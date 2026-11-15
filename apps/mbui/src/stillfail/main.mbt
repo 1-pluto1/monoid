@@ -159,6 +159,9 @@ fn refused(name : String) -> Json {
 let core_source : @sfapp.Source = {
   topic_read: core_topic,
   topic_key: fn(name, params) { @sfbase.wire_topic_key(name, @sfbase.core_topic_params(name, params)) },
+  topic_keyed: fn(name, params, field, keys) {
+    @core.keyed_of(name, @sfbase.core_topic_params(name, params), field, keys)
+  },
   topic_scope: None,
   topic_alive: fn() { true },
   topic_lease_own: None,
