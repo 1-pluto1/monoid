@@ -147,6 +147,38 @@ const filesIn = (n: Name, id: string) => {
   return existsSync(d) ? readdirSync(d).length : 0;
 };
 
+/// Of the hand-overs out of `sender` begun from `from` to `to` (their id's time), in the order begun, cut in ten: each
+/// tenth's median of what each step took as the sender's own record says (`began`, its clock: from a step's begin to
+/// the next one's, the last to `done`), and of what each kind of request took the receiver to answer (its in record's
+/// `spent`), with the whole run's mean of each beside: the stations' own times, through no file event.
+function recordTenths(sender: Name, receiver: Name, from: number, to: number): string[] {
+  const begun = (id: string) => parseInt(String(id).split("-")[0] ?? "", 36);
+  const outs = handovers(sender, "out").filter((o) => begun(o.id) >= from && begun(o.id) <= to && o.began && typeof o.began === "object").sort((x, y) => begun(x.id) - begun(y.id));
+  if (outs.length < 10) return [`${outs.length} hand-overs with their steps' times: too few to cut in ten (a station from before keeps none)`];
+  const ins = new Map(handovers(receiver, "in").map((i) => [i.id, i] as const));
+  const rows = new Map<string, number[][]>();
+  const put = (k: string, tenth: number, ms: number) => {
+    const r = rows.get(k) ?? Array.from({ length: 10 }, () => [] as number[]);
+    r[tenth]!.push(ms);
+    rows.set(k, r);
+  };
+  outs.forEach((o, i) => {
+    const tenth = Math.min(9, Math.floor((i * 10) / outs.length));
+    const steps = Object.entries(o.began as Record<string, number>).sort((x, y) => x[1] - y[1]);
+    for (let j = 0; j + 1 < steps.length; j++) put(`${sender}: ${steps[j]![0]}`, tenth, steps[j + 1]![1] - steps[j]![1]);
+    if (steps.length > 1) put(`${sender}: begin to its last (${steps.at(-1)![0]})`, tenth, steps.at(-1)![1] - steps[0]![1]);
+    const spent = ins.get(o.id)?.spent as Record<string, number> | undefined;
+    for (const [k, ms] of Object.entries(spent ?? {})) put(`${receiver} answering: ${k}`, tenth, ms);
+  });
+  const median = (xs: number[]) => (xs.length === 0 ? "-" : String([...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]));
+  const mean = (r: number[][]) => {
+    const all = r.flat();
+    return all.length === 0 ? "-" : (all.reduce((a, b) => a + b, 0) / all.length).toFixed(1);
+  };
+  return [`${outs.length} hand-overs by their stations' own times, by tenths, median ms | the run's mean (how many):`,
+    ...[...rows.entries()].map(([k, r]) => `${k}: ${r.map(median).join(" ")} | ${mean(r)} (${r.reduce((n, x) => n + x.length, 0)})`)];
+}
+
 /// What each hand-over out of a station went through and when (this driver's clock), told by its directory's events.
 class Steps {
   readonly seen = new Map<string, { step: string; held: boolean; at: number }[]>();
@@ -182,6 +214,30 @@ class Steps {
   }
   of(id: string) {
     return this.seen.get(id) ?? [];
+  }
+  /// Of the hand-overs begun from `from` to `to` (their id's time, the station's clock), in the order begun, cut in ten:
+  /// each tenth's median of each change of step (`files>held*`, … as seen here), of begun to its first record seen, and
+  /// of begun to its end, in ms; what a whole move's per-chat time is made of, and which of it grows along the run.
+  tenths(from: number, to: number): string[] {
+    const begun = (id: string) => parseInt(id.split("-")[0] ?? "", 36);
+    const outs = [...this.seen.entries()].filter(([id, l]) => l.length > 0 && begun(id) >= from && begun(id) <= to).sort((x, y) => begun(x[0]) - begun(y[0]));
+    if (outs.length < 10) return [`${outs.length} hand-overs seen: too few to cut in ten`];
+    const name = (x: { step: string; held: boolean }) => `${x.step}${x.held ? "*" : ""}`;
+    const rows = new Map<string, number[][]>();
+    const put = (k: string, tenth: number, ms: number) => {
+      const r = rows.get(k) ?? Array.from({ length: 10 }, () => [] as number[]);
+      r[tenth]!.push(ms);
+      rows.set(k, r);
+    };
+    outs.forEach(([id, l], i) => {
+      const tenth = Math.min(9, Math.floor((i * 10) / outs.length));
+      put("begun>seen", tenth, l[0]!.at - begun(id));
+      for (let j = 1; j < l.length; j++) put(`${name(l[j - 1]!)}>${name(l[j]!)}`, tenth, l[j]!.at - l[j - 1]!.at);
+      put("begun>end", tenth, l.at(-1)!.at - begun(id));
+    });
+    const median = (xs: number[]) => (xs.length === 0 ? "-" : String([...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]));
+    return [`${outs.length} hand-overs, by tenths, median ms (how many of the ${outs.length} had the change):`,
+      ...[...rows.entries()].map(([k, r]) => `${k} (${r.reduce((n, x) => n + x.length, 0)}): ${r.map(median).join(" ")}`)];
   }
   close() {
     this.#w?.close();
@@ -240,21 +296,46 @@ const lastOn = (n: Name, ws: string): J | null => {
 };
 const brief = (v: J, most = 600) => JSON.stringify(v)?.slice(0, most);
 
-/// Where chat `key` is stopped, as the station it is shown on keeps it (move/stopped.json): what it waits for; null
-/// where it is not stopped.
-function stoppedOf(key: string): string | null {
-  for (const n of stations()) {
-    let l: J = [];
+/// When anything station `n` keeps of moving last changed (the newest file's time in its move/; what they hold is the
+/// station's own to keep as it will, never read here).
+function moveChanged(n: Name): number {
+  const d = `${DATA[n]}/move`;
+  let most = 0;
+  for (const f of existsSync(d) ? readdirSync(d) : []) {
     try {
-      l = JSON.parse(readFileSync(`${DATA[n]}/move/stopped.json`, "utf8"));
-    } catch {
-      continue;
-    }
-    const s = (Array.isArray(l) ? l : []).find((x: J) => x?.item?.module === "chats" && x?.item?.id === key);
-    if (s !== undefined && standing(n, key) === "live") return `stopped on ${n}, waiting for ${s.waitsFor?.module} ${s.waitsFor?.id}`;
+      most = Math.max(most, statSync(join(d, f)).mtimeMs);
+    } catch {}
+  }
+  return most;
+}
+/// What station `n` says is stopped there, as its GET /move answers (`stopped`, its scheduler's: each item `module id`
+/// with what it waits for), never its files: the device's last answer of it where it was asked after anything in its
+/// move/ last changed, else asked afresh by alice's device, by a page of its chats not read yet (so the core reads it at
+/// once, as timeMove's), let go of once answered. (Asked afresh each time, a say in part 5 would plan 2,384 chats in
+/// the turn it times.)
+async function stoppedOn(n: Name): Promise<{ item: string; waitsFor: string }[]> {
+  const t0 = Date.now();
+  const last = a.moves.findLast((x) => x.station === idOf(n));
+  if (last !== undefined && last.asked > moveChanged(n)) return last.stopped;
+  const w = a.watch({ topic: "stationMove", station: addr(n), to: "", module: "chats", limit: 51 + Math.floor(Math.random() * 140) });
+  try {
+    return (await a.moveSaid(idOf(n), t0, 60_000)).stopped;
+  } finally {
+    w.stop();
+  }
+}
+/// Where chat `key` is stopped, as GET /move of the station it is shown on says: what it waits for; null where it is not
+/// stopped, or its station is down or did not answer (nothing to say then: what waits on it says so itself).
+async function stoppedOf(key: string): Promise<string | null> {
+  for (const n of stations()) {
+    if (standing(n, key) !== "live" || !alive(n)) continue;
+    const s = (await stoppedOn(n).catch(() => [])).find((x) => x.item === `chats ${key}`);
+    if (s !== undefined) return `stopped on ${n}, waiting for ${s.waitsFor}`;
   }
   return null;
 }
+/// What station `n`'s GET /move says is stopped, for a log line.
+const stoppedText = async (n: Name) => brief(await stoppedOn(n).catch((e) => String(e)), 1200);
 /// Whether station `n`'s launcher runs (its pid file, e2e-local.sh's, and that process).
 function alive(n: Name): boolean {
   try {
@@ -332,7 +413,7 @@ let B = "";
 let C = "";
 const addr = (n: Name) => (n === "A" ? A : n === "B" ? B : C);
 const idOf = (n: Name) => (n === "A" ? aId : n === "B" ? bId : cId);
-const steps: { A?: Steps } = {};
+const steps: { A?: Steps; B?: Steps } = {};
 const report: string[] = [];
 const measured = (s: string) => {
   report.push(s);
@@ -351,23 +432,33 @@ const moveT = (to: string, module = "chats", limit?: number) => ({ topic: "stati
 /// What chat `key` was answered after `text` was said in it by alice's device (aimed at A, where it began: the core
 /// sends it on to where it is): the first new message beginning `prefix`.
 /// It fails at once where no answer can come: what was said failed in the outbox, or the chat is stopped where it is
-/// (its station's move/stopped.json, what GET /move's `stopped` says), saying why.
+/// (what GET /move's `stopped` of its station says), saying why.
 async function say(key: string, text: string, prefix: string, ms = 120_000): Promise<string> {
   log(`  saying ${text.slice(0, 80)}, waiting for ${prefix}`);
   const before = new Set(texts(await untilChat(key, (v) => v?.messages && v, 60_000)));
-  const stopped0 = stoppedOf(key);
+  const stopped0 = await stoppedOf(key);
   if (stopped0 !== null) throw new Error(`no answer can come: the chat is ${stopped0} (${standings(key)})`);
   await a.call("chat.send", { station: A, session: key, text });
-  // (the chat stopped meanwhile, as its station's files say; a wait that never ends otherwise. Let go of at the next
-  // change once the answer came)
+  // (the chat stopped meanwhile, as GET /move of its station says, asked again as what its station keeps of moving
+  // changes, one ask at a time; a wait that never ends otherwise. Let go of at the next change once the answer came)
   let over = false;
-  const stops = whenChanged(stations().map((n) => DATA[n]), () => {
-    if (over) return { over };
-    const s = stoppedOf(key);
-    return s !== null && { stopped: s };
-  }, ms + 5_000, () => "").catch(() => new Promise<never>(() => {}));
+  const stops = new Promise<{ stopped: string }>((resolve) => {
+    let looking = false;
+    let again = false;
+    const look = async () => {
+      if (looking) return void (again = true);
+      looking = true;
+      do {
+        again = false;
+        const s = await stoppedOf(key).catch(() => null);
+        if (s !== null && !over) return resolve({ stopped: s });
+      } while (again && !over);
+      looking = false;
+    };
+    whenChanged(stations().map((n) => `${DATA[n]}/move`), () => over || void look(), ms + 5_000, () => "").catch(() => {});
+  });
   const answered = untilChat(key, (v) => texts(v).find((t) => t.startsWith(prefix) && !before.has(t)) ?? failedSend(v, text), ms);
-  const got = await Promise.race([answered, stops.then((s) => ("stopped" in s ? s : answered))]).finally(() => void (over = true));
+  const got = await Promise.race([answered, stops]).finally(() => void (over = true));
   if (typeof got !== "string") {
     if ("stopped" in got) throw new Error(`no answer can come: the chat is ${got.stopped} (${standings(key)})`);
     throw new Error(`what was said did not go: ${got.failed}`);
@@ -702,6 +793,7 @@ try {
     log(`  on B after ${((Date.now() - t0) / 1000).toFixed(1)} s`);
   });
   steps.A = new Steps("A");
+  steps.B = new Steps("B");
 
   // ── 1: the page's data ──
   if (part("1")) {
@@ -778,7 +870,7 @@ try {
       // (a login that can be shared is lent, not moved: A stays its host, B borrows it, `last.lent`, 5beeaa8cf)
       lentWith = ((l.lent ?? []) as J[]).map((x: J) => (typeof x === "string" ? x : named(x)));
       const profilesA = (JSON.parse(readFileSync(`${DATA.A}/config.json`, "utf8")).profiles ?? []).map((p: J) => p.id);
-      log(`  A's profiles now ${brief(profilesA)}; stopped on A: ${existsSync(`${DATA.A}/move/stopped.json`) ? readFileSync(`${DATA.A}/move/stopped.json`, "utf8").slice(0, 400) : "none"}`);
+      log(`  A's profiles now ${brief(profilesA)}; stopped on A: ${await stoppedText("A")}`);
     });
     if (arrived) {
       await check("2: the login it needs lent to B, not moved: A still hosts it, B borrows it", async () => {
@@ -899,7 +991,7 @@ try {
         if (account !== undefined && standing("A", k2) === "live" && borrowed.length === 0) {
           const nonce = randomBytes(3).toString("hex");
           await check("2: back on A while its account is still on B: stopped, and the person is told so", async () => {
-            log(`  A's stopped.json: ${existsSync(`${DATA.A}/move/stopped.json`) ? readFileSync(`${DATA.A}/move/stopped.json`, "utf8").slice(0, 600) : "none"}`);
+            log(`  A's stopped: ${await stoppedText("A")}`);
             const m = await a.until(moveT(bId), (v) => v?.modules && v, 60_000);
             const row = await rowSettled("2", m, k2, (r) => r?.state === "stopped");
             const chatsM = m.modules.find((x: J) => x.id === "chats");
@@ -1021,10 +1113,10 @@ try {
       let back = false;
       await check("2k: the chat alone moved back while its login stays on B: on A, stopped, waiting for it", async () => {
         const l = await moveBack(kc, "B");
-        log(`  ${outcome(l)}; ${standings(kc)}; A's stopped ${existsSync(`${DATA.A}/move/stopped.json`) ? readFileSync(`${DATA.A}/move/stopped.json`, "utf8").slice(0, 600) : "none"}`);
+        log(`  ${outcome(l)}; ${standings(kc)}; A's stopped ${await stoppedText("A")}`);
         if (standing("A", kc) !== "live") throw new Error(`not back on A: ${standings(kc)}; ${outcome(l)}`);
         back = true;
-        const s = stoppedOf(kc);
+        const s = await stoppedOf(kc);
         if (s === null || !s.includes(item)) throw new Error(`not stopped waiting for ${item}: ${s}`);
         const m = await atRest("2k");
         const chatsM = m.modules.find((x: J) => x.id === "chats");
@@ -1080,10 +1172,10 @@ try {
             await a.call("move.start", { station: A, to: bId, module: "accounts", item });
             const lo = await turnEnds("A", t0);
             moved = true;
-            log(`  the login alone to B: ${outcome(lo)}; its turn's stopped ${brief(lo?.stopped ?? null, 600)}; ${standings(kd)}; stopped ${stoppedOf(kd)}`);
+            log(`  the login alone to B: ${outcome(lo)}; its turn's stopped ${brief(lo?.stopped ?? null, 600)}; ${standings(kd)}; stopped ${await stoppedOf(kd)}`);
             // (the facts at that moment, for the station's side: no verdict of them)
-            log(`  2k's second chat as the login left, its facts: A's stopped.json ${existsSync(`${DATA.A}/move/stopped.json`) ? readFileSync(`${DATA.A}/move/stopped.json`, "utf8").slice(0, 1200) : "none"}\n    ${heldOf2(kd)}\n    the first chat: ${heldOf2(kc)}\n    A's runtime sessions of both: ${brief(sql("A", `select session_key, profile, id from runtime_sessions where session_key in (${lit(kd)}, ${lit(kc)})`))}\n    the stations' logs around it:\n    ${logsAround(Date.now() - 1500)}`);
-            if (stoppedOf(kd) === null) throw new Error(`not stopped on A as its login left: ${standings(kd)}`);
+            log(`  2k's second chat as the login left, its facts: A's stopped ${await stoppedText("A")}\n    ${heldOf2(kd)}\n    the first chat: ${heldOf2(kc)}\n    A's runtime sessions of both: ${brief(sql("A", `select session_key, profile, id from runtime_sessions where session_key in (${lit(kd)}, ${lit(kc)})`))}\n    the stations' logs around it:\n    ${logsAround(Date.now() - 1500)}`);
+            if ((await stoppedOf(kd)) === null) throw new Error(`not stopped on A as its login left: ${standings(kd)}`);
             const m = await atRest("2k");
             const row = await rowSettled("2k", m, kd, (r) => r?.state === "stopped" && r?.action === "move");
             log(`  A's page: its row ${brief(row)}`);
@@ -1106,7 +1198,7 @@ try {
             const rowAfter = await rowSettled("2k", after, kd, (r) => r?.state === "there");
             log(`  A's page after: its row ${brief(rowAfter)}`);
             // (the facts at that moment, for the station's side: no verdict of them)
-            log(`  2k's second chat, its facts: A's stopped.json ${existsSync(`${DATA.A}/move/stopped.json`) ? readFileSync(`${DATA.A}/move/stopped.json`, "utf8").slice(0, 800) : "none"}\n    ${heldOf2(kd)}`);
+            log(`  2k's second chat, its facts: A's stopped ${await stoppedText("A")}\n    ${heldOf2(kd)}`);
             if (rowAfter?.state !== "there") throw new Error(`its row on A's page reads ${rowAfter?.state}, not there`);
           });
         } finally {
@@ -1835,7 +1927,9 @@ try {
       // (and the device's link to it usable again: a request of its answered by the new process. Online is the cloud's
       // word, which comes first: drill 28's link to A, dialled into the endpoint as it closed, sat three beats (15 s) on
       // a dead connection, and the page's first answer timed after online read 16,446 ms where GET /move took 15)
-      const ready = await a.answered(aId, "/", up, 120_000);
+      // (a request asked after A was up, not one asked of the process before and answered as A came back: p5-5a0d's
+      // 300 chats took one of those for the link usable, and its first answer waited 14 s on the dead link)
+      const ready = await a.answered(aId, "/", up, 120_000, true);
       log(`  A's link usable again ${ready.at - up} ms after A was up (${ready.method} ${ready.path.replace(/\?.*$/, "")})`);
     };
     /// What the stations' logs say of their main thread held since `from` (each log's byte offset): how often, the longest.
@@ -1925,6 +2019,9 @@ try {
       const ends = (x: J, t: number, seen: number) => `the station's turn ended at ${typeof x?.at === "number" ? ((x.at - t) / 1000).toFixed(1) : "?"} s, seen at ${seen.toFixed(1)} s`;
       const notDone = (x: J) => `refused [${(x?.refused ?? []).map((r: J) => `${named(r.item)}: ${r.why}`).join(" | ")}] failed ${failuresOf(x).map((f) => `${f.item}: ${f.error}`).join(" | ") || "none"}`;
       measured(`${n} chats moved with all: ${s.toFixed(0)} s, ${((n - left) / (s / 60)).toFixed(0)} chats a minute, ${left} left on A; ${ends(l, t0, seenS)}; main thread: ${holds(from)}; ${notDone(l)}`);
+      // (each chat's hand-over by its steps, A's records as the drill saw them change: which step a chat's time is in)
+      for (const line of steps.A!.tenths(t0, Date.now())) log(`  there: ${line}`);
+      for (const line of recordTenths("A", "B", t0, Date.now())) log(`  there, own times: ${line}`);
       from = offsets();
       const t1 = Date.now();
       await a.call("move.back", { station: A, from: bId, all: true });
@@ -1936,6 +2033,8 @@ try {
       const seenB = (Date.now() - t1) / 1000;
       const sb = typeof lb?.at === "number" ? (lb.at - t1) / 1000 : seenB;
       measured(`and back: ${sb.toFixed(0)} s, ${(n / (sb / 60)).toFixed(0)} chats a minute; ${ends(lb, t1, seenB)}; main thread: ${holds(from)}; ${notDone(lb)}`);
+      for (const line of steps.B!.tenths(t1, Date.now())) log(`  back: ${line}`);
+      for (const line of recordTenths("B", "A", t1, Date.now())) log(`  back, own times: ${line}`);
       if (left > 0) throw new Error(`${left} chats not moved`);
     });
   }
@@ -2238,6 +2337,7 @@ try {
 }
 partOver();
 steps.A?.close();
+steps.B?.close();
 for (const r of report) log(`MEASURED ${r}`);
 log(failures() === 0 ? "ALL PASSED" : `${failures()} FAILED`);
 await within(Promise.all([a.close(), bob.close()]), 5000);
