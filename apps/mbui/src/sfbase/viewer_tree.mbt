@@ -478,7 +478,7 @@ fn image_layer(n : @view.View, src : Source, vw : Viewer, stage : () -> (Double,
         }
       Some(_) =>
         // (a picture's actions and a page's there; anything else its own bar still, its name and tabs theirs)
-        if @sf.native_over_up(vw.file.name, alive=fn() { vw.up_still() }, owner="viewer", over=2) &&
+        if @sf.native_over_up(vf_title(vw), alive=fn() { vw.up_still() }, owner="viewer", over=2) &&
           !marking.on &&
           (vw.shown_kind() == Some(KImage) || vw.shown_kind() == Some(KHtml)) {
           vf_native(vw, @ui.current(), src)
@@ -540,6 +540,8 @@ fn Viewer::flight_share_at(self : Viewer, t : Double) -> Double {
 fn Viewer::ground_ink(self : Viewer) -> Int64 {
   if self.dark() {
     0x000000FFL
+  } else if viewer_mbui_rendered(self) {
+    @sf.theme().p.bg
   } else if self.shown_kind() == Some(KPdf) {
     let t = @sf.theme()
     @sf.mix(t.p.text, 0.05, t.p.bg)
@@ -1146,7 +1148,7 @@ fn image_head(h : @view.View, src : Source, vw : Viewer, stage : () -> (Double, 
   }
   @sf.viewer_head_node(
     h,
-    fn() { vw.file.name },
+    fn() { vf_title(vw) },
     // (its kind and size after its name where the bar has room: wider than a phone, viewer_head_node)
     fn() { vf_meta(vw, src) },
     // (as it rests, a tap hides it, while it comes it stays)
@@ -1201,9 +1203,9 @@ fn image_bar(h : @view.View, src : Source, vw : Viewer, stage : () -> (Double, D
   @sf.viewer_bar_node(
     h,
     fn() { vw.desk_back(src) },
-    fn() { vw.file.name },
+    fn() { vf_title(vw) },
     fn() { vf_meta(vw, src) },
-    fn() { if vw.file.path.has_prefix("draft:") { "" } else { vw.file.path } },
+    fn() { if vw.shown_kind() == Some(KMbui) || is_mbui_viz(vw.file.name) || vw.file.path.has_prefix("draft:") { "" } else { vw.file.path } },
     // (marking, there: Viewer::bars_shown; anything but a picture's stays)
     fn() { vw.shown_kind() == Some(KImage) && !vw.bars_shown() },
     fn(node) { vw.shown_on(node) },
@@ -1282,9 +1284,9 @@ fn image_tools(
   // (copied: a check from the press, its end its own, another press another end)
   let copied : @signals.Signal[Bool] = @signals.signal(false, same=fn(a, b) { a == b })
   let copied_end : Ref[() -> Unit] = Ref(fn() {  })
-  // 预览 / 源码: a table's, a page's once read (Markdown read in the reader, its own bar): the library's
+  // 预览 / 源码: a table's, a page's, an mbui widget's once read (Markdown read in the reader, its own bar): the library's
   // segmented choice, its nodes (@sf.seg_node), what it chooses told (Viewer::set_source)
-  row.show(fn() { whole() && (vw.shown_kind() == Some(KCsv) || vw.shown_kind() == Some(KHtml)) }, fn(r) {
+  row.show(fn() { whole() && vf_has_source(vw) }, fn(r) {
     // (giving way as it does where the bar is short of room: its track fitted to what there is)
     r.shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
     @sf.seg_node(
@@ -1359,9 +1361,10 @@ fn image_tools(
     )
     |> ignore
   })
+  let is_mini_app = fn() { vw.shown_kind() == Some(KMbui) || is_mbui_viz(vw.file.name) }
   // 分享 on a phone (shares_out): what is here handed to the system's share sheet; one told of, read whole first. Not
-  // beside 预览 / 源码 (a table, a page): a phone's floating bar has no room for both with the name (words at 1.3)
-  row.show(fn() { shares_out() && !vw.coming() && !downloading(dl()) && (whole() || vw.told_of()) && !(whole() && (vw.shown_kind() == Some(KCsv) || vw.shown_kind() == Some(KHtml))) }, fn(r) {
+  // beside 预览 / 源码 (a table, a page) or for a `.mbui` mini-program: a phone's floating bar has no room for both with the name (words at 1.3)
+  row.show(fn() { !is_mini_app() && shares_out() && !vw.coming() && !downloading(dl()) && (whole() || vw.told_of()) && !(whole() && vf_has_source(vw)) }, fn(r) {
     @sf.tool_node(
       r,
       fn() {
@@ -1375,8 +1378,8 @@ fn image_tools(
     )
     |> ignore
   })
-  // download: what is here saved at once; one told of, read whole first; a ring while the core downloads it
-  row.show(fn() { !vw.coming() && !downloading(dl()) }, fn(r) {
+  // download: what is here saved at once; one told of, read whole first; a ring while the core downloads it (none for a `.mbui` mini-program)
+  row.show(fn() { !is_mini_app() && !vw.coming() && !downloading(dl()) }, fn(r) {
     @sf.tool_node(
       r,
       fn() {
@@ -1390,7 +1393,7 @@ fn image_tools(
     )
     |> ignore
   })
-  row.show(fn() { !vw.coming() && downloading(dl()) }, fn(r) {
+  row.show(fn() { !is_mini_app() && !vw.coming() && downloading(dl()) }, fn(r) {
     @sf.tool_ring_node(r, fn() { number(dl(), "progress") }, fn() { @sf.t("web-main.preview.download") }, ink, corner)
     |> ignore
   })
@@ -1591,7 +1594,10 @@ fn viewer_hosted(n : @view.View, src : Source, vw : Viewer) -> Unit {
       }
     }))
     |> ignore
-    s.show(fn() { stage() == Hosted }, fn(h) {
+    s.show(fn() { stage() == Hosted && viewer_mbui_rendered(vw) }, fn(m) {
+      viewer_mbui_node(m, src, vw, bars=true)
+    })
+    s.show(fn() { stage() == Hosted && !viewer_mbui_rendered(vw) }, fn(h) {
       h.over(Is(true)) |> ignore
       @ui.old(h, fn(c) {
         // (what marking and what reads stamp by: this source's clock, as the old frame's layer said it each frame)
