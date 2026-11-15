@@ -114,7 +114,11 @@ fn said_bytes(said : Map[String, Said]) -> Bytes {
 /// Where the peer at `place` last said a device dials it straight: its LAN's, then its tailnet's.
 fn Mesh::straight(self : Mesh, place : Place) -> Array[String] {
   match self.said.get(place.key()) {
-    Some(said) => [..said.lan, ..said.tailnet]
+    Some(said) =>
+      [
+        ..(if self.is_off(place, "lan") { [] } else { said.lan }),
+        ..(if self.is_off(place, "tailnet") { [] } else { said.tailnet }),
+      ]
     None => []
   }
 }
@@ -159,9 +163,17 @@ pub fn Mesh::tailnet(self : Mesh, peer : String, scope? : String = "") -> Array[
 ///|
 /// The peer's answer to a link's first line said where it is dialled straight (none said: nowhere): kept where it
 /// changed, written to the store (one writing at a time, each of what is kept as it gets its turn), and told to
-/// the endpoint. Only of a link at its place: one that lost its opening says nothing for it.
+/// the endpoint. Only of a way to its place (the link there or one beside it), and not of one at an address said
+/// (it says where it was dialled): asked as the answer comes, and as a link whose answer came first becomes a way
+/// (`Mesh::now_on`, `Mesh::adopt_way`).
 fn Mesh::heard(self : Mesh, place : Place, link : Link) -> Unit {
-  guard !self.closed && self.is_current(link) else { return }
+  guard !self.closed &&
+    self.links.contains(place) &&
+    link.pin != Some("lan") &&
+    link.pin != Some("tailnet") &&
+    self.ways_at(place).all.iter().any(way => physical_equal(way.link, link)) else {
+    return
+  }
   let key = place.key()
   let was = self.said.get(key)
   let same = match was {
@@ -181,10 +193,17 @@ fn Mesh::heard(self : Mesh, place : Place, link : Link) -> Unit {
       })),
     )
   }
-  // (on the endpoint the addresses are iroh's to try on the connection open, paths of it)
+  // (on the endpoint the addresses are iroh's to try on the connection open, paths of it; off it, dialled each
+  // on an endpoint of its own, ways.mbt)
+  if !self.main_on(place) {
+    for kind in ["lan", "tailnet"] {
+      self.dial_at_if(place, kind, link.credentials)
+    }
+    return
+  }
   let ips = self.ips(place)
   if ips.length() > 0 && !self.rebinding {
-    self.tell_addr(self.endpoint, place.peer, self.relays, ips)
+    self.tell_addr(self.endpoint, place.peer, self.relays_for(place), ips)
   }
 }
 
@@ -243,6 +262,14 @@ fn Mesh::note_dial(self : Mesh, place : Place, unanswered : Bool) -> Unit {
   if ips.length() > 0 {
     self.unanswered_at[place] = ips.join(" ")
   }
+}
+
+///|
+/// Whether the last dial of `place` on the endpoint went unanswered given the addresses it would be given now: then
+/// the next dials every way beside it (ways.mbt, `Mesh::dial_all`).
+fn Mesh::unanswered_straight(self : Mesh, place : Place) -> Bool {
+  let ips = self.ips(place)
+  ips.length() > 0 && self.unanswered_at.get(place) == Some(ips.join(" "))
 }
 
 ///|

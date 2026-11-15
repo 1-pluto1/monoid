@@ -25,6 +25,11 @@ pub fn Mesh::wake(self : Mesh) -> Unit {
   // (being bound anew: the endpoint that comes is new to its network, and nothing is on either)
   guard !self.rebinding else { return }
   self.shell.tell("iroh.networkChange", { "id": self.endpoint })
+  // (on another network, perhaps the peer's: its addresses worth a try again, its tailnet once it answers there)
+  for _, ways in self.ways_of {
+    ways.tried.clear()
+    ways.tailnet_answered = false
+  }
   for place, opening in self.links {
     match opening.result {
       Some(Open(link)) =>
@@ -47,7 +52,7 @@ fn Mesh::hedge(self : Mesh, place : Place, opening : Opening) -> Unit {
   // (cut as its opening ends otherwise, or the mesh closes, it says nothing: whoever ended the opening said it)
   opening.hedge = Some(
     self.scope.fork(name="mesh hedge", () => {
-      let made = attempt(() => self.open(place, opening.credentials, opening.fresh))
+      let made = attempt(() => self.dial_all(place, opening.credentials, opening.fresh))
       self.dialled(place, opening, true, made)
     }),
   )
@@ -59,7 +64,9 @@ fn Mesh::hedge(self : Mesh, place : Place, opening : Opening) -> Unit {
 /// under way (with the dial tried beside it), no race, no connection a peer dialled that its program took and that
 /// has not ended (`incomings`, bind.mbt). What comes to hold the endpoint otherwise is counted here.
 fn Mesh::idle(self : Mesh) -> Bool {
-  self.live.length() == 0 &&
+  // (a link on an endpoint of a way's own is not on this one: ways.mbt)
+  self.live.iter().all(link => link.pin is Some(_)) &&
+  self.dialling_main == 0 &&
   self.racing.length() == 0 &&
   self.incomings.length() == 0 &&
   !self.links.values().any(opening => opening.result is None)
@@ -73,7 +80,9 @@ fn Mesh::idle(self : Mesh) -> Bool {
 /// whose answer is not said yet (its read fails with it). A connection open has no such time: with one, the
 /// endpoint is dialled on as it is.
 fn Mesh::settling(self : Mesh) -> Bool {
-  !self.idle() && self.incomings.length() == 0 && !self.live.iter().any(link => !link.gone.is_done())
+  !self.idle() &&
+  self.incomings.length() == 0 &&
+  !self.live.iter().any(link => link.pin is None && !link.gone.is_done())
 }
 
 ///|

@@ -3,14 +3,21 @@
 // numbers, but for how the old link is asked whether it answers (`Mesh::race` says).
 
 ///|
-/// The usable links to a place: the ways requests may go there. Today the one in `links`, where it is usable; where
-/// a place comes to have several ways, the others are counted here, and what goes by "any way" or "no other way"
-/// (`standing`, `healthy`, `suspect`) goes by all of them with nothing else changed.
+/// The usable links to a place: the ways requests may go there, the one in `links` and those beside it (ways.mbt).
+/// What goes by "any way" or "no other way" (`standing`, `healthy`, `suspect`) goes by all of them.
 fn Mesh::ways(self : Mesh, place : Place) -> Array[Link] {
-  match self.links.get(place) {
+  let out = match self.links.get(place) {
     Some({ result: Some(Open(link)), .. }) if link.usable() => [link]
     _ => []
   }
+  if self.ways_of.get(place) is Some(ways) {
+    for way in ways.all {
+      if way.link.usable() && !out.iter().any(one => physical_equal(one, way.link)) {
+        out.push(way.link)
+      }
+    }
+  }
+  out
 }
 
 ///|
@@ -148,7 +155,7 @@ async fn Mesh::race(self : Mesh, place : Place, opening : Opening, race : Race) 
   let dialled : @effect.Deferred[Link?] = @effect.Deferred::new()
   race.dial = Some(
     self.scope.fork(name="mesh race dial", () => {
-      let made = attempt(() => self.open(place, old.credentials, false))
+      let made = attempt(() => self.dial_all(place, old.credentials, false))
       // (cut as the race ends otherwise, it comes to nothing here: an interruption is this fiber's as it next
       // resumes, which is inside the opening, whose own leaving closes what it made)
       match made {
@@ -258,6 +265,10 @@ fn Mesh::switch(self : Mesh, place : Place, opening : Opening, old : Link, next 
   taken.result = Some(Open(next))
   ignore(taken.done.succeed(next))
   self.links[place] = taken
+  // (no more a way to go back to)
+  if self.ways_of.get(place) is Some(ways) {
+    ways.all.retain(way => !physical_equal(way.link, old))
+  }
   self.changed()
   self.adopt(place, taken, next)
   // (cut as the mesh closes, which closes every link not ended itself: `live`)
