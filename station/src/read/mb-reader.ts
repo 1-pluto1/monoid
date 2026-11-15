@@ -101,14 +101,37 @@ export class Said {
   }
 }
 
+/// The builders nobody waits on: what the station drives itself, a batch at a time (MbBackfill's kinds), and the export
+/// of the chats' copies. Every other builder answers a request as it is asked (a search, the vault's uses, the usage
+/// page, a live session found, the outflow's chats), or holds the backfill permit for its batch as a read waits on it
+/// (read/requested-builder.ts), or is waited on by a person (a restore, the mesh's): under PRIO_DARWIN_BG's throttled IO
+/// on a busy Mac each would take many times as long, holding up the person or the permit.
+const BACKGROUND_BUILDERS = new Set(["replica-export", "session-backfill", "post-blocks", "session-counts", "usage-retire", "usage-scope", "signin-save"]);
+
+/// Whether the program with `args` is the station's background work by default: a builder of BACKGROUND_BUILDERS
+/// (`--builder <kind>`). The readers that answer devices as they ask (`--data`, `--serve`, `--sessions`) are not.
+export function backgroundByDefault(args: readonly string[]): boolean {
+  const at = args.indexOf("--builder");
+  return at >= 0 && BACKGROUND_BUILDERS.has(args[at + 1] ?? "");
+}
+
+/// What is spawned for the program `binary` with `args`: under platform.backgrounded when it is background work
+/// (`background`, else backgroundByDefault), so the builders scanning the database and the disk on their own yield the
+/// CPU and the disk to the station's foreground and the agents'; as it is otherwise.
+export function mbSpawned(binary: string, args: string[], options: { background?: boolean } = {}): [string, string[]] {
+  return (options.background ?? backgroundByDefault(args)) ? platform.backgrounded(binary, args) : [binary, args];
+}
+
 /// The program's process, a line of JSON each way: told its lines as "message"s, its end as "exit".
 export class MbProcess extends EventEmitter {
   readonly #child: ChildProcess;
   #exited = false;
 
-  constructor(binary: string, args: string[]) {
+  /// `options.background`: whether it runs as the system's background work (mbSpawned), else as its args say.
+  constructor(binary: string, args: string[], options: { background?: boolean } = {}) {
     super();
-    this.#child = spawn(binary, args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    const [command, given] = mbSpawned(binary, args, options);
+    this.#child = spawn(command, given, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     const said = new Said((answer) => this.emit("message", answer));
     this.#child.stdout!.on("data", (bytes: Buffer) => said.push(bytes));
     createInterface({ input: this.#child.stderr! }).on("line", (line) => log.warn("readers", "a MoonBit reader said", { line }));
@@ -192,7 +215,8 @@ export class MbBackfill extends EventEmitter {
     this.#priority = priority instanceof SharedArrayBuffer ? new Int32Array(priority) : null;
     this.#pauseMs = pauseMs;
     this.#fallback = fallback;
-    this.#process = new MbProcess(binary, args);
+    // (a backfill is the station's own, nobody waiting on it: the system's background work, whatever its kind)
+    this.#process = new MbProcess(binary, args, { background: true });
     this.#process.on("message", (result: { done: boolean; error?: string; fallback?: boolean }) => {
       if (this.#worker !== null) return;
       this.#give();

@@ -5,7 +5,7 @@
 //
 // Directories are read in the order the file system gives (opendir, as Rust's read_dir), not sorted: which of equally
 // recent files comes first, and which project a Claude session is found in first, stay the Rust's.
-import { type Dirent, closeSync, opendirSync, openSync, readSync, statSync } from "node:fs";
+import { type Dirent, closeSync, lstatSync, opendirSync, openSync, readSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { type Lang, tr } from "../ops/i18n.ts";
 import { type Json, type Store, sessionOfRuntime } from "./store.ts";
@@ -80,7 +80,6 @@ function readDir(dir: string): Dirent[] {
   return out;
 }
 
-const isDir = (p: string) => statSync(p, { throwIfNoEntry: false })?.isDirectory() ?? false;
 const isFile = (p: string) => statSync(p, { throwIfNoEntry: false })?.isFile() ?? false;
 
 const STRICT = new TextDecoder("utf-8", { fatal: true });
@@ -309,13 +308,40 @@ function stamp(path: string): [number, number] | null {
   return [Number(meta.mtimeNs / 1_000_000n), Number(meta.size)];
 }
 
-/// rollouts_in: Codex's rollout-*.jsonl files under a directory, at any depth.
-export function rolloutsIn(dir: string, out: string[]) {
-  for (const entry of readDir(dir)) {
-    const path = join(dir, entry.name);
-    if (isDir(path)) rolloutsIn(path, out);
-    else if (entry.name.startsWith("rollout-") && extension(entry.name) === "jsonl") out.push(path);
-  }
+/// How far rolloutsIn goes: Codex keeps its rollouts at sessions/<year>/<month>/<day>/, a year's of daily use a few
+/// thousand files; a directory under it that is a disk or share mounted there, a link (to the home, say) or a tree a
+/// million entries deep is not walked, synchronously, on a reader thread or the station's (ops/walk.ts says why).
+export const ROLLOUT_DEPTH = 8;
+export const ROLLOUT_ENTRIES = 100_000;
+
+/// rollouts_in: Codex's rollout-*.jsonl files under a directory, at any depth up to ROLLOUT_DEPTH, at most
+/// ROLLOUT_ENTRIES entries looked at, on the directory's own file system, no link followed below it (`dir` itself may
+/// be one). Whether it stopped short.
+export function rolloutsIn(dir: string, out: string[], most: { depth?: number; entries?: number } = {}): boolean {
+  const root = statSync(dir, { throwIfNoEntry: false, bigint: true });
+  if (!root?.isDirectory()) return false;
+  const depthMost = most.depth ?? ROLLOUT_DEPTH;
+  let left = most.entries ?? ROLLOUT_ENTRIES;
+  let short = false;
+  const visit = (at: string, depth: number) => {
+    for (const entry of readDir(at)) {
+      if (left-- <= 0) {
+        short = true;
+        return;
+      }
+      const path = join(at, entry.name);
+      if (entry.isDirectory()) {
+        if (depth >= depthMost) short = true;
+        else {
+          // (lstat: a directory made a link since it was listed is not followed)
+          const sub = lstatSync(path, { throwIfNoEntry: false, bigint: true });
+          if (sub?.isDirectory() && sub.dev === root.dev) visit(path, depth + 1);
+        }
+      } else if (entry.name.startsWith("rollout-") && extension(entry.name) === "jsonl") out.push(path);
+    }
+  };
+  visit(dir, 1);
+  return short;
 }
 
 /// rollout_of: a rollout file of a thread: rollout-<time>-<id>.jsonl, or rollout-<time>-<id>_<more>.jsonl.

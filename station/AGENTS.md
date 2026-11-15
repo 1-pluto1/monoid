@@ -46,6 +46,15 @@
   line that says the main thread was held (`src/main.ts`) names, by caller, those that still take time.
   `test/main-thread-waits.test.ts` counts what a day's scenarios make it wait on; a change may lower the counts, never
   raise them.
+- The station's own background work yields the machine to the foreground: the MoonBit builders nobody waits on (its
+  backfills, `MbBackfill`, and the copies' export: `src/read/mb-reader.ts` `BACKGROUND_BUILDERS`) are started under
+  `platform.backgrounded` (`mbSpawned`; macOS's `taskpolicy -b`, which lowers its disk IO too where nice does not;
+  Linux's `ionice` and `nice`). A builder that answers a request, holds the backfill permit while a read waits
+  (`src/read/requested-builder.ts`) or is waited on by a person stays as it is, as do the readers that answer devices
+  (`--data`, `--serve`, `--sessions`): throttled on a busy Mac, each would hold up a person or the permit. A walk of a tree the station does not own (a
+  workspace, the home, a mirrored directory) goes through `src/ops/walk.ts` `walkBounded`: on its root's file system,
+  no link followed, bounded in entries, depth and time, yielding as it goes; a new walk does too, never a recursion of
+  its own (`src/read/machine.ts` `rolloutsIn`, synchronous on a reader thread, keeps the same bounds by itself).
 - Time is the Clock's (a `TestClock` in tests): `Date.now`, `new Date()`, `setTimeout`, `setInterval` only in
   `src/ops/fibers.ts` (`wall`, for what is shared with other programs: mtimes, expiries, deadlines to processes).
   `scripts/check.sh` refuses them elsewhere.
