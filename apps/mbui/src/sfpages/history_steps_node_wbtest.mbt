@@ -153,9 +153,11 @@ test "history task keeps its title visible when opened and toggles from its prev
   t.run_for(@ui.move_most_ms)
   assert_true(t.rect_of(title) is Some(_), msg="task title stays visible when expanded")
   assert_true(t.rect_of(result) is Some(_), msg="task result opens when preview is tapped")
-  assert_true(t.rect_of(@sf.t("web-main.fold")) is Some(_))
-  t.tap_text(@sf.t("web-main.fold"))
+  assert_true(t.rect_of(@sf.t("web-main.fold")) is None, msg="no 收起 words: the title's chevron turns")
+  let title_y = t.rect_of(title).unwrap().1
+  t.tap_text(title)
   t.run_for(@ui.move_most_ms)
+  assert_true((t.rect_of(title).unwrap().1 - title_y).abs() < 0.5, msg="the title stays where it was pressed")
   assert_true(t.rect_of(title) is Some(_))
   assert_true(t.rect_of(preview) is Some(_))
   assert_true(t.rect_of(result) is None)
@@ -208,10 +210,13 @@ test "history text expands on its first line and short single-line text omits fo
   t.tap_text(long_words)
   t.run_for(@ui.move_most_ms)
   let (_, expanded_y, _, expanded_h) = t.rect_of(long_words).unwrap()
-  let fold_y = t.rect_of(@sf.t("web-main.fold")).unwrap().1
+  assert_true(t.rect_of(@sf.t("web-main.fold")) is None, msg="no 收起 words: the chevron turns")
   assert_true(expanded_h > long_h, msg="expanded text wraps across multiple lines: \{expanded_h} vs \{long_h}")
   assert_true((expanded_y - collapsed_y).abs() <= 4.0, msg="expanded text starts on the first line: \{expanded_y} vs \{collapsed_y}")
-  assert_true((fold_y - expanded_y).abs() <= 6.0, msg="fold button aligns with the first line: \{fold_y} vs \{expanded_y}")
+  t.tap_text(long_words)
+  t.run_for(@ui.move_most_ms)
+  let (_, shut_y, _, shut_h) = t.rect_of(long_words).unwrap()
+  assert_true(shut_h <= 20.0 && (shut_y - collapsed_y).abs() < 0.5, msg="shut again, one line where it was: \{shut_y} \{shut_h}")
   steps_reset()
 }
 
@@ -404,28 +409,16 @@ test "reused history rows strip i/ prefix when expanding groups and messages" {
 }
 
 ///|
-test "curved_rail_lines connects icon centers at x=10 and curves around body at x=3" {
-  // Single-line header with next event: straight vertical connector at x = 10
-  let s1 = curved_rail_lines(20.0, 0.0, true, 0x000000FFL)
-  assert_eq(s1, [@ui.line([(10.0, 20.0), (10.0, 30.0)], width=1.25, color=0x000000FFL)])
-  // Single-line terminal header: no rail
-  assert_eq(curved_rail_lines(20.0, 0.0, false, 0x000000FFL).length(), 0)
-  // Wrapped multi-line in-row header without subordinate body: vertical connector to head_h - 1.5
-  let s_wrap = curved_rail_lines(44.0, 0.0, false, 0x000000FFL)
-  assert_eq(s_wrap, [@ui.line([(10.0, 20.0), (10.0, 42.5)], width=1.25, color=0x000000FFL)])
-  // Event with body followed by next event vs terminal event with body
-  let s_next = curved_rail_lines(20.0, 80.0, true, 0x000000FFL)
-  let s_end = curved_rail_lines(20.0, 80.0, false, 0x000000FFL)
-  assert_eq(s_next.length(), 1)
-  assert_eq(s_end.length(), 1)
-  assert_true(s_next != s_end, msg="rail_next=true extends into next icon while rail_next=false hooks at bottom")
-  let pts_next = curved_rail_pts(20.0, 80.0, true)
-  // Top curve starts at (10.0, 20.0) and reaches x = 3.0 at y = 27.0 (span = 3.5);
-  // bottom curve starts at (3.0, 96.5), returns to x = 10.0 at y = 103.5, and continues to (10.0, 110.0).
-  assert_eq(pts_next[0], 10.0)
-  assert_eq(pts_next[1], 20.0)
-  assert_eq(pts_next[pts_next.length() - 4], 10.0)
-  assert_eq(pts_next[pts_next.length() - 3], 103.5)
-  assert_eq(pts_next[pts_next.length() - 2], 10.0)
-  assert_eq(pts_next[pts_next.length() - 1], 110.0)
+test "rail_shapes draws one straight line at x=4 from the icon down" {
+  let c = 0x000000FFL
+  // On to the next event: from the icon's bottom to the next icon, past any body
+  assert_eq(rail_shapes(20.0, 0.0, true, c), [@ui.shape_of([([4.0, 20.0, 4.0, 30.0], false)], stroke=c, width=1.25)])
+  assert_eq(rail_pts(20.0, 80.0, true), [4.0, 20.0, 4.0, 110.0])
+  assert_eq(rail_pts(44.0, 0.0, true), [4.0, 20.0, 4.0, 54.0])
+  // Last event without a body: no rail
+  assert_eq(rail_shapes(20.0, 0.0, false, c).length(), 0)
+  assert_eq(rail_shapes(44.0, 2.0, false, c).length(), 0)
+  // Last event with a body: down beside it, 2px short of its end
+  assert_eq(rail_pts(20.0, 80.0, false), [4.0, 20.0, 4.0, 98.0])
+  assert_eq(rail_pts(18.0, 3.0, false), [4.0, 20.0, 4.0, 21.0])
 }

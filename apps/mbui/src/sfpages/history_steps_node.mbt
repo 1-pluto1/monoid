@@ -439,109 +439,36 @@ fn steps_main_node(v : @view.View, body : (@view.View) -> Unit) -> Unit {
 }
 
 ///|
-// kept across runs: a value (no field of it changes)
-let quarter_arc : Array[(Double, Double)] = [
-  (1.0, 0.0),
-  (0.980785, 0.195090),
-  (0.923880, 0.382683),
-  (0.831470, 0.555570),
-  (0.707107, 0.707107),
-  (0.555570, 0.831470),
-  (0.382683, 0.923880),
-  (0.195090, 0.980785),
-  (0.0, 1.0),
-]
-
-///|
-/// Builds the single continuous side-rail stroke for an event whose header row is `head_h` tall (`20×20` icon centered
-/// at `x = 10.0`) and whose subordinate body below it is `body_h` tall:
-/// - When `body_h <= 2.0`: draws a straight vertical connector from `(10.0, 20.0)` to `head_h + 10.0` when `rail_next`
-///   is true (or to `head_h - 1.5` when the header row itself expanded across multiple lines).
-/// - When `body_h > 2.0`: starts at `(10.0, 20.0)`, glides smoothly via two tangent `67.5°` circular arcs (`╭─╯`) from
-///   `(10.0, head_h)` to `x = 3.0`, runs straight down beside `body` (`pl = S3`), and at the bottom either curves back
-///   via `╰─╮` to `(10.0, head_h + body_h + 10.0)` (when `rail_next` is true) or finishes with a rounded `╰─` hook to
-///   `(10.0, head_h + body_h - 1.5)`.
-fn curved_rail_pts(head_h : Double, body_h : Double, rail_next : Bool) -> Array[Double] {
-  if body_h <= 2.0 {
-    if rail_next {
-      return [10.0, 20.0, 10.0, head_h + body_h + 10.0]
-    } else if head_h > 28.0 {
-      return [10.0, 20.0, 10.0, head_h - 1.5]
-    } else {
-      return []
-    }
-  }
-  let y_end = head_h + body_h
-  if body_h <= 14.0 {
-    let end_y = if rail_next { y_end + 10.0 } else { dmax(21.0, y_end - 1.0) }
-    return [10.0, 20.0, 10.0, end_y]
-  }
-  let pts : Array[Double] = []
-  if head_h > 20.5 {
-    pts.push(10.0)
-    pts.push(20.0)
-  }
-  let top_idx = 6
-  let (c_top, s_top) = quarter_arc[top_idx]
-  let r1 = 3.5 / (1.0 - c_top)
-  let span = dmin(3.5, dmax(2.0, (body_h - 4.0) * 0.25))
-  for i in 0..<=top_idx {
-    let (c, s) = quarter_arc[i]
-    pts.push(10.0 - r1 * (1.0 - c))
-    pts.push(head_h + (s / s_top) * span)
-  }
-  for j in 1..<=top_idx {
-    let (c, s) = quarter_arc[top_idx - j]
-    pts.push(3.0 + r1 * (1.0 - c))
-    pts.push(head_h + 2.0 * span - (s / s_top) * span)
-  }
-  let bot_start = dmax(head_h + 2.0 * span, y_end - span)
+/// The side rail's points for an event whose header row is `head_h` tall (its `20×20` icon pulled `6px` left, centred
+/// at `x = 4.0`) and whose subordinate body below it (`pl = S5`, clear of the rail) is `body_h` tall. The rail is one
+/// straight line at `x = 4.0` from the icon's bottom `(4.0, 20.0)`:
+/// - on to the next event's icon (`head_h + body_h + 10.0`) when `rail_next` is true;
+/// - otherwise down beside the body to `2px` above its end, or nothing when there is no body.
+fn rail_pts(head_h : Double, body_h : Double, rail_next : Bool) -> Array[Double] {
   if rail_next {
-    for i in 0..<=top_idx {
-      let (c, s) = quarter_arc[i]
-      pts.push(3.0 + r1 * (1.0 - c))
-      pts.push(bot_start + (s / s_top) * span)
-    }
-    for j in 1..<=top_idx {
-      let (c, s) = quarter_arc[top_idx - j]
-      pts.push(10.0 - r1 * (1.0 - c))
-      pts.push(bot_start + 2.0 * span - (s / s_top) * span)
-    }
-    if bot_start + 2.0 * span < y_end + 10.0 {
-      pts.push(10.0)
-      pts.push(y_end + 10.0)
-    }
+    [4.0, 20.0, 4.0, head_h + body_h + 10.0]
+  } else if body_h <= 2.0 {
+    []
   } else {
-    let r2 = span
-    let bot_y = bot_start + r2
-    for pair in quarter_arc {
-      let (c, s) = pair
-      pts.push(3.0 + r2 * (1.0 - c))
-      pts.push(bot_start + r2 * s)
-    }
-    pts.push(10.0)
-    pts.push(bot_y)
+    [4.0, 20.0, 4.0, dmax(21.0, head_h + body_h - 2.0)]
   }
-  pts
 }
 
 ///|
-fn curved_rail_lines(head_h : Double, body_h : Double, rail_next : Bool, color : Int64) -> Array[@ui.Line] {
-  let pts = curved_rail_pts(head_h, body_h, rail_next)
+fn rail_shapes(head_h : Double, body_h : Double, rail_next : Bool, color : Int64) -> Array[@ui.Shape] {
+  let pts = rail_pts(head_h, body_h, rail_next)
   if pts.is_empty() {
-    return []
+    []
+  } else {
+    [@ui.shape_of([(pts, false)], stroke=color, width=1.25)]
   }
-  let pairs : Array[(Double, Double)] = []
-  for i in 0..<(pts.length() / 2) {
-    pairs.push((pts[2 * i], pts[2 * i + 1]))
-  }
-  [@ui.line(pairs, width=1.25, color~)]
 }
 
 ///|
 /// Full-width event stack in `parent`: `head` renders the top event row (with its `20×20` `h_icon` centered at
-/// `x = 10.0`), `body` renders the subordinate block below it (indented by `pl = S3`), and an overlay rail connects
-/// from `(10.0, 20.0)` around `body` (`x = 10 -> 3 -> 10`) and on to the next event (`+10.0`) when `rail_next` is true.
+/// `x = 4.0`), `body` renders the subordinate block below it (indented by `pl = S5`, the column of the head's words), and an overlay rail runs
+/// straight down at `x = 4.0` from `(4.0, 20.0)` beside `body` and on to the next event (`+10.0`) when `rail_next` is
+/// true.
 fn event_stack_node(
   parent : @view.View,
   failed? : () -> Bool = fn() { false },
@@ -577,9 +504,9 @@ fn event_stack_node(
       body(b)
     })
     |> ignore
-    v.lines(By(fn() {
+    v.shapes(By(fn() {
       let color = @ui.tree_theme().color(if failed() { Danger } else { Line })
-      curved_rail_lines(head_h(), body_h(), rail_next(), color)
+      rail_shapes(head_h(), body_h(), rail_next(), color)
     }))
     |> ignore
   })
@@ -622,7 +549,7 @@ fn ev_node(
     |> ignore
     steps_box_node(e, h_ev_body, body, in_row=true)
   }
-  if rail || rail_last || icon == "said" || icon == "wait" {
+  if rail || rail_last {
     v.by_room(fn(p, room) {
       p.fills_across(Is(true)) |> ignore
       let row_ref : Ref[@view.View?] = Ref(None)
@@ -636,9 +563,9 @@ fn ev_node(
         row_ref.val = Some(e)
         make_ev(e)
       })
-      p.lines(By(fn() {
+      p.shapes(By(fn() {
         let color = @ui.tree_theme().color(if tone == "red" { Danger } else { Line })
-        curved_rail_lines(tall(), 0.0, rail || rail_last, color)
+        rail_shapes(tall(), 0.0, rail || rail_last, color)
       }))
       |> ignore
     })
@@ -712,59 +639,31 @@ fn item_node(
           } else {
             let key = ik + "/text"
             let open = fn() { steps_own.opened.contains(key) }
-            b.pick(open, fn(p, is_open) {
-              p.fills_across(Is(true)).cuts_softly(Is(true)) |> ignore
-              p.box(fn(r) {
-                @sf.style_node(r, fn() { h_one_press })
-                @sf.presses_node(r, fn() { steps_flip(key) })
-                r
-                .says(By(fn() {
-                  Some(@view.said(Button, label=if is_open { @sf.t("web-main.fold") } else { line }, expanded=is_open))
-                }))
-                |> ignore
-                if !is_open {
-                  r.box(fn(l) {
-                    l.shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
-                    @sf.words_node(l, fn() { line }, fn() { if @sf.lit_node(r) { h_one_hot } else { h_one_words } })
+            // (the pressed row stays the same node opened and shut, so the list keeps it where it was: mbui's
+            // press_stays.mbt; only what it shows inside comes and goes)
+            b.box(fn(r) {
+              @sf.style_node(r, fn() { h_one_press })
+              @sf.presses_node(r, fn() { steps_flip(key) })
+              r
+              .says(By(fn() { Some(@view.said(Button, label=line, expanded=open())) }))
+              .lines_up(By(fn() { if open() { Some(Start) } else { None } }))
+              |> ignore
+              // (its words one node beside the mark: one line cut short shut, all of it opened)
+              r.box(fn(w) {
+                w.grow(Is(1.0)).shrink(Is(1.0)).basis(Is(Some(0.0))).min_width(Is(Some(0.0))) |> ignore
+                w.pick(at_once=true, open, fn(p, is_open) {
+                  if is_open {
+                    steps_box_node(p, h_one_body, fn(m) { md_node(m, words, field(content, "md"), small=true) })
+                  } else {
+                    @sf.words_node(p, fn() { line }, fn() { if @sf.lit_node(r) { h_one_hot } else { h_one_words } })
                     |> ignore
-                  })
-                  |> ignore
-                  @sf.icon_node(
-                    r,
-                    "chevron-down",
-                    12.0,
-                    By(fn() { if @sf.lit_node(r) { @sf.theme().p.blue } else { @sf.theme().p.muted } }),
-                  )
-                  |> ignore
-                } else {
-                  r.lines_up(Is(Some(Start))) |> ignore
-                  steps_box_node(r, h_grow, fn(w) {
-                    steps_box_node(w, h_one_body, fn(m) { md_node(m, words, field(content, "md"), small=true) })
-                  }, in_row=true)
-                  r.box(fn(o) {
-                    @sf.style_node(o, fn() { h_one_open })
-                    o.min_height(Is(Some(20.0))).shrink(Is(0.0)) |> ignore
-                    @sf.words_node(o, fn() { @sf.t("web-main.fold") }, fn() {
-                      if @sf.lit_node(r) {
-                        h_one_fold_hot
-                      } else {
-                        h_one_fold
-                      }
-                    })
-                    |> ignore
-                    @sf.icon_node(
-                      o,
-                      "chevron-up",
-                      12.0,
-                      By(fn() { if @sf.lit_node(r) { @sf.theme().p.accent } else { @sf.theme().p.blue } }),
-                    )
-                    |> ignore
-                  })
-                  |> ignore
-                }
+                  }
+                })
               })
               |> ignore
+              steps_fold_mark_node(r, open)
             })
+            |> ignore
           }
         })
       }
@@ -889,8 +788,26 @@ fn steps_chevron_node(
 }
 
 ///|
+/// The mark at the end of a row `r` pressed to open and shut what it holds: a 12 chevron turning as it opens, in a box
+/// as high as the row's first line, so on a row of several lines it stays by the first.
+fn steps_fold_mark_node(r : @view.View, open : () -> Bool) -> Unit {
+  r.box(fn(c) {
+    @sf.style_node(c, fn() { h_one_mark })
+    c.shrink(Is(0.0)) |> ignore
+    steps_chevron_node(
+      c,
+      "chevron-down",
+      12.0,
+      By(fn() { if @sf.lit_node(r) { @sf.theme().p.blue } else { @sf.theme().p.muted } }),
+      open,
+    )
+  })
+  |> ignore
+}
+
+///|
 /// An event in one line in `v`: `lead`, then `line` cut at its end; pressed (where there is more), what
-/// `whole` makes under it beside the curved side rail, the line giving way to 收起.
+/// `whole` makes under it beside the side rail, the line staying and its chevron turning.
 fn one_line_ev_node(
   v : @view.View,
   icon : String,
@@ -912,35 +829,28 @@ fn one_line_ev_node(
           @sf.style_node(r, fn() { h_one_press })
           @sf.presses_node(r, fn() { steps_flip(key) })
           r
-          .says(By(fn() {
-            Some(@view.said(Button, label=if open() { @sf.t("web-main.fold") } else { line }, expanded=open()))
-          }))
+          .says(By(fn() { Some(@view.said(Button, label=line, expanded=open())) }))
           |> ignore
           lead(r)
-          r.show(fn() { !open() && line != "" }, fn(l) {
-            l.shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
-            @sf.words_node(l, fn() { line }, fn() {
-              if tone == "red" {
-                h_one_red
-              } else if @sf.lit_node(r) {
-                h_one_hot
-              } else {
-                h_one_words
-              }
+          // (its first line stays, opened or shut: what it says in whole comes under it)
+          if line != "" {
+            r.box(fn(l) {
+              l.shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
+              @sf.words_node(l, fn() { line }, fn() {
+                if tone == "red" {
+                  h_one_red
+                } else if @sf.lit_node(r) {
+                  h_one_hot
+                } else {
+                  h_one_words
+                }
+              })
+              |> ignore
             })
             |> ignore
-          })
-          r.show(fn() { !open() }, fn(i) {
-            @sf.icon_node(i, "chevron-down", 12.0, By(fn() { if @sf.lit_node(r) { @sf.theme().p.blue } else { @sf.theme().p.muted } })) |> ignore
-          })
-          r.show(open, fn(o) {
-            @sf.style_node(o, fn() { h_one_open })
-            o.grow(Is(1.0)) |> ignore
-            steps_box_node(o, h_grow, fn(_) {  }, in_row=true)
-            @sf.words_node(o, fn() { @sf.t("web-main.fold") }, fn() { if @sf.lit_node(r) { h_one_fold_hot } else { h_one_fold } })
-            |> ignore
-            @sf.icon_node(o, "chevron-up", 12.0, By(fn() { if @sf.lit_node(r) { @sf.theme().p.accent } else { @sf.theme().p.blue } })) |> ignore
-          })
+          }
+          steps_box_node(r, h_grow, fn(_) {  }, in_row=true)
+          steps_fold_mark_node(r, open)
         })
         |> ignore
       })
@@ -1302,12 +1212,10 @@ fn task_node(v : @view.View, key : String, task : Json?, rail : Bool, rail_last 
           @sf.style_node(r, fn() { h_one_press })
           @sf.presses_node(r, fn() { steps_flip(key) })
           r
-          .says(By(fn() {
-            Some(@view.said(Button, label=if open() { @sf.t("web-main.fold") } else { title }, expanded=open()))
-          }))
+          .says(By(fn() { Some(@view.said(Button, label=title, expanded=open())) }))
           |> ignore
           r.box(fn(l) {
-            l.shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
+            l.grow(Is(1.0)).shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
             @sf.words_node(l, fn() { title }, fn() {
               if failed {
                 h_one_red
@@ -1320,35 +1228,7 @@ fn task_node(v : @view.View, key : String, task : Json?, rail : Bool, rail_last 
             |> ignore
           })
           |> ignore
-          r.show(fn() { !open() }, fn(i) {
-            @sf.icon_node(
-              i,
-              "chevron-down",
-              12.0,
-              By(fn() { if @sf.lit_node(r) { @sf.theme().p.blue } else { @sf.theme().p.muted } }),
-            )
-            |> ignore
-          })
-          r.show(open, fn(o) {
-            @sf.style_node(o, fn() { h_one_open })
-            o.grow(Is(1.0)) |> ignore
-            steps_box_node(o, h_grow, fn(_) {  }, in_row=true)
-            @sf.words_node(o, fn() { @sf.t("web-main.fold") }, fn() {
-              if @sf.lit_node(r) {
-                h_one_fold_hot
-              } else {
-                h_one_fold
-              }
-            })
-            |> ignore
-            @sf.icon_node(
-              o,
-              "chevron-up",
-              12.0,
-              By(fn() { if @sf.lit_node(r) { @sf.theme().p.accent } else { @sf.theme().p.blue } }),
-            )
-            |> ignore
-          })
+          steps_fold_mark_node(r, open)
         })
         |> ignore
       })
@@ -1361,7 +1241,7 @@ fn task_node(v : @view.View, key : String, task : Json?, rail : Bool, rail_last 
             steps_box_node(p, h_task_preview_body, fn(rb) {
               rb.box(fn(s) {
                 @sf.style_node(s, fn() { h_one_press })
-                steps_pressed(s, fn() { steps_flip(key) })
+                steps_pressed(s, fn() { steps_flip(key) }, label=fn() { preview }, folds=true, open~)
                 steps_run(s, fn() { preview }, h_one_words, mono=!agent)
               })
               |> ignore
@@ -1444,7 +1324,7 @@ fn ended_node(v : @view.View, ends : String, words : String, rail : Bool) -> Uni
     ends
   } else if words.has_prefix("标记为做完了") || words.has_prefix("标记为已完成") || words.has_prefix("Marked as done") {
     "done"
-  } else if words.has_prefix("已暂停") || words.has_prefix("等待人工") || words.has_prefix("Paused") {
+  } else if words.has_prefix("已暂停") || words.has_prefix("暂停") || words.has_prefix("等待人工") || words.has_prefix("标记为等") || words.has_prefix("Paused") || words.has_prefix("Stopped for human") {
     "human"
   } else {
     ""
@@ -1490,6 +1370,36 @@ fn ended_node(v : @view.View, ends : String, words : String, rail : Bool) -> Uni
 }
 
 ///|
+/// The icon a group of calls and thoughts in the history leads with: what its calls do, by its title or its first
+/// call's kind (`step_label`); `think` for a group of thoughts alone.
+fn group_icon(g : Json?) -> String {
+  let rows = items(g, "rows")
+  guard rows.iter().find_first(fn(r) { text(Some(r), "kind") == "step" }) is Some(first) else { return "think" }
+  let title = text(g, "title")
+  let label = step_label(text(field(Some(first), "content"), "name"))
+  let says = fn(prefixes : Array[String], labels : Array[String]) {
+    prefixes.iter().any(fn(p) { title.has_prefix(p) }) || labels.contains(label)
+  }
+  if says(["修改", "编辑", "新建"], ["编辑", "新建"]) {
+    "edit"
+  } else if says(["读取"], ["读取"]) {
+    "file-text"
+  } else if says(["搜索"], ["搜索"]) {
+    "search"
+  } else if says(["运行", "命令"], ["命令"]) {
+    "command"
+  } else if says(["网页"], ["网页"]) {
+    "web"
+  } else if says(["子代理", "代理"], ["代理"]) {
+    "agent"
+  } else if says(["对话"], ["对话"]) {
+    "thread"
+  } else {
+    "other"
+  }
+}
+
+///|
 /// A group of calls and thoughts in `v`: its line, all of it opening the group (its title its tip, in
 /// `tips`); opened, a line each beside the group's side line.
 fn group_node(
@@ -1518,15 +1428,11 @@ fn group_node(
         h.ground(By(fn() { if @sf.lit_in_node(h) { @ui.tree_theme().color(Hover) } else { 0L } }))
         |> ignore
         steps_pressed(h, fn() { steps_flip(gk) }, label=fn() { text(g, "summary") }, folds=true, open~)
+        let g_icon = group_icon(g)
         h.box(fn(i) {
           @sf.style_node(i, fn() { h_icon })
-          steps_chevron_node(
-            i,
-            "chevron-right",
-            14.0,
-            By(fn() { if hot() { @sf.theme().p.text } else { @sf.theme().p.muted } }),
-            open,
-          )
+          @sf.icon_node(i, g_icon, 14.0, By(fn() { if hot() { @sf.theme().p.text } else { @sf.theme().p.muted } }))
+          |> ignore
         })
         |> ignore
         steps_box_node(h, h_grow_clip, fn(w) {
@@ -1550,6 +1456,7 @@ fn group_node(
           @sf.badge_node(h, fn() { @sf.t("web-main.history.pending", args=[("n", pending.to_string())]) }, tone=Accented)
           |> ignore
         }
+        steps_fold_mark_node(h, open)
         ignore(tips)
       })
       |> ignore
@@ -1747,9 +1654,9 @@ fn ev_live_node(
     (Some(has_rail), Some(h)) =>
       steps_box_node(v, h_ev, fn(e) {
         make_ev(e)
-        e.lines(By(fn() {
+        e.shapes(By(fn() {
           let color = @ui.tree_theme().color(if tone() == "red" { Danger } else { Line })
-          curved_rail_lines(h, 0.0, has_rail(), color)
+          rail_shapes(h, 0.0, has_rail(), color)
         }))
         |> ignore
       })
@@ -1767,9 +1674,9 @@ fn ev_live_node(
           row_ref.val = Some(e)
           make_ev(e)
         })
-        p.lines(By(fn() {
+        p.shapes(By(fn() {
           let color = @ui.tree_theme().color(if tone() == "red" { Danger } else { Line })
-          curved_rail_lines(tall(), 0.0, has_rail(), color)
+          rail_shapes(tall(), 0.0, has_rail(), color)
         }))
         |> ignore
       })
@@ -1815,9 +1722,19 @@ fn steps_reused_row_node(
             },
             same=fn(a, b) { a == b },
           )
+          let has_live_rail_sig = @signals.computed(
+            fn(_) {
+              match picked.get().row {
+                Some(Live(_, rail)) => rail
+                _ => false
+              }
+            },
+            same=fn(a, b) { a == b },
+          )
+          let has_live_rail = fn() { has_live_rail_sig.get() }
           steps_box_node(p, steps_row, fn(r) {
             steps_main_node(r, fn(m) {
-              ev_node(m, "think", "", "", rail_last=true, fn(b) {
+              ev_live_node(m, "think", fn() { "" }, rail_last=has_live_rail, fn(b) {
                 steps_words(b, fn() { live_words_sig.get() }, live_words) |> ignore
               })
             })
@@ -1893,77 +1810,83 @@ fn steps_reused_row_node(
                   let open = fn() { open_sig.get() }
                   let summary_sig = @signals.computed(fn(_) { text(content(), "summary") }, same=fn(a, b) { a == b })
                   let summary = fn() { summary_sig.get() }
-                  steps_box_node(m, h_group, fn(gv) {
-                    gv.lines(By(fn() {
-                      curved_rail_lines(20.0, 0.0, has_rail(), @ui.tree_theme().color(Line))
-                    }))
-                    |> ignore
-                    gv.box(fn(h) {
-                      @sf.style_node(h, fn() { h_group_head })
-                      let hot = fn() { @sf.lit_node(h) }
-                      h.ground(By(fn() { if @sf.lit_in_node(h) { @ui.tree_theme().color(Hover) } else { 0L } }))
-                      |> ignore
-                      steps_pressed(h, fn() { steps_flip(@signals.untracked(gk)) }, label=summary, folds=true, open~)
-                      h.box(fn(i) {
-                        @sf.style_node(i, fn() { h_icon })
-                        steps_chevron_node(
-                          i,
-                          "chevron-right",
-                          14.0,
-                          By(fn() { if hot() { @sf.theme().p.text } else { @sf.theme().p.muted } }),
-                          open,
-                        )
-                      })
-                      |> ignore
-                      steps_box_node(h, h_grow_clip, fn(w) {
-                        w.box(fn(rw) {
-                          rw
-                          .words_runs(By(fn() { [@ui.span(summary(), mono=false)] }))
-                          .words_look(By(fn() { @ui.style_words(h_group_words) }))
-                          .ink(By(fn() { @ui.style_ink(if hot() { h_group_hot } else { h_group_words }) }))
-                          .cuts(Is(true))
-                          .min_width(Is(Some(0.0)))
-                          .allow_ellipsis(Is(true))
+                  event_stack_node(
+                    m,
+                    rail_next=has_rail,
+                    fn(gv) {
+                      gv.box(fn(h) {
+                        @sf.style_node(h, fn() { h_group_head })
+                        let hot = fn() { @sf.lit_node(h) }
+                        h.ground(By(fn() { if @sf.lit_in_node(h) { @ui.tree_theme().color(Hover) } else { 0L } }))
+                        |> ignore
+                        steps_pressed(h, fn() { steps_flip(@signals.untracked(gk)) }, label=summary, folds=true, open~)
+                        let icon_sig = @signals.computed(fn(_) { group_icon(content()) }, same=fn(a, b) { a == b })
+                        let icon_fn = fn() { icon_sig.get() }
+                        h.box(fn(i) {
+                          @sf.style_node(i, fn() { h_icon })
+                          @sf.icon_node(
+                            i,
+                            @signals.untracked(icon_fn),
+                            14.0,
+                            By(fn() { if hot() { @sf.theme().p.text } else { @sf.theme().p.muted } }),
+                            name_now=icon_fn,
+                          )
                           |> ignore
                         })
                         |> ignore
-                      }, in_row=true)
-                      if has_failures {
-                        let failures_sig = @signals.computed(
-                          fn(_) { number(content(), "failures").to_int() },
-                          same=fn(a, b) { a == b },
-                        )
-                        @sf.badge_node(h, fn() {
-                          @sf.t("web-main.history.failures", args=[("n", failures_sig.get().to_string())])
-                        }, tone=Red)
-                        |> ignore
-                      }
-                      if has_pending {
-                        let pending_sig = @signals.computed(
-                          fn(_) { number(content(), "pending").to_int() },
-                          same=fn(a, b) { a == b },
-                        )
-                        @sf.badge_node(h, fn() {
-                          @sf.t("web-main.history.pending", args=[("n", pending_sig.get().to_string())])
-                        }, tone=Accented)
-                        |> ignore
-                      }
-                      ignore(tips)
-                    })
-                    |> ignore
-                    gv.pick(fn() { if open() { Some(gk()) } else { None } }, fn(s, cur_gk) {
-                      guard cur_gk is Some(cur) else { return }
-                      s.fills_across(Is(true)).cuts_softly(Is(true)) |> ignore
-                      let g = @signals.untracked(content)
-                      let rs = items(g, "rows")
-                      let calls = rs.iter().any(fn(r) { text(Some(r), "kind") == "step" })
-                      group_rows_node(s, src, station, key, cur, rs, calls)
-                    })
-                  })
+                        steps_box_node(h, h_grow_clip, fn(w) {
+                          w.box(fn(rw) {
+                            rw
+                            .words_runs(By(fn() { [@ui.span(summary(), mono=false)] }))
+                            .words_look(By(fn() { @ui.style_words(h_group_words) }))
+                            .ink(By(fn() { @ui.style_ink(if hot() { h_group_hot } else { h_group_words }) }))
+                            .cuts(Is(true))
+                            .min_width(Is(Some(0.0)))
+                            .allow_ellipsis(Is(true))
+                            |> ignore
+                          })
+                          |> ignore
+                        }, in_row=true)
+                        if has_failures {
+                          let failures_sig = @signals.computed(
+                            fn(_) { number(content(), "failures").to_int() },
+                            same=fn(a, b) { a == b },
+                          )
+                          @sf.badge_node(h, fn() {
+                            @sf.t("web-main.history.failures", args=[("n", failures_sig.get().to_string())])
+                          }, tone=Red)
+                          |> ignore
+                        }
+                        if has_pending {
+                          let pending_sig = @signals.computed(
+                            fn(_) { number(content(), "pending").to_int() },
+                            same=fn(a, b) { a == b },
+                          )
+                          @sf.badge_node(h, fn() {
+                            @sf.t("web-main.history.pending", args=[("n", pending_sig.get().to_string())])
+                          }, tone=Accented)
+                          |> ignore
+                        }
+                        steps_fold_mark_node(h, open)
+                        ignore(tips)
+                      })
+                      |> ignore
+                    },
+                    fn(gv) {
+                      gv.pick(fn() { if open() { Some(gk()) } else { None } }, fn(s, cur_gk) {
+                        guard cur_gk is Some(cur) else { return }
+                        s.fills_across(Is(true)).cuts_softly(Is(true)) |> ignore
+                        let g = @signals.untracked(content)
+                        let rs = items(g, "rows")
+                        let calls = rs.iter().any(fn(r) { text(Some(r), "kind") == "step" })
+                        group_rows_node(s, src, station, key, cur, rs, calls)
+                      })
+                    },
+                  )
                 }
                 4 => {
                   let line_sig = @signals.computed(fn(_) { text(content(), "line") }, same=fn(a, b) { a == b })
-                  ev_live_node(m, "said", fn() { "" }, rail_last=has_rail, fixed_h=20.0, fn(eb) {
+                  ev_live_node(m, "said", fn() { "" }, rail_last=has_rail, fn(eb) {
                     steps_box_node(eb, h_one, fn(o) { steps_words(o, fn() { line_sig.get() }, h_one_words) })
                   })
                 }
@@ -2252,7 +2175,7 @@ fn opened_node(
       summary(line)
       steps_chevron_node(
         line,
-        "chevron-right",
+        "chevron-down",
         12.0,
         By(fn() { if @sf.lit_in_node(line) { @sf.theme().p.blue } else { @sf.theme().p.muted } }),
         open,
@@ -3342,24 +3265,24 @@ let h_turn_words : @ui.TextStyle = @ui.text_style(size=Caption, color=Muted, wra
 let h_main : @ui.Style = @ui.css("w=Full gap=S2_5")
 
 ///|
-/// An event (hEv): its 20 gutter and what it is, 8 apart.
+/// An event (hEv): its 20 gutter and what it is, 6 apart, pulled 6 left so its icon centres on the rail at `x = 4.0` and its words start at `x = 20`, the column of what it holds below.
 // kept across runs: a value (no field of it changes)
-let h_ev : @ui.Style = @ui.css("row w=Full gap=S2 align=AStart")
+let h_ev : @ui.Style = @ui.css("row w=Full gap=S1_5 align=AStart").then(@sf.outset_start(6.0))
 
 ///|
-/// A received message's body beside the event's curved side rail (`12px` left offset).
+/// A received message's body beside the event's side rail (`20px` left offset: the column of the event's words, clear of the rail at `x = 4.0`).
 // kept across runs: a value (no field of it changes)
-let h_received_body : @ui.Style = @ui.css("w=Full pl=S3 pt=S1 pb=S1")
+let h_received_body : @ui.Style = @ui.css("w=Full pl=S5 pt=S1 pb=S0_5")
 
 ///|
-/// A collapsed background task preview's body beside the event's curved side rail (`12px` left offset).
+/// A collapsed background task preview's body beside the event's side rail (`20px` left offset: the column of the event's words, clear of the rail at `x = 4.0`).
 // kept across runs: a value (no field of it changes)
-let h_task_preview_body : @ui.Style = @ui.css("w=Full pl=S3 pt=S1 pb=S1")
+let h_task_preview_body : @ui.Style = @ui.css("w=Full pl=S5 pt=S0_5 pb=S0_5")
 
 ///|
-/// A sent card or expanded note/task body beside the event's curved side rail (`12px` left offset).
+/// A sent card or expanded note/task body beside the event's side rail (`20px` left offset: the column of the event's words, clear of the rail at `x = 4.0`).
 // kept across runs: a value (no field of it changes)
-let h_post_body : @ui.Style = @ui.css("w=Full pl=S3 pt=S1 pb=S0_5")
+let h_post_body : @ui.Style = @ui.css("w=Full pl=S5 pt=S1 pb=S0_5")
 
 ///|
 /// An event's mark (hIcon): 20 square, on whatever it stands on: the turn's rail runs from under it, so nothing of it
@@ -3468,7 +3391,7 @@ let h_toggle_words : @ui.TextStyle = @ui.text_style(size=Meta, color=Link, wrap=
 let h_toggle_hot : @ui.TextStyle = @ui.text_style(size=Meta, color=Accent, wrap=false)
 
 ///|
-/// An event in one line (hOne): 20 high, 12 muted (the ink pointed at, red when it failed), 6 apart; 收起 at its end;
+/// An event in one line (hOne): 20 high, 12 muted (the ink pointed at, red when it failed), 6 apart; a chevron at its end that turns as it opens;
 /// what it says in whole under it, 2 over and 4 under (hOneBody).
 // kept across runs: a value (no field of it changes)
 let h_one : @ui.Style = @ui.css("row w=Full min_h=S5 gap=S1_5 align=ACenter clip")
@@ -3479,7 +3402,7 @@ let h_one_press : @ui.Style = h_one.then(@ui.css("radius=Lg hovered{bg=Hover}"))
 
 ///|
 // kept across runs: a value (no field of it changes)
-let h_one_open : @ui.Style = @ui.css("row gap=S1 align=ACenter")
+let h_one_mark : @ui.Style = @ui.css("row h=S5 align=ACenter")
 
 ///|
 // kept across runs: a value (no field of it changes)
@@ -3504,14 +3427,6 @@ let h_one_red : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color=Dang
 ///|
 // kept across runs: a value (no field of it changes)
 let h_one_red_wrap : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color=Danger, w=Full)
-
-///|
-// kept across runs: a value (no field of it changes)
-let h_one_fold : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color=Link, wrap=false)
-
-///|
-// kept across runs: a value (no field of it changes)
-let h_one_fold_hot : @ui.TextStyle = h_one_fold.then(@ui.text_style(color=Accent))
 
 ///|
 // kept across runs: a value (no field of it changes)
@@ -3568,7 +3483,7 @@ let h_group : @ui.Style = @ui.css("w=Full")
 
 ///|
 // kept across runs: a value (no field of it changes)
-let h_group_head : @ui.Style = @ui.css("row w=Full px=S1_5 gap=S2 align=ACenter radius=Lg hovered{bg=Hover}").then(@sf.outset(6.0))
+let h_group_head : @ui.Style = @ui.css("row w=Full pr=S1_5 gap=S1_5 align=ACenter radius=Lg hovered{bg=Hover}").then(@sf.outset(6.0))
 
 ///|
 // kept across runs: a value (no field of it changes)
@@ -3579,9 +3494,9 @@ let h_group_words : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color=
 let h_group_hot : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color=Fg, wrap=false, w=Cut)
 
 ///|
-/// Its calls, opened (hSteps): 12px left offset beside the group's curved side rail (`x = 10 -> 3 -> 10`), 4 apart.
+/// Its calls, opened (hSteps): 20px left offset (the group head's words' column) beside the group's straight side rail at `x = 4.0`, 4 apart.
 // kept across runs: a value (no field of it changes)
-let h_steps : @ui.Style = @ui.css("w=Full pl=S3 pt=S1_25 pb=S1_5 gap=S1")
+let h_steps : @ui.Style = @ui.css("w=Full pl=S5 pt=S1 pb=S1 gap=S1")
 
 ///|
 /// A call's line (hStep summary): aligned with the card below it, 8 apart, 12.
