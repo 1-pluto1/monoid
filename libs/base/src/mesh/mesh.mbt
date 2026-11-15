@@ -928,8 +928,7 @@ async fn Mesh::open(
       }
       ignore(link.gone.succeed(closed))
       // Its end is kept now, and the link answers from that (`Link::ended`): nothing is asked of the connection at
-      // the shell again. Closed once more to be forgotten: what a page's shell lets go of it by; the Rust shell reads
-      // no `forget`, does nothing to one that ended, and keeps what it keeps of it (its end, for the asking).
+      // the shell again. Closed once more to be forgotten: both shells let go of it then, its streams with it.
       shell.tell("conn.close", { "id": link.conn, "code": 0, "reason": "closed", "forget": true })
       self.said(link)
     }),
@@ -1214,15 +1213,15 @@ pub async fn Mesh::close(self : Mesh) -> Unit {
   self.rebinding = false
   @effect.uninterruptible(() => {
     for link in open {
-      ignore(attempt(() => self.shell.call("conn.close", { "id": link.conn, "code": 0, "reason": "closed" })))
+      ignore(attempt(() => self.shell.call("conn.close", { "id": link.conn, "code": 0, "reason": "closed", "forget": true })))
     }
     for incoming in taken {
-      ignore(attempt(() => self.shell.call("conn.close", { "id": incoming.conn, "code": 0, "reason": "closed" })))
+      ignore(attempt(() => self.shell.call("conn.close", { "id": incoming.conn, "code": 0, "reason": "closed", "forget": true })))
     }
     // (with it go the connections on it nobody took, and the wait for the next: `iroh.close`, in both shells)
-    ignore(attempt(() => self.shell.call("iroh.close", { "id": self.endpoint })))
+    ignore(attempt(() => self.shell.call("iroh.close", { "id": self.endpoint, "forget": true })))
     for endpoint in pinned {
-      ignore(attempt(() => self.shell.call("iroh.close", { "id": endpoint })))
+      ignore(attempt(() => self.shell.call("iroh.close", { "id": endpoint, "forget": true })))
     }
   })
 }
