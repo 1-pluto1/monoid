@@ -4,6 +4,7 @@
 // notices). The actor itself runs in the MoonBit program (mb/src/reader/actor_run.mbt), the hub holding a shell of
 // each (mb-actor.ts) that answers it with these.
 import { presetCopyOf, presetInstructions } from "./presets.ts";
+import { markNotice } from "./chat.ts";
 import { sessionSkills } from "./agent-home.ts";
 import { writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -194,6 +195,8 @@ export type SessionDeps = {
   /// Turns are held (the station is about to stop or hand over, or is out of the session's workspace): none starts,
   /// messages stay pending.
   held(key: string): boolean;
+  /// What a chat stopped by a move answers, once a stop, as a person speaks in it (null: nothing now).
+  stoppedNotice?(key: string): string | null;
   /// Stopped while it waits: ends the session's jobs that would bring it back.
   stopJobs(key: string): Promise<void>;
   /// Archived: ends every job and service of the session.
@@ -266,7 +269,7 @@ export async function postNotice(deps: SessionDeps, key: string, text: string, p
     return;
   }
   try {
-    const ts = await chat.post({ channel: latest.thread.channel, threadTs: latest.thread.threadTs }, text, []);
+    const ts = await chat.post({ channel: latest.thread.channel, threadTs: latest.thread.threadTs }, markNotice(text), []);
     const [n] = store.insertMessage({ thread: latest.thread.id, ts, authorKind: STATION_AUTHOR, author: STATION_AUTHOR, text, profile, runtime, attachments: [], quotes: [], declared: null, client: null, card: null, options: null, agentIdentity: null, ...(change !== undefined ? { change } : {}) });
     recorded?.([latest.thread.id, n, ts]);
   } catch (error) {

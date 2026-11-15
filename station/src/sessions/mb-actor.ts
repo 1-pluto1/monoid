@@ -443,9 +443,10 @@ export class MbActor {
   compact(say = false): Promise<string | null> { return this.#call("compact", [say]); }
   compactToCap() { return this.#call("compactToCap").then(() => undefined); }
   clear(say = false, readBack = false): Promise<string | null> { return this.#call("clear", [say, readBack]); }
-  suspend() {
+  /// `why`: what is said of it (actor.ts `suspend`).
+  suspend(why = "the station is in no workspace") {
     this.#formatAbort?.abort();
-    return this.#call("suspend").then(() => undefined);
+    return this.#call("suspend", [why]).then(() => undefined);
   }
   async runChanged(change: RunChange): Promise<void> {
     await this.#call("runChanged", [runChangeWords(change, stationLang()), change]);

@@ -13,15 +13,15 @@
 // index and streams the lists, and what goes between the two stations is a list's piece at a time (retire.ts).
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, closeSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { appendFileSync, chmodSync, closeSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { rebuildable, roomOf } from "../sessions/footprint.ts";
 import { BUILTIN_SKILLS, FEEDBACK_SKILL } from "../sessions/agent-home.ts";
 import { runtimeKind } from "../agents/runtime.ts";
 import { sessionPlaces, storage, transcriptSources } from "../read/transcript.ts";
-import { moved } from "./restore.ts";
+import { carriedTo, moved } from "./restore.ts";
 
 /// A file that goes along, a line of its session's list: where it is (under the station's data directory), its bytes'
 /// hash, how big, its mode and time; a symbolic link its target instead (nothing to send).
@@ -49,7 +49,12 @@ export type CarriedHome = { dir: string; list: string; files: number; bytes: num
 /// index of a station from before, or where it has none).
 export type CarryIndex = { v: 2; dataDir: string; sessions: CarriedSession[]; gits: CarriedGit[]; skipped: string[]; jobs: CarriedJob[]; bundles: Record<string, string>; files: number; bytes: number; agent?: CarriedHome | null };
 /// What a gathering answers (the rest is on disk): where its index is, and how much it names.
-export type Gathered = { index: string; files: number; bytes: number; gits: number; skipped: number };
+/// `unreadable`: the files (and directories) of what goes that this station could not read: none goes left out silently,
+/// what gathered them says so (the first few; `unreadableCount` all of them).
+export type Gathered = { index: string; files: number; bytes: number; gits: number; skipped: number; unreadable?: string[]; unreadableCount?: number };
+
+/// Whether an error reading a file is that this station may not read it (not that it went meanwhile).
+const denied = (e: unknown) => ["EACCES", "EPERM"].includes((e as NodeJS.ErrnoException)?.code ?? "");
 
 /// A session of the workspace as the gathering reads it.
 type SessionAt = { key: string; workspace: string; cwd: string | null; runtime: string; profile: string; runtime_session_id: string | null; archived_at: number | null };
@@ -145,8 +150,11 @@ const git = (dir: string, args: string[], timeout?: number): string | null => {
 };
 
 /// The sessions of a workspace whose things go along, as both the gathering and the preview read them (`home`: the
-/// station's home workspace, whose sessions say none).
-const sessionsIn = (home: boolean) => `SELECT key, workspace, cwd, runtime, profile, runtime_session_id, archived_at FROM sessions WHERE ${home ? "(ws = ? OR ws IS NULL)" : "ws = ?"} ORDER BY key`;
+/// station's home workspace, whose sessions say none); `keys`: those sessions alone (a chat handed over, handover.ts),
+/// whatever their `ws`.
+const sessionsIn = (home: boolean, keys: readonly string[] | null = null) => keys !== null
+  ? "SELECT key, workspace, cwd, runtime, profile, runtime_session_id, archived_at FROM sessions WHERE key IN (SELECT value FROM json_each(?)) ORDER BY key"
+  : `SELECT key, workspace, cwd, runtime, profile, runtime_session_id, archived_at FROM sessions WHERE ${home ? "(ws = ? OR ws IS NULL)" : "ws = ?"} ORDER BY key`;
 
 /// A session's room under `dataDir` as its files go along (footprint.ts `roomOf`, said under `dataDir` as given,
 /// `realData` its real path), null where its directory is not the station's own (it stays, `skipped`).
@@ -181,14 +189,15 @@ export function preview(dataDir: string, db: string, ws: string, home: boolean):
 
 /// Where a gathering keeps its index and its lists, in `scratch`.
 export const indexFile = (scratch: string) => join(scratch, "index.json");
-const listFile = (scratch: string, key: string) => join(scratch, "lists", `${createHash("sha256").update(key).digest("hex").slice(0, 32)}.jsonl`);
+export const listFile = (scratch: string, key: string) => join(scratch, "lists", `${createHash("sha256").update(key).digest("hex").slice(0, 32)}.jsonl`);
 
 /// What goes along with the chats of `ws` on the station whose data directory is `dataDir`: their transcripts and each
 /// one's room, a git checkout in it as git lists its files (tracked and not ignored) with its repository, a linked
 /// worktree's commits no remote has in a bundle; written in `scratch` (a list a session, the index of them). A file of
 /// the gathering before that has the same size and time is not read again (its hash from that session's list then).
-/// `agent`: the workspace's agent home here, whose own files go along too (`homeFiles`).
-export function gather(dataDir: string, db: string, ws: string, home: boolean, scratch: string, agent: string | null = null): Gathered {
+/// `agent`: the workspace's agent home here, whose own files go along too (`homeFiles`). `keys`: those sessions alone,
+/// not the workspace's (a chat handed over: its scratch is its own).
+export function gather(dataDir: string, db: string, ws: string, home: boolean, scratch: string, agent: string | null = null, keys: readonly string[] | null = null): Gathered {
   const d = new DatabaseSync(db, { readOnly: true, timeout: 30_000 });
   const gits: CarriedGit[] = [];
   const sessions: CarriedSession[] = [];
@@ -204,6 +213,12 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
   let list: ListFile | null = null;
   /// Where what is added may be (the agent home's own files are under it, not the data directory's sessions).
   let under: (path: string) => boolean = (path) => carriedPlace(dataDir, path);
+  const unreadable: string[] = [];
+  let unreadableCount = 0;
+  const cannotRead = (path: string) => {
+    unreadableCount++;
+    if (unreadable.length < 5) unreadable.push(path);
+  };
   const add = (path: string) => {
     if (seen.has(path) || !under(path) || list === null) return;
     seen.add(path);
@@ -222,7 +237,8 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
     let hash: string;
     try {
       hash = was !== undefined && was.size === st.size && was.mtimeMs === st.mtimeMs ? was.hash : hashFile(path);
-    } catch {
+    } catch (e) {
+      if (denied(e)) cannotRead(path);
       return;
     }
     list.add({ path, hash, size: st.size, mode: st.mode & 0o777, mtimeMs: st.mtimeMs });
@@ -232,7 +248,8 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
     let names: string[];
     try {
       names = readdirSync(dir); // sync: in the gathering's own thread (gatherSoon)
-    } catch {
+    } catch (e) {
+      if (denied(e)) cannotRead(dir);
       return;
     }
     for (const name of names.sort()) {
@@ -252,7 +269,8 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
     let names: string[];
     try {
       names = readdirSync(dir); // sync: in the gathering's own thread (gatherSoon)
-    } catch {
+    } catch (e) {
+      if (denied(e)) cannotRead(dir);
       return;
     }
     if (names.includes(".git") && checkout(dir)) return;
@@ -357,7 +375,7 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
     realData = realpathSync(dataDir); // sync: in the gathering's own thread (gatherSoon)
   } catch {}
   try {
-    const rows = d.prepare(sessionsIn(home)).all(ws) as SessionAt[];
+    const rows = d.prepare(sessionsIn(home, keys)).all(keys !== null ? JSON.stringify(keys) : ws) as SessionAt[];
     const runs = d.prepare("SELECT id, profile, runtime FROM runtime_sessions WHERE session_key = ? ORDER BY at");
     for (const s of rows) {
       const at = listFile(scratch, s.key);
@@ -375,7 +393,10 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
       // subagents beside it.
       const ids = (runs.all(s.key) as { id: string; profile: string | null; runtime: string | null }[]).map((r) => ({ id: r.id, profile: r.profile, runtime: r.runtime ?? s.runtime }));
       if (s.runtime_session_id !== null && !ids.some((r) => r.id === s.runtime_session_id)) ids.push({ id: s.runtime_session_id, profile: s.profile, runtime: s.runtime });
-      const found = transcriptSources(dataDir, [], ids.filter((r) => runtimeKind(r.runtime) !== null), sessionPlaces(s));
+      // (looked for first where the runtime resumes it: under the project of the room's real path; another of the same
+      // id elsewhere is an older copy)
+      const places = sessionPlaces(s);
+      const found = transcriptSources(dataDir, [], ids.filter((r) => runtimeKind(r.runtime) !== null), [...new Set([...places.map(realOf), ...places])]);
       for (const t of found.paths) {
         add(storage(t.path));
         if (t.runtime === "claude") {
@@ -442,7 +463,7 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
   const path = indexFile(scratch);
   writeFileSync(`${path}.tmp`, JSON.stringify(index)); // sync: in the gathering's own thread (gatherSoon)
   renameSync(`${path}.tmp`, path); // sync: in the gathering's own thread (gatherSoon)
-  return { index: path, files, bytes, gits: gits.length, skipped: skipped.length };
+  return { index: path, files, bytes, gits: gits.length, skipped: skipped.length, ...(unreadableCount > 0 ? { unreadable, unreadableCount } : {}) };
 }
 
 /// The files of an agent home that go along: its MEMORY.md and presets.json, and every skill of its skills/ that people
@@ -495,18 +516,81 @@ export function homeFiles(agent: string): string[] {
 }
 
 /// What the index at `indexPath` says put under this station's data directory `dataDir`, each session's list and each
-/// file's bytes read from `from` (`<hash>` each, copied: a clone where the disk makes one): where the retired station
+/// file's bytes read from `from` (`<hash>` each, put in place by `putFile`): where the retired station
 /// had it, moved to here. One there already with the same size and time, or the same bytes, is left as it is, another
 /// put in its place. A link to the retired station's data directory names this one's. What of it could not be put (its
-/// bytes not brought) is counted.
-export function place(dataDir: string, indexPath: string, from: string): { placed: number; missing: number; kept: number } {
+/// bytes not brought) is counted. `made`: a file the paths it put where nothing was are written to, a line each (what a
+/// hand-over that fails takes away again, handover.ts). `aside`: a directory what was there and is replaced is moved
+/// into, the first time (`list.txt` says where each was: what a hand-over that fails puts back, handover.ts); none:
+/// what is replaced is removed. `placed`: a file of what this placing put or found in place before (path, hash, size,
+/// time), kept by it: one the index says the same of again is left without being looked at (a hand-over's second
+/// pass touches only what changed since its first).
+export function place(dataDir: string, indexPath: string, from: string, made: string | null = null, aside: string | null = null, placed: string | null = null, projects = false): { placed: number; missing: number; kept: number } {
   const index = JSON.parse(readFileSync(indexPath, "utf8")) as CarryIndex; // sync: in the placing's own thread (placeSoon)
+  // (what is there that is this placing's own already, made or put aside before: replaced, not put aside again)
+  const ours = new Set<string>();
+  for (const at of [made, aside === null ? null : join(aside, "list.txt")]) {
+    if (at !== null && existsSync(at)) for (const line of linesOf(at)) if (line !== "") ours.add(line.split("\t")[0]!); // sync: in the placing's own thread (placeSoon)
+  }
+  const known = new Map<string, string>();
+  if (placed !== null && existsSync(placed)) for (const line of linesOf(placed)) { // sync: in the placing's own thread (placeSoon)
+    const tab = line.indexOf("\t");
+    if (tab > 0) known.set(line.slice(0, tab), line.slice(tab + 1));
+  }
+  const placedFd = placed === null ? null : openSync(placed, "a"); // sync: in the placing's own thread (placeSoon)
+  const same = (_path: string, f: { hash: string; size: number; mtimeMs: number }) => `${f.hash}\t${f.size}\t${Math.trunc(f.mtimeMs)}`;
+  const seen = {
+    before: (path: string, f: { hash: string; size: number; mtimeMs: number }) => known.get(path) === same(path, f),
+    now: (path: string, f: { hash: string; size: number; mtimeMs: number }) => {
+      if (placedFd !== null && known.get(path) !== same(path, f)) writeSync(placedFd, `${path}\t${same(path, f)}\n`); // sync: in the placing's own thread (placeSoon)
+    },
+  };
+  const madeFd = made === null ? null : openSync(made, "a"); // sync: in the placing's own thread (placeSoon)
+  const fresh = (path: string) => {
+    ours.add(path);
+    if (madeFd !== null) writeSync(madeFd, `${path}\n`); // sync: in the placing's own thread (placeSoon)
+  };
+  const away = (path: string) => {
+    if (aside === null || ours.has(path)) return void rmSync(path, { recursive: true, force: true }); // sync: in the placing's own thread (placeSoon)
+    mkdirSync(aside, { recursive: true }); // sync: in the placing's own thread (placeSoon)
+    const name = `${createHash("sha256").update(path).digest("hex").slice(0, 32)}-${randomBytes(4).toString("hex")}`;
+    renameSync(path, join(aside, name)); // sync: in the placing's own thread (placeSoon)
+    appendFileSync(join(aside, "list.txt"), `${path}\t${name}\n`); // sync: in the placing's own thread (placeSoon)
+    ours.add(path);
+  };
+  try {
+    return placeAll(index, dataDir, from, fresh, away, seen, projects);
+  } finally {
+    if (madeFd !== null) closeSync(madeFd); // sync: in the placing's own thread (placeSoon)
+    if (placedFd !== null) closeSync(placedFd); // sync: in the placing's own thread (placeSoon)
+  }
+}
+
+/// `path`'s real path, the part of it not there yet as it is: what a process working in it will see (`/private/tmp/…`
+/// where it is behind a symlink).
+function realOf(path: string): string {
+  const rest: string[] = [];
+  for (let at = path; ; at = dirname(at)) {
+    try {
+      return join(realpathSync(at), ...rest.reverse()); // sync: in the placing's own thread (placeSoon)
+    } catch {
+      if (dirname(at) === at) return path;
+      rest.push(basename(at));
+    }
+  }
+}
+
+type Seen = { before(path: string, f: { hash: string; size: number; mtimeMs: number }): boolean; now(path: string, f: { hash: string; size: number; mtimeMs: number }): void };
+function placeAll(index: CarryIndex, dataDir: string, from: string, fresh: (path: string) => void, away: (path: string) => void, seen: Seen | null = null, projects = false): { placed: number; missing: number; kept: number } {
   let placed = 0;
   let missing = 0;
   let kept = 0;
   const root = resolve(dataDir);
   for (const s of index.sessions) {
     const list = join(from, s.list);
+    // (a chat handed over: its Claude transcripts under the project of its room here as the runtime sees it, its real
+    // path, whatever project they were under there)
+    const room = projects ? realOf(moved(s.workspace, index.dataDir, dataDir)) : null;
     if (!existsSync(list)) { // sync: in the placing's own thread (placeSoon)
       missing += s.files;
       continue;
@@ -519,8 +603,15 @@ export function place(dataDir: string, indexPath: string, from: string): { place
         continue;
       }
       // (resolved first: a path the other station said is put under this one's sessions or transcripts, or nowhere)
-      const path = resolve(moved(f.path, index.dataDir, dataDir));
+      // (`projects`, a chat handed over: a Claude transcript under its room's project here, where one there before
+      // would otherwise be the one its agent resumes; a retirement's stays where it was put, found by its id)
+      const path = resolve(projects ? carriedTo(f.path, index.dataDir, dataDir, room) : moved(f.path, index.dataDir, dataDir));
       if (!carriedPlace(root, path)) continue;
+      // (placed by this placing before as the index says it now: not looked at again)
+      if (!("link" in f) && seen?.before(path, f) === true) {
+        kept++;
+        continue;
+      }
       let there = null;
       try {
         there = lstatSync(path); // sync: in the placing's own thread (placeSoon)
@@ -532,14 +623,16 @@ export function place(dataDir: string, indexPath: string, from: string): { place
             kept++;
             continue;
           }
-          rmSync(path, { recursive: true, force: true }); // sync: in the placing's own thread (placeSoon)
+          away(path);
         }
         mkdirSync(dirname(path), { recursive: true }); // sync: in the placing's own thread (placeSoon)
         symlinkSync(target, path); // sync: in the placing's own thread (placeSoon)
+        if (there === null) fresh(path);
         placed++;
         continue;
       }
       if (there !== null && there.isFile() && there.size === f.size && (Math.trunc(there.mtimeMs) === Math.trunc(f.mtimeMs) || hashFile(path) === f.hash)) {
+        seen?.now(path, f);
         kept++;
         continue;
       }
@@ -550,21 +643,41 @@ export function place(dataDir: string, indexPath: string, from: string): { place
       }
       mkdirSync(dirname(path), { recursive: true }); // sync: in the placing's own thread (placeSoon)
       const tmp = `${path}.${randomBytes(4).toString("hex")}.carrying`;
-      copyFileSync(blob, tmp, constants.COPYFILE_FICLONE); // sync: in the placing's own thread (placeSoon)
+      putFile(blob, tmp);
       chmodSync(tmp, f.mode); // sync: in the placing's own thread (placeSoon)
       utimesSync(tmp, f.mtimeMs / 1000, f.mtimeMs / 1000); // sync: in the placing's own thread (placeSoon)
-      if (there !== null) rmSync(path, { recursive: true, force: true }); // sync: in the placing's own thread (placeSoon)
+      if (there !== null) away(path);
       renameSync(tmp, path); // sync: in the placing's own thread (placeSoon)
+      if (there === null) fresh(path);
+      seen?.now(path, f);
       placed++;
     }
   }
   return { placed, missing, kept };
 }
 
+/// A file sent (`blob`) put at `tmp` without copying its bytes: linked to it, where nothing else is linked to it yet.
+/// One linked already (the same bytes at another path, or a placing cut between its link and its rename) is copied, so
+/// that no two paths share a file (one written in place would change the other); so is one where the disk makes no
+/// link (another volume, a file system without them, too many links). Node's copy with COPYFILE_FICLONE copies the
+/// bytes on APFS (measured 2026-11-14: a station's disk filled as a retirement's 55 GB were placed), so no clone is
+/// asked for.
+export function putFile(blob: string, tmp: string): void {
+  if (lstatSync(blob).nlink === 1) { // sync: in the placing's own thread (placeSoon)
+    try {
+      linkSync(blob, tmp); // sync: in the placing's own thread (placeSoon)
+      return;
+    } catch (e) {
+      if (!["EXDEV", "EPERM", "ENOTSUP", "EMLINK", "ENOSYS"].includes((e as NodeJS.ErrnoException).code ?? "")) throw e;
+    }
+  }
+  copyFileSync(blob, tmp); // sync: in the placing's own thread (placeSoon)
+}
+
 if (!isMainThread && workerData?.carry !== undefined) {
   const a = workerData.carry;
   try {
-    const answer = a.op === "gather" ? gather(a.dataDir, a.db, a.ws, a.home, a.scratch, a.agent ?? null) : a.op === "preview" ? preview(a.dataDir, a.db, a.ws, a.home) : place(a.dataDir, a.index, a.from);
+    const answer = a.op === "gather" ? gather(a.dataDir, a.db, a.ws, a.home, a.scratch, a.agent ?? null, a.keys ?? null) : a.op === "preview" ? preview(a.dataDir, a.db, a.ws, a.home) : place(a.dataDir, a.index, a.from, a.made ?? null, a.aside ?? null, a.placed ?? null, a.projects === true);
     parentPort!.postMessage({ answer });
   } catch (e) {
     parentPort!.postMessage({ error: (e as Error).message });

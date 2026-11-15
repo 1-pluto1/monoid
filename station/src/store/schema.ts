@@ -462,6 +462,24 @@ CREATE TABLE IF NOT EXISTS model_stars (
   stars TEXT NOT NULL,
   PRIMARY KEY (ws, sub)
 );
+-- The chats handed from here to another station while both are up (replica/handover.ts): where each went, the
+-- workspace it was of here (null: the home one), its chat's thread here and there. Its rows here stay (a hand-back
+-- goes on from them); a device, a link or a letter naming it is told where it is.
+CREATE TABLE IF NOT EXISTS handed_over (
+  session TEXT PRIMARY KEY,
+  station TEXT NOT NULL,
+  ws TEXT,
+  thread INTEGER,
+  there INTEGER,
+  at INTEGER NOT NULL
+);
+-- What a chat being handed here has put in so far (the ctx of replica/handover.ts In), written in the same transaction as
+-- each page of its rows: a stop between a page and the hand-over's own file leaves nothing a drop does not take out.
+-- Gone once it is shown or dropped.
+CREATE TABLE IF NOT EXISTS handover_in (
+  id TEXT PRIMARY KEY,
+  ctx TEXT NOT NULL
+);
 `;
 
 /// Each message as it reads now: its latest edit's words, files and quotes.
@@ -1442,10 +1460,19 @@ export function addListState(db: DatabaseSync): void {
 /// is in (sessions.ws) and whose archive policy a row is (archive_policy.ws); NULL is the station's home workspace.
 export function addWorkspaceColumns(db: DatabaseSync): void {
   if (!has(db, "sessions", "ws")) db.exec("ALTER TABLE sessions ADD COLUMN ws TEXT");
+  // A chat handed here from another station (replica/handover.ts): the station it came from (none: it began here, or
+  // came back to where it began) and the one it began on (none: here).
+  if (!has(db, "sessions", "came_from")) db.exec("ALTER TABLE sessions ADD COLUMN came_from TEXT");
+  if (!has(db, "sessions", "began_on")) db.exec("ALTER TABLE sessions ADD COLUMN began_on TEXT");
   if (!has(db, "archive_policy", "ws")) db.exec("ALTER TABLE archive_policy ADD COLUMN ws TEXT");
   // The sessions counted by connect and workspace (store.ts SESSION_COUNTS, in every overview): from the index alone.
   db.exec("CREATE INDEX IF NOT EXISTS sessions_by_connect ON sessions (connect, ws)");
   // Which workspace each session is in, by its key (read/store.ts SEEN_OF, in each usage read): from the index alone,
   // not each session's whole row (every session's, for the usage page's history).
   db.exec("CREATE INDEX IF NOT EXISTS sessions_ws ON sessions (key, ws)");
+  // A workspace's sessions by key (store.ts sessionsOfWs: what a migration plans, move/), a page at a time. On an
+  // expression the other reads of `ws` do not name, so that it changes none of their plans (a plain (ws, key) index
+  // took the join of legacy-decision-session-store.test.ts's sessions by key from its index).
+  db.exec("DROP INDEX IF EXISTS sessions_by_ws");
+  db.exec("CREATE INDEX IF NOT EXISTS sessions_of_ws ON sessions (COALESCE(ws, ''), key)");
 }

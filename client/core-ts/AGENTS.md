@@ -118,6 +118,23 @@ A column a read needs is derived as the record is written (SQLite's of its JSON,
 JS's rule by list-rows.test.ts; the core's, `state` and `watched`, Derive: one algorithm each), and for rows an older core wrote (their `made` not `CHAT_MADE`) at the next open: every host opens its
 database alone (`locking_mode EXCLUSIVE`), so nothing an older core wrote is read before that.
 
+## A chat on another station now
+
+A chat handed to another station of its workspace (station/src/replica/handover.ts) is shown once, where it is, and
+goes on there with nothing said (`src/views/moved.ts` says how). Where it went is kept by the station it left and its
+session (account.ts `putMoved`, table `moved`) and read by `Data.chatNow`; a row of a station that said its chat went
+is never written (account.ts `#movedAway`), nor one the station it went to says came from it (its session's `from`,
+`#came`), so every read of `chat` sees one row a chat and no read filters. One session key on two stations with
+neither said is two chats (a platform thread's key is its connect's, each station's own: the lead, 2026-11-14).
+What names a chat on the station it left (a call's params, a link, a page's topic, a draft) is aimed through
+`chatNow` where it is read, never by rewriting what the UI holds: a page open on it keeps its topics and its thread id,
+each shown of its copy there (core/routing.ts `#movedTo`, one place for every topic a chat's page holds).
+`#came` is one rule whichever of the row and its summary's `from` comes first (`#summaryCame`), and takes the chat
+by its thread there once its row names it. A log held of a station that said its chat went is never asked of that
+station (its catch-up as a stream comes back aimed by `chatNow`: it would answer 404); and being told a chat is on a
+station (the one it left saying so, a `409 moved`, its row there come from another, it back) lets go of what was kept
+of it there as not there and reads again what a page holds of it (station/sync.ts `chatHere`).
+
 ## What is shared is never written
 
 Unchanged things being the same object is what makes rule 6 work, so a value read from the database

@@ -28,6 +28,13 @@ export type J = any;
 
 /// What `p` gives, or nothing once `ms` have gone by (a deadline: a core or a process that would not end).
 export const within = <T>(p: Promise<T>, ms: number): Promise<T | undefined> => Promise.race([p, new Promise<undefined>((r) => setTimeout(r, ms))]);
+/// `over` once `ms` have gone by, unless what it gives back is called first: a run's or a part's deadline (what it is
+/// given before it fails, not what it is expected to take), keeping no process up by itself.
+export function deadline(ms: number, over: () => void): () => void {
+  const t = setTimeout(over, ms);
+  t.unref();
+  return () => clearTimeout(t);
+}
 
 /// The watch of a directory waited on, kept for the rest of the run and shared by its waits: one stream of the file
 /// system's events for the run, not one begun and ended by each wait. It is only as good as the Mac's file events. On
@@ -35,38 +42,62 @@ export const within = <T>(p: Promise<T>, ms: number): Promise<T | undefined> => 
 /// eight writes in 12 s, and this run's waits ended by whatever else was told later, or not at all: round 7 failed with
 /// what it waited for there, "alice's own lock 16 long, not 16". So a wait looks once more as its time ends
 /// (`whenChanged`), and says when that was what saw it.
-const watches = new Map<string, Set<() => void>>();
+/// (closed as its last waiter goes: drill 24 kept a recursive watch of each station's whole data directory for the rest
+/// of the run, and a move of 2,384 rooms then held this process minutes at a time on their events, past a turn's end)
+const watches = new Map<string, { all: Set<() => void>; w: ReturnType<typeof watch> }>();
 function watching(d: string, changed: () => void): () => void {
   let told = watches.get(d);
   if (told === undefined) {
-    const all = (told = new Set<() => void>());
-    watches.set(d, all);
+    const all = new Set<() => void>();
     const w = watch(d, { recursive: true }, () => {
       for (const f of [...all]) f();
     });
+    told = { all, w };
+    watches.set(d, told);
+    const mine = told;
     // (a watch that fails, its directory gone: the next wait there begins another; those waiting keep their deadlines)
     w.on("error", () => {
-      if (watches.get(d) === all) watches.delete(d);
+      if (watches.get(d) === mine) watches.delete(d);
       w.close();
     });
     w.unref();
   }
-  told.add(changed);
+  told.all.add(changed);
   const mine = told;
-  return () => void mine.delete(changed);
+  return () => {
+    mine.all.delete(changed);
+    if (mine.all.size === 0 && watches.get(d) === mine) {
+      watches.delete(d);
+      mine.w.close();
+    }
+  };
 }
 
 /// What `ok` gives, looked at again as each of `dirs` changes (the file system's events, as scripts/waitfor.mjs waits:
 /// a station's database and the lock chains it keeps), or an error saying `what` by `ms`. Looked at once more at `ms`:
 /// what holds by then is not failed for no change having been seen of it, and the run says that it was so.
-export function whenChanged<T>(dirs: string[], ok: () => T | undefined | null | false, ms: number, what: () => string): Promise<T> {
+/// Calls `said` with how long this process's loop was held each time a once-a-second tick comes over a second late.
+export function heldProbe(said: (ms: number) => void): void {
+  let last = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    if (now - last > 2000) said(now - last - 1000);
+    last = now;
+  }, 1000).unref();
+}
+
+/// (`every`: looked at again that often besides, where a file event may be missed: drill 23 saw a move's turn end 215
+/// and 268 s after the station wrote it, by the next event in that directory)
+export function whenChanged<T>(dirs: string[], ok: () => T | undefined | null | false, ms: number, what: () => string, every?: number): Promise<T> {
   return new Promise((resolve, reject) => {
     let done = false;
     const end = () => {
       done = true;
       clearTimeout(deadline);
+      if (again !== undefined) clearInterval(again);
       for (const stop of stops) stop();
     };
+    const again = every === undefined ? undefined : setInterval(() => void look(), every);
     const look = (): boolean => {
       if (done) return false;
       const got = ok();
@@ -77,7 +108,11 @@ export function whenChanged<T>(dirs: string[], ok: () => T | undefined | null | 
       if (look()) log(`  (seen only as its ${ms} ms ended: no change of ${dirs.join(", ")} was told for it; are this Mac's file events late or lost?)`);
       else if (!done) (end(), reject(new Error(what())));
     }, ms);
-    const stops = dirs.map((d) => watching(d, () => void look()));
+    // (a directory not there yet, as A's `move/` before any move wrote it: not watched, looked at every second instead)
+    const missing = dirs.filter((d) => !existsSync(d));
+    const stops = dirs.filter((d) => existsSync(d)).map((d) => watching(d, () => void look()));
+    const slow = missing.length > 0 && every === undefined ? setInterval(() => void look(), 1000) : undefined;
+    if (slow !== undefined) stops.push(() => clearInterval(slow));
     look();
   });
 }
@@ -90,7 +125,9 @@ const askedFile = (data: string) => join(data, "asked.log");
 /// of its own, its first write the head line (client/core-ts/src/mesh.ts `#open`: `{"method","path",…}`), its answer
 /// read to its end as that stream reads null, the station the connection's (`remoteId`, a station's id). `told` hears
 /// each such answer; nothing the core sends or reads is changed.
-function watchRequests(told: (station: string, method: string, path: string) => void): void {
+/// (`body`: given the whole answer, as read, of each request whose path `bodyOf` picks: what a station said, word for
+/// word, where a drill needs it beside what the core made of it)
+function watchRequests(told: (station: string, method: string, path: string, status: string, ms: number) => void, bodyOf?: (path: string) => boolean, body?: (station: string, path: string, raw: string) => void): void {
   // (the object as it is, but for `own`: the native one's methods called on it)
   const over = <T extends object>(target: T, own: Record<string, unknown>): T =>
     new Proxy(target, {
@@ -103,24 +140,40 @@ function watchRequests(told: (station: string, method: string, path: string) => 
   const stream = (s: J, station: string): J => {
     let first = true;
     let head: { method: string; path: string } | null = null;
+    // (the answer's head as it is read: its status where it says one)
+    let answered = "";
+    let chunks: Buffer[] | null = null;
+    // (when its head was written: how long the station took to answer it, read to its end)
+    let began = 0;
     return over(s, {
       write: (b: Buffer) => {
         if (first) {
           first = false;
+          began = Date.now();
           const end = b.indexOf(10);
           try {
             const h = end > 0 ? JSON.parse(b.subarray(0, end).toString("utf8")) : null;
-            if (typeof h?.method === "string" && typeof h.path === "string") head = { method: h.method, path: h.path };
+            if (typeof h?.method === "string" && typeof h.path === "string") {
+              head = { method: h.method, path: h.path };
+              if (bodyOf?.(h.path) === true) chunks = [];
+            }
           } catch {}
         }
         return s.write(b);
       },
       read: async () => {
         const b = await s.read();
+        if (answered === "" && b !== null && b !== undefined) answered = /"status"\s*:\s*(\d{3})/.exec(Buffer.from(b).subarray(0, 400).toString("utf8"))?.[1] ?? "-";
+        if (chunks !== null && b !== null && b !== undefined) chunks.push(Buffer.from(b));
         if ((b === null || b === undefined) && head !== null) {
           const h = head;
           head = null;
-          told(station, h.method, h.path);
+          told(station, h.method, h.path, answered, Date.now() - began);
+          if (chunks !== null) {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            chunks = null;
+            body?.(station, h.path, raw);
+          }
         }
         return b;
       },
@@ -144,10 +197,13 @@ if (process.argv[2] === "device") {
   // (its record: what its links do, the core's lines; and each request of a station answered, this file's)
   const record = join(data, "record.log");
   // (before the core is loaded: it loads the addon as its host is made)
-  watchRequests((station, method, path) => {
-    appendFileSync(record, `asked: ${station.slice(0, 8)} ${method} ${path} -> answered\n`);
+  watchRequests((station, method, path, status, ms) => {
+    appendFileSync(record, `asked: ${new Date().toISOString().slice(11, 23)} ${station.slice(0, 8)} ${method} ${path} -> answered${status !== "" && status !== "-" ? ` ${status}` : ""} in ${ms} ms\n`);
     if (process.connected) process.send!({ answered: { station, method, path } });
   });
+  // (how long this process's own loop was held, where over a second: drill 24 saw a turn's end minutes late and could not
+  // tell whose loop it was)
+  heldProbe((ms) => appendFileSync(record, `${new Date().toISOString()} held: this device's process did nothing else for ${ms} ms\n`));
   const { start } = await import(pathToFileURL(join(src, "client/core-ts/src/hosts/node.ts")).href);
   // (`again`: the same device started anew, its data and what it sealed kept)
   if (process.argv[4] !== "again") rmSync(data, { recursive: true, force: true });
@@ -330,7 +386,9 @@ export class Device {
     });
   }
   /// The topic's value once `ok` gives something (or the time is up: what it was, in the error).
-  until<T>(topic: J, ok: (v: J) => T | undefined | null | false, ms = 60_000): Promise<T> {
+  /// `stop`: an error the topic gives that says what is waited for cannot come (a chat its station says it has not):
+  /// the wait ends at once with it, rather than at `ms`.
+  until<T>(topic: J, ok: (v: J) => T | undefined | null | false, ms = 60_000, stop?: (error: J) => boolean): Promise<T> {
     const id = this.next++;
     return new Promise((resolve, reject) => {
       const entry = { value: undefined as J, error: undefined as J, changed: () => {} };
@@ -343,7 +401,14 @@ export class Device {
         reject(new Error(`${this.name} timed out on ${JSON.stringify(topic)}: ${JSON.stringify(entry.value ?? entry.error)?.slice(0, 2500)}`));
       }, ms);
       entry.changed = () => {
-        if (entry.value === undefined) return;
+        if (entry.value === undefined) {
+          if (entry.error !== undefined && stop?.(entry.error)) {
+            clearTimeout(timer);
+            end();
+            reject(new Error(`${this.name} told it cannot come on ${JSON.stringify(topic)}: ${JSON.stringify(entry.error)?.slice(0, 600)}`));
+          }
+          return;
+        }
         const got = ok(entry.value);
         if (got) {
           clearTimeout(timer);

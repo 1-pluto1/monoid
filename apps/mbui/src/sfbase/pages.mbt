@@ -804,6 +804,7 @@ fn setting_kind(r : @settings.Route) -> String {
     Permissions => "Permissions"
     Archiving => "Archiving"
     StationArchiving(_) => "StationArchiving"
+    StationMove(_) => "StationMove"
     UsagePrices(_) => "UsagePrices"
     RunSettings(_, _) => "RunSettings"
   }
@@ -965,6 +966,7 @@ pub fn open_setting(name : String) -> Unit {
 fn setting_way(r : @settings.Route) -> Array[@settings.Route] {
   match r {
     Memory(_) => [Memories]
+    StationMove(a) => [Stations, Station(a)]
     MemoryDoc(a, _, _) => [Memories, Memory(a)]
     AutoCompletion => [AutoDecisions]
     AutoPolicy(_) => [AutoDecisions, AutoCompletion]

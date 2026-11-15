@@ -1,0 +1,1241 @@
+// One chat handed from this station to another of its workspace while both are up (the owner, 2026-11-14: a
+// whole-station move is every chat handed over, then its connects and logins; the reverse hand-over is the way back;
+// replica/AGENTS.md). The unit: a session, its agent, its room and transcripts, with the threads it takes part in, and
+// the sessions that share its still.fail home chat with it. A platform thread is routed per connect, so two bots'
+// sessions in one Slack thread move each on its own, and each station keeps its own copy of that thread's log.
+//
+// Driven by the station that has it (A), each step said to the one that takes it (B) by `handover.*`, each side's state
+// in a file of its own (`handover/out/<id>.json`, `handover/in/<id>.json`: a file a hand-over, written whole, as
+// retire.ts keeps its own; no table, so nothing of it is in the copies' export or the schema), so that either started
+// again goes on, or undoes what it put in:
+// 1. checks, refused in words that say what to do (`check`);
+// 2. the chat held here (sessions/hub.ts `holdChat`): its turn not cut (a busy one refused, or waited for), no new one,
+//    its process ended, its jobs stopped and kept (what the jobs module starts there, move/jobs.ts); what is said to it
+//    meanwhile is kept in its threads' logs, delivered where it ends up;
+// 3. its files gathered alone (carry-worker.ts `gather` with its keys, a scratch of its own), what B lacks sent
+//    (sending.ts), each checked by its hash there, placed (what B made kept, to take away where it fails);
+// 4. its rows sent a bounded page at a time (store/handover.ts), put in through B's store, hidden (`comingWs`);
+// 5. B counts what it has; A compares; only then A says it went (store `handOff`, durably, before anyone is told),
+//    sends what was said meanwhile (its logs' rest, its threads' platforms' events waited for), tells B to show it, and
+//    re-points each of its platform threads where the connect runs (connects/workspace.ts `route`).
+// A failure before A said it went: B takes out what it put in, the chat goes on here, its jobs started again. After,
+// nothing is undone: A tells B again until it answers (on start, on failure with a backoff; never polled).
+// Nothing is posted in its threads nor said in the chat; its agent is told once as its next turn starts (moved_notes).
+import { createHash, randomBytes } from "node:crypto";
+import { createReadStream, readFileSync, readdirSync } from "node:fs";
+import { appendFile, mkdir, readFile, readdir, realpath, rename, rm, rmdir, stat, statfs, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { type Bytes, Refused, bytesOf, withBytes } from "../mesh/bus.ts";
+import { stopBytes } from "../mesh/files.ts";
+import type { Fibers } from "../ops/fibers.ts";
+import { log } from "../ops/log.ts";
+import { knownOf } from "../connects/remote.ts";
+import type { Described, Known } from "../connects/remote.ts";
+import { CHAT_TABLES, BY_N, MARKS, type ChatTable, type Counts, type ImportCtx, afterOf, newCtx } from "../store/handover.ts";
+import type { Store } from "../store/store.ts";
+import type { SessionRow } from "../store/rows.ts";
+import { STILLFAIL_SURFACE, comingWs, handedWs } from "../store/rows.ts";
+import { type CarriedJob, type CarryIndex, type Gathered, carriedPlace, listFile } from "./carry-worker.ts";
+import { HASH, STATION, WORKSPACE } from "./format.ts";
+import type { Ask } from "./peers.ts";
+import { Gone, type Need, Said, UNANSWERED, sayOf } from "../move/module.ts";
+import type { KeptSend } from "../api/admin.ts";
+import { HEADROOM, LACK_MOST, type MadeGit, RETRY_MOST_MS, RETRY_MS, connectsThere, gatherSoon, placeSoon, rebuildGits } from "./retire.ts";
+import { lackingIn, receiveFile, sendGathered } from "./sending.ts";
+import { carriedTo, moved } from "./restore.ts";
+import { stationLang, tr } from "../ops/i18n.ts";
+
+type Json = any;
+
+/// How long a hand-over waits for a busy chat's turn to end, where it was asked to wait.
+export const TURN_WAIT_MS = 10 * 60_000;
+
+/// What a chat's station sends after it was shown where it went: what was said there meanwhile.
+const AFTER_SHOWN: readonly ChatTable[] = ["entries", "letters", "deliveries"];
+
+/// Why a chat cannot go to station `name`: a chat of its key is live there (`keys`), one that went on there apart from
+/// this one (the copy a retirement taken back left there, 2026-11-14): never merged into, whichever had more.
+export const liveHereWords = (_keys: readonly string[], name: string) => why("liveThere", { station: name });
+
+/// Why a hand-over did not go, in the station's language (`station.move.why.*`): every reason the chat's failure gives.
+const why = (key: string, args: Record<string, unknown> = {}) => tr(stationLang(), `station.move.why.${key}`, args);
+
+/// What carrying a chat's files failed of, in the station's words (`station.move.why.*`), what happened and what to do:
+/// what a person can act on of its own (a file this station cannot read, no room left), the other station not
+/// answering as they went (its connection gone, no answer, no answer in time), else that they could not be carried;
+/// what the other station said, or the move's own words, as they are. The error as it came is the log's alone.
+const carryWords = (e: unknown): Error => {
+  // (the other found gone as its files went, `#ask`'s: said as what it means here)
+  if (e instanceof Gone) return new Said(why("carryUnanswered"));
+  if (e instanceof Refused || e instanceof Said) return e;
+  const err = e as NodeJS.ErrnoException;
+  if (err?.code === "EACCES" || err?.code === "EPERM") return new Said(why("cannotRead", { path: err.path ?? "", count: 1 }));
+  if (err?.code === "ENOSPC") return new Said(why("noSpace"));
+  const cause = err?.message ?? String(e);
+  log.warn("handover", "a chat's files could not be carried", { error: cause, code: err?.code ?? null });
+  // (mesh/peer.ts PeerGone says its connection was gone and the request got no answer)
+  return new Said(why(UNANSWERED.test(cause) ? "carryUnanswered" : "carryFailed"));
+};
+
+/// What a session's account is known by across the workspace: the share it is a copy of or the host of (`share`), the
+/// key it runs with (`key`, a hash of it), or a login not shared, by its id where it is (`own`: `<id>@<station>`, the
+/// id it keeps where it moves); null: this machine's own login, which cannot be had elsewhere.
+export type AccountOf = { share?: string; key?: string; own?: string; name: string };
+
+/// A step of a hand-over on the station it leaves:
+/// - `held`: checked and held, its jobs stopped and kept;
+/// - `files`, `rows`: being sent;
+/// - `gone`: it went (B counted what it has); B is told the rest and to show it, its threads re-pointed (`told`);
+/// - `failed`: it did not go, and goes on here (B is told to take out what it put in, `dropOwed`);
+/// - `done`: it is there, and every thread re-pointed.
+export type OutStep = "held" | "files" | "rows" | "gone" | "failed" | "done";
+export type Out = {
+  id: string; keys: string[]; to: string; toName: string; ws: string; at: number; step: OutStep; error: string | null;
+  jobs: CarriedJob[]; dropOwed: boolean;
+  /// Of each thread (by its id here): the last entry and letter sent; and what B said it has.
+  sent: Record<string, { entries: number; letters: number }>; counts: Counts | null;
+  /// Each session's home thread here and there (B's answer), its threads' platforms' (connect, channel, ts), and those
+  /// re-pointed already.
+  there: Record<string, { thread: number | null; there: number | null }>; routes: { connect: string; channel: string; threadTs: string }[]; routed: number;
+  /// Whether B showed it; and whether what was taken here between its rows' last sending and its going out of sight
+  /// here (`shownThere`) was sent after it and B took it up (`caught`).
+  shown: boolean; caught?: boolean;
+  /// Its chat came back here since (`#endOuts`): over for good, nothing of it replayed or told. `v`: written by a station
+  /// that ends its records so (2); one of before is judged by whether its chat came back (`#cameBack`).
+  ended?: boolean; v?: 2;
+  /// What was sent and placed of its files (bytes), for the status; of them, the bytes of the room's own files that
+  /// went (what was in place there already did not).
+  done: number; total: number; sentBytes?: number;
+  /// Whether the chat is held: not while its files go a first time, the chat working (`handOver`); none said: held
+  /// (one from before there were two passes).
+  held?: boolean;
+  /// The move it is part of was asked to stop: given up at its next step, until it is gone (`abandon`).
+  abandoned?: boolean;
+};
+/// A step of one on the station it goes to: being put in (`coming`), shown (`shown`), taken out (`dropped`).
+/// `stoppedFor`: it arrives stopped, waiting for that; `bindings`: the single-session connects (as known here) bound to
+/// its sessions.
+export type In = { id: string; origin: string; keys: string[]; ws: string; at: number; step: "coming" | "shown" | "dropped"; ctx: ImportCtx; carry: string | null; error: string | null; stoppedFor?: Need | null; bindings?: Record<string, string> };
+
+export type HandoverDeps = {
+  data: string;
+  here: () => string | null;
+  home: () => string | null;
+  /// The whole stations of `ws` with their names (null while not current).
+  roster: (ws: string) => { id: string; name: string; tasks?: boolean }[] | null;
+  ask: Ask;
+  fibers: Fibers;
+  store: Store;
+  /// The hub (sessions/hub.ts): a chat held one at a time and let go, its turn's state, what a thread's platform said
+  /// waited for, a chat woken, a connect's surface.
+  hub: {
+    holdChat(key: string, why: string, notice?: () => string): Promise<void>;
+    releaseChat(key: string): boolean;
+    wakeChat(key: string): void;
+    busy(key: string): boolean;
+    /// Once its turn ended (at once where none runs).
+    turnEnded(key: string): Promise<void>;
+    drained(connect: string, channel: string, threadTs: string): Promise<void>;
+    wsOf(key: string | SessionRow): string | null;
+  };
+  /// The workspace's connects (connects/workspace.ts): a thread re-pointed where its connect runs, what one says of
+  /// itself and where it runs, learnt from another station, and how one goes (null: not known here).
+  connects: {
+    route(id: string, channel: string, threadTs: string, station: string): Promise<void>;
+    describedFor(id: string): { station: string; described: Described } | null;
+    learnOf(known: Known, station: string, described: Described): void;
+    kindOf(id: string): { kind: string; mode: string } | null;
+    own(): string[];
+    /// The station connect `id` runs on (null: this one, or not known).
+    runsOn(id: string): string | null;
+  } | null;
+  /// The jobs of sessions here up now (with what it takes to run them again), and stopping them; one started again
+  /// here (a hand-over that failed).
+  jobs: { of(keys: string[]): CarriedJob[]; stop(keys: string[], why: string): Promise<void>; start(job: CarriedJob): void };
+  /// What a profile here is known by elsewhere (null: none here), and the profile here of one so known (null: none).
+  /// `present`: whether profile `id` is one of this station's (in its config): one that is not is a login of no
+  /// station's to its chats unless the station they go to has it (the plan's rule, move/accounts.ts), no need of them.
+  accounts: { of(id: string): AccountOf | null; here(a: AccountOf): string | null; present?(id: string): boolean };
+  reposDir: string;
+  room?: () => Promise<{ free: number | null }>;
+  hasGit?: () => Promise<boolean>;
+  git?: (dir: string, args: string[]) => Promise<string>;
+  lackMost?: number;
+  work?: { gather: typeof gatherSoon; place: typeof placeSoon };
+  /// Told as a hand-over's state changes (the scheduler, move/).
+  changed?: (id: string) => void;
+  /// A chat that arrived here stopped, waiting for `need` (move/scheduler.ts `noteStopped`), held before it is shown.
+  arrivedStopped?: (keys: string[], need: Need & { label?: string; at?: string }, ws: string) => Promise<void>;
+  /// The messages written under a client's key to these threads here, each to its thread there (api/admin.ts
+  /// `keptSends`), and those of a chat handed here kept as if written here (`keepSends`).
+  keptSends?: (threads: ReadonlyMap<number, number>) => KeptSend[];
+  keepSends?: (sends: readonly KeptSend[]) => void;
+  /// What keeps the station from updating itself while a chat comes here (updates/holds.ts `hold`): its let-go.
+  hold?: () => () => void;
+  /// Chats `keys` shown here (what their connect kept for them while they were on their way, taken: move/station.ts).
+  shown?: (keys: string[]) => Promise<void> | void;
+  /// Chats `keys` went from here (`gone`): what kept them stopped here is no longer this station's (the scheduler's
+  /// stopped set): one that comes back is stopped anew as it arrives.
+  went?: (keys: string[]) => Promise<void> | void;
+  /// The single-session connects bound to sessions here (store `binding`), by connect.
+  bindingsOf?: (keys: string[]) => Record<string, string>;
+  /// For a test: a step's failure made there (`files`, `rows`, `counts`, `show`).
+  fail?: (step: string) => void;
+};
+
+const dir = (data: string) => join(data, "replica", "handover");
+const outFile = (data: string, id: string) => join(dir(data), "out", `${id}.json`);
+const inFile = (data: string, id: string) => join(dir(data), "in", `${id}.json`);
+const inFiles = (data: string, id: string) => join(dir(data), "in", id, "files");
+const inMade = (data: string, id: string) => join(dir(data), "in", id, "made.txt");
+/// What was here that a hand-over coming in replaced or pruned, kept until it is shown (put back where it is dropped).
+const inAside = (data: string, id: string) => join(dir(data), "in", id, "aside");
+/// The linked worktrees git made for a hand-over coming here, a line each (retire.ts `MadeGit`).
+const inGits = (data: string, id: string) => join(dir(data), "in", id, "gits.jsonl");
+const scratch = (data: string, id: string) => join(dir(data), "out", id);
+
+async function writeJson(path: string, v: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const tmp = `${path}.${randomBytes(4).toString("hex")}.tmp`;
+  await writeFile(tmp, JSON.stringify(v));
+  await rename(tmp, path);
+}
+
+function readAll<T>(at: string): T[] {
+  let names: string[] = [];
+  try {
+    names = readdirSync(at); // sync: read once, before the station serves
+  } catch {}
+  const out: T[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      out.push(JSON.parse(readFileSync(join(at, name), "utf8")) as T); // sync: read once, before the station serves
+    } catch {}
+  }
+  return out;
+}
+
+const roomHere = (data: string) => async () => {
+  const s = await statfs(data).catch(() => null);
+  return { free: s === null ? null : Number(s.bavail) * Number(s.bsize) };
+};
+const gb = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GB`;
+
+/// The hand-over's id: of when, its sessions and the station it goes to, and a part of its own (two of the same chat
+/// to the same station in the same millisecond are two: the second was refused there as "shown already").
+export const handoverId = (keys: string[], to: string, at: number) => `${at.toString(36)}-${Buffer.from(keys[0] ?? "").toString("hex").slice(0, 24)}-${to.slice(0, 8)}-${randomBytes(4).toString("hex")}`;
+
+/// What `together`, `accountsOf` and `check` read of sessions: the store's, a statement each, or a page's read at once
+/// (store.ts `SessionPage`, a plan's).
+export type SessionReads = {
+  session(key: string): SessionRow | null;
+  /// The sessions of `key`'s still.fail home chat (null: it is the home of none).
+  homeMembers(key: string): string[] | null;
+  /// The accounts its runtime sessions ran on, in the order they are kept.
+  ranOn(key: string): string[];
+};
+
+export class Handover {
+  readonly #d: HandoverDeps;
+  readonly #outs = new Map<string, Out>();
+  /// Each session's hand-overs from here, the latest first (`outs`, by session).
+  readonly #outsOf = new Map<string, Out[]>();
+  readonly #reads: SessionReads;
+  readonly #ins = new Map<string, In>();
+  /// The chats coming here, each holding the station's self-update until it is shown or dropped.
+  readonly #inHeld = new Map<string, () => void>();
+  /// What a hand-over coming here does to its files, one at a time (its placing, its pruning, its drop): a drop waits
+  /// for the placing under way, so nothing it places is left after it.
+  readonly #inWork = new Map<string, Promise<unknown>>();
+  /// The hand-overs coming here whose drop was asked: from then on nothing more of them is taken (`#dropIn` may still
+  /// wait for a placing under way).
+  readonly #dropping = new Set<string>();
+  readonly #runs = new Map<string, Promise<void>>();
+  readonly #again = new Map<string, () => void>();
+  readonly #tries = new Map<string, number>();
+  readonly #work: { gather: typeof gatherSoon; place: typeof placeSoon };
+  #closed = false;
+
+  /// Where each side stood, read before the station serves: a chat being handed over is held again before its agents
+  /// are taken up.
+  constructor(d: HandoverDeps) {
+    this.#d = d;
+    this.#work = d.work ?? { gather: gatherSoon, place: placeSoon };
+    this.#reads = {
+      session: (k) => d.store.getSession(k),
+      homeMembers: (k) => {
+        const home = d.store.homeChat(k);
+        return home !== null && home.surface === STILLFAIL_SURFACE ? d.store.threadSessions(home.id).map((m) => m.session) : null;
+      },
+      ranOn: (k) => [...new Set(d.store.chatPage("runtime_sessions", k, null, 500).flatMap((r) => (typeof r.profile === "string" ? [r.profile as string] : [])))],
+    };
+    for (const o of readAll<Out>(join(dir(d.data), "out"))) this.#keepOut(o);
+    for (const i of readAll<In>(join(dir(d.data), "in"))) {
+      // (what its rows' pages put in, as kept with them: newer than its file where a stop came between the two)
+      if (i.step === "coming") i.ctx = d.store.importCtx(i.id) ?? i.ctx;
+      this.#ins.set(i.id, i);
+      this.#holdIn(i);
+    }
+    for (const o of this.#outs.values()) if ((o.step === "held" || o.step === "files" || o.step === "rows") && o.held !== false) for (const key of o.keys) void d.hub.holdChat(key, `moving to ${o.toName || o.to.slice(0, 8)}`);
+    // (one that went and is not shown there yet, or went as this process stopped before its rows here said so: held
+    // until `start` says so, or it is shown there)
+    for (const o of this.#outs.values()) for (const key of this.#notOff(o)) void d.hub.holdChat(key, `moving to ${o.toName || o.to.slice(0, 8)}`);
+  }
+
+  /// Begun (the mesh attached): each hand-over goes on where it stood. One cut before it went did not go: undone.
+  /// The sessions of `o`, gone, still in sight here: not shown there yet, or shown and this process stopped before its
+  /// rows here said so. A record of a trip is acted on only while its chat has not come here since from where it went
+  /// (a hand-over from there shown here after this one began): one that came back is here, whatever the record says
+  /// (a start hid every chat that went and came back, the drill of 2026-11-14).
+  #notOff(o: Out): string[] {
+    if (o.ended === true || (o.step !== "gone" && o.step !== "done")) return [];
+    return o.keys.filter((k) => this.#d.store.getSession(k) !== null && this.#d.store.sessionWs(k)?.startsWith(handedWs("")) !== true && (o.v === 2 || !this.#cameBack(o, k)));
+  }
+
+  /// Whether chat `k` came here since `o` took it away, from where it went.
+  #cameBack(o: Out, k: string): boolean {
+    return [...this.#ins.values()].some((i) => i.step === "shown" && i.origin === o.to && i.at >= o.at && i.keys.includes(k));
+  }
+
+  async start(): Promise<void> {
+    // (what was left to remove as a chat came here was shown, where this process stopped before it was gone)
+    for (const name of await readdir(join(dir(this.#d.data), "in")).catch(() => [] as string[])) if (name.startsWith(".gone-")) void rm(join(dir(this.#d.data), "in", name), { recursive: true, force: true }).catch(() => {});
+    // (gone, where it went said first, before anything else; shown there, out of sight here and let go as a hand-over
+    // lets go once it is shown there; not shown yet, still held, its reads served here, until it is)
+    for (const o of this.#outs.values()) {
+      const off = this.#notOff(o);
+      if (off.length === 0) continue;
+      this.#d.store.goneTo(off, o.to, o.there);
+      await this.#d.went?.(off);
+      if (!o.shown) continue;
+      this.#d.store.shownThere(off, this.#d.home());
+      for (const k of off) this.#d.hub.releaseChat(k);
+    }
+    for (const o of this.#outs.values()) {
+      if (o.step === "held" || o.step === "files" || o.step === "rows") await this.#fail(o, tr(stationLang(), "station.move.restartedMidway", { station: o.toName || o.to.slice(0, 12) }));
+      // (one whose chat came back since is over: nothing of it is told any more, as its arrival ended it)
+      else if (o.step === "gone" && o.v !== 2 && o.keys.every((k) => this.#cameBack(o, k))) {
+        o.step = "done";
+        o.ended = true;
+        await this.#save(o);
+      } else if (o.step === "gone" || (o.step === "failed" && o.dropOwed)) this.#go(o);
+    }
+  }
+
+  async close(): Promise<void> {
+    this.#closed = true;
+    for (const letGo of this.#inHeld.values()) letGo();
+    this.#inHeld.clear();
+    for (const done of [...this.#settledIn.values()].flat()) done();
+    this.#settledIn.clear();
+    for (const stop of this.#again.values()) stop();
+    this.#again.clear();
+    await Promise.all([...this.#runs.values()].map((p) => p.catch(() => {})));
+  }
+
+  /// What is under way brought to rest (a test's).
+  async settle(): Promise<void> {
+    while (this.#runs.size > 0) await Promise.all([...this.#runs.values()].map((p) => p.catch(() => {})));
+  }
+
+  /// The hand-overs from here, the latest of each chat first.
+  outs(): Out[] {
+    return [...this.#outs.values()].sort((a, b) => b.at - a.at);
+  }
+
+  /// A hand-over kept (`#outs`), and among its sessions' (`#outsOf`) by when it began, the latest first (one of the
+  /// same time after those before it, as `outs` sorts them).
+  #keepOut(o: Out): void {
+    this.#outs.set(o.id, o);
+    for (const k of o.keys) {
+      const list = (this.#outsOf.get(k) ?? []).filter((x) => x.id !== o.id);
+      const at = list.findIndex((x) => x.at < o.at);
+      list.splice(at < 0 ? list.length : at, 0, o);
+      this.#outsOf.set(k, list);
+    }
+  }
+  ins(): In[] {
+    return [...this.#ins.values()];
+  }
+  /// The latest hand-over of session `key` from here (none: never).
+  outOf(key: string): Out | null {
+    return this.#outsOf.get(key)?.[0] ?? null;
+  }
+
+  /// The hand-overs waiting for a chat's turn to end before they hold it (by id): known here while they wait.
+  readonly #waitingTurn = new Set<string>();
+  /// Whether hand-over `o` waits for its chat's turn to end now.
+  waitsForTurn(o: Out): boolean {
+    return this.#waitingTurn.has(o.id);
+  }
+
+  // ── the station it leaves ──
+
+  /// The move under way asked to stop: each hand-over not gone yet gives up at its next step, undone as a failure there
+  /// is (the chat goes on here); one gone completes.
+  abandon(): void {
+    for (const o of this.#outs.values()) if (o.step === "files" || o.step === "held" || o.step === "rows") o.abandoned = true;
+  }
+
+  /// Thrown where hand-over `o` was asked to stop.
+  #given(o: Out): void {
+    if (o.abandoned === true) throw new Said(why("abandoned"));
+  }
+
+  /// The sessions handed over with `key`: those that share its still.fail home chat (threads.home).
+  /// `reads`: what reads the sessions (a plan's page).
+  together(key: string, reads: SessionReads = this.#reads): string[] {
+    const keys = new Set([key]);
+    for (const m of reads.homeMembers(key) ?? []) keys.add(m);
+    return [...keys].sort();
+  }
+
+  /// The chat session `key` goes with, by the first of its keys (`together`): a member of another's still.fail home
+  /// chat goes with that chat (as the chats' plan lists it), else its own.
+  chatOf(key: string): string {
+    const home = this.#d.store.sessionThreads(key, 64).find((m) => m.thread.surface === STILLFAIL_SURFACE && m.thread.home !== null && m.thread.home !== key)?.thread.home;
+    return this.together(home ?? key)[0] ?? key;
+  }
+
+  /// Why chat `key` cannot be handed to `to` now, in words that say what to do (null: it can). `ignoreFiles`: one whose
+  /// room is not the station's own goes without its files.
+  /// Chat `key` as people call it: its title, else its key without still.fail's own prefix.
+  #chatName(key: string): string {
+    return this.#d.store.getSession(key)?.title ?? key.replace(/^chat:/, "");
+  }
+
+  /// `planning`: as a plan lists it (a chat of a connect that is not routed needs that connect there, which the plan
+  /// says by its needs); else as it is to go now (`stoppedFor`: it may go while that is not there).
+  check(key: string, to: string, opts: { ignoreFiles?: boolean; planning?: boolean; stoppedFor?: Need | null; reads?: SessionReads } = {}): string | null {
+    const reads = opts.reads ?? this.#reads;
+    const here = this.#d.here();
+    const row = reads.session(key);
+    if (here === null || row === null) return why("noSuchChat");
+    const ws = this.#d.hub.wsOf(row);
+    if (ws === null || row.ws?.startsWith(handedWs("")) || row.ws?.startsWith(comingWs(""))) return why("notInWorkspaceNow");
+    if (!WORKSPACE.test(ws) || !STATION.test(to) || to === here) return why("nameAnother");
+    const target = this.#d.roster(ws)?.find((s) => s.id === to);
+    if (target === undefined) return why("notOfWorkspace");
+    if (target.tasks === true) return why("tasksOnly", { station: target.name });
+    const busy = (this.#outsOf.get(key) ?? []).find((o) => o.step === "held" || o.step === "files" || o.step === "rows" || o.step === "gone");
+    if (busy !== undefined) return busy.step === "gone" ? why("goingAlready", { station: busy.toName || busy.to.slice(0, 8) }) : why("handingAlready");
+    for (const k of this.together(key, reads)) {
+      const s = reads.session(k);
+      if (s === null) continue;
+      const kind = isInternal(s.connect) ? null : this.#d.connects?.kindOf(s.connect) ?? null;
+      // (a chat of a connect that is not routed runs where the connect runs: it goes once its connect is there, or
+      // arrives there stopped, waiting for it)
+      if (kind !== null && !routed(kind) && !opts.planning && opts.stoppedFor?.module !== "connects" && this.#d.connects?.runsOn(s.connect) !== to) {
+        return why("connectFirst", { chat: this.#chatName(k), connect: s.connect, kind: kind.mode === "single-session" ? why("oneSession") : kind.kind });
+      }
+      if (!opts.ignoreFiles && s.archivedAt === null && !s.workspace.startsWith(join(this.#d.data, "sessions"))) {
+        return why("filesOutside", { chat: this.#chatName(k), dir: s.workspace });
+      }
+    }
+    return null;
+  }
+
+  /// The accounts sessions `keys` run on (their sessions' and runtime sessions' profiles), as they are known across the
+  /// workspace (`AccountOf`; null: this machine's own, which cannot go).
+  accountsOf(keys: string[], reads: SessionReads = this.#reads): Map<string, AccountOf | null> {
+    const out = new Map<string, AccountOf | null>();
+    for (const key of keys) {
+      const row = reads.session(key);
+      if (row === null) continue;
+      const ids = new Set<string>([row.profile, ...(row.profiles ?? []), ...reads.ranOn(key)]);
+      for (const id of ids) if (!out.has(id)) out.set(id, this.#d.accounts.of(id));
+    }
+    return out;
+  }
+
+  /// Hands chat `key` (and those sharing its home chat) to `to`: checked, held, sent, switched; what happened said back.
+  /// `wait`: a busy chat's turn is waited for (TURN_WAIT_MS at most), else refused. `progress`: how far its files went.
+  /// `stoppedFor`: what it needs is not usable there yet (the scheduler says so): it arrives there stopped, waiting for
+  /// that, its accounts there or not.
+  async handOver(key: string, to: string, opts: { wait?: boolean; ignoreFiles?: boolean; progress?: (p: { done: number; total: number; unit: string }) => void; stoppedFor?: Need } = {}): Promise<Out> {
+    const refused = this.check(key, to, { ...opts, stoppedFor: opts.stoppedFor ?? null });
+    if (refused !== null) throw new Refused(refused);
+    const keys = this.together(key);
+    const ws = this.#d.hub.wsOf(key)!;
+    if (opts.wait !== true) for (const k of keys) if (this.#d.hub.busy(k)) throw new Refused(why("inTurn", { chat: this.#chatName(k) }));
+    const name = this.#d.roster(ws)?.find((s) => s.id === to)?.name ?? "";
+    const o: Out = {
+      id: handoverId(keys, to, this.#d.fibers.now()), keys, to, toName: name, ws, at: this.#d.fibers.now(), step: "files", error: null, jobs: [], dropOwed: false,
+      sent: {}, counts: null, there: {}, routes: [], routed: 0, shown: false, done: 0, total: 0, held: false, v: 2,
+    };
+    this.#keepOut(o);
+    await this.#save(o);
+    let begun: Json;
+    try {
+      // A first pass, the chat working all along: begun there, its files sent and placed, so that the second, held,
+      // sends only what changed since (its pause does not grow with its room).
+      this.#given(o);
+      begun = await this.#beginThere(o, opts.stoppedFor ?? null);
+      await this.#files(o, begun, opts.progress, false);
+      for (const k of keys) {
+        if (!this.#d.hub.busy(k)) continue;
+        if (opts.wait !== true) throw new Said(why("inTurn", { chat: this.#chatName(k) }));
+        let late: () => void = () => {};
+        const deadline = new Promise<"late">((resolve) => (late = this.#d.fibers.after(TURN_WAIT_MS, () => resolve("late")))); // timer: a deadline for the turn's end
+        this.#waitingTurn.add(o.id);
+        const ended = await Promise.race([this.#d.hub.turnEnded(k).then(() => "ended" as const), deadline]).finally(() => this.#waitingTurn.delete(o.id));
+        late();
+        if (ended === "late") throw new Said(why("turnLate", { chat: this.#chatName(k), minutes: TURN_WAIT_MS / 60_000 }));
+      }
+    } catch (e) {
+      const error = sayOf(e, `chat ${keys[0] ?? ""}`);
+      if (this.#closed) throw new Refused(tr(stationLang(), "station.move.stoppedMidway", { station: name || to.slice(0, 12) }));
+      await this.#fail(o, error);
+      throw new Refused(tr(stationLang(), "station.move.chatStayed", { station: name || to.slice(0, 12), why: error }));
+    }
+    try {
+      this.#given(o);
+    } catch (e) {
+      const error = sayOf(e, `chat ${keys[0] ?? ""}`);
+      await this.#fail(o, error);
+      throw new Refused(tr(stationLang(), "station.move.chatStayed", { station: name || to.slice(0, 12), why: error }));
+    }
+    for (const k of keys) await this.#d.hub.holdChat(k, `moving to ${name || to.slice(0, 8)}`);
+    o.held = true;
+    o.step = "held";
+    o.jobs = this.#d.jobs.of(keys);
+    await this.#save(o);
+    this.#d.fail?.("held");
+    await this.#d.jobs.stop(keys, `its chat is being handed to ${name || "another station"}`);
+    try {
+      await this.#send(o, opts.progress, begun);
+    } catch (e) {
+      const error = sayOf(e, `chat ${keys[0] ?? ""}`);
+      // (this process stopping: the next goes on from where it stood, `start`)
+      if (this.#closed) throw new Refused(tr(stationLang(), "station.move.stoppedHeld", { station: name || to.slice(0, 12) }));
+      await this.#fail(o, error);
+      throw new Refused(tr(stationLang(), "station.move.chatStayed", { station: name || to.slice(0, 12), why: error }));
+    }
+    // (what is told after it went is told until it answers: by itself, on failure with a backoff)
+    await this.#afterGone(o).catch((e) => {
+      log.warn("handover", "a chat that went is not all told there yet", { id: o.id, error: (e as Error).message });
+      this.#retry(o);
+    });
+    return o;
+  }
+
+  /// Begun there: its accounts there, its connects as they are known there, said first (refused there in words).
+  async #beginThere(o: Out, stoppedFor: Need | null): Promise<Json> {
+    const here = this.#d.here()!;
+    const d = this.#d;
+    const ask = (request: Json) => d.ask(o.to, { ...request, workspace: o.ws, origin: here, id: o.id });
+    // Its accounts there, its connects as they are known there, said first (refused there in words).
+    const accounts = Object.fromEntries([...this.accountsOf(o.keys)].map(([id, a]) => [id, a]));
+    const used = [...new Set(o.keys.flatMap((k) => [d.store.getSession(k)?.connect ?? "", ...d.store.sessionThreads(k).map((t) => t.connect)]).filter((c) => c !== ""))];
+    // (every connect named but still.fail's own chats' is one the workspace knows by its id here: one moved away since
+    // is named so still)
+    const connects = connectsThere(used.filter((c) => !isInternal(c)), used, here, o.to);
+    const described: { known: Known; station: string; described: Described }[] = [];
+    for (const id of used) {
+      const it = d.connects?.describedFor(id);
+      if (it) described.push({ known: knownOf(id, here), station: it.station, described: it.described });
+    }
+    // (those no profile here, told so: where the other has none of them either, no need of the chat's)
+    const nowhere = Object.keys(accounts).filter((pid) => d.accounts.present?.(pid) === false);
+    return await ask({ method: "handover.begin", keys: o.keys, ws: o.ws, dataDir: d.data, accounts, nowhere, connects, described, stoppedFor, bindings: this.#bindingsOf(o.keys) });
+  }
+
+  /// Its files: gathered alone (what the first pass hashed taken by path, size and time: its lists in the same
+  /// scratch), what is not in place there sent, placed and checked there. `held`: the second pass, the chat held: a
+  /// file that changes as it is sent fails it (gathered again), and every file must be there. The first, the chat
+  /// working, leaves one that changed for the second, and tells how far it went (the second sends what changed since,
+  /// told as done).
+  async #files(o: Out, begun: Json, progress: ((p: { done: number; total: number; unit: string }) => void) | undefined, held: boolean): Promise<void> {
+    const here = this.#d.here()!;
+    const d = this.#d;
+    const ask = (request: Json) => d.ask(o.to, { ...request, workspace: o.ws, origin: here, id: o.id });
+    o.step = "files";
+    await this.#save(o);
+    const db = join(d.data, "stillfail.db");
+    const g: Gathered = await this.#work.gather(d.data, db, o.ws, false, scratch(d.data, o.id), undefined, null, o.keys).catch((e) => Promise.reject(carryWords(e)));
+    // (a file of its room this station cannot read: the chat does not go, rather than go without it)
+    if ((g.unreadableCount ?? 0) > 0) throw new Said(why("cannotRead", { path: (g.unreadable ?? []).join("、"), count: g.unreadableCount }));
+    const need = HEADROOM + g.bytes + Math.ceil(g.bytes / 20);
+    if (g.gits > 0 && begun?.git === false) throw new Said(why("noGit", { station: o.toName || o.to.slice(0, 12), n: g.gits }));
+    if (typeof begun?.free === "number" && need > begun.free) throw new Said(why("noRoom", { station: o.toName || o.to.slice(0, 12), free: gb(begun.free), need: gb(need) }));
+    d.fail?.("files");
+    const carry = await sendGathered(g, {
+      // (where each goes and how big, so that what is in place there already is not sent again)
+      lacking: (hashes, files) => ask({ method: "handover.lacking", hashes, files: files.map((f) => ({ hash: f.hash, path: f.path, size: f.size, mtimeMs: f.mtimeMs ?? null, ...(f.room !== undefined ? { room: f.room } : {}) })) }),
+      put: async (hash, bytes, path, size) => {
+        const answer = await d.ask(o.to, withBytes({ method: "handover.put", workspace: o.ws, origin: here, id: o.id, name: hash }, bytes));
+        if (carriedPlace(d.data, path)) o.sentBytes = (o.sentBytes ?? 0) + size;
+        return answer;
+      },
+      most: d.lackMost ?? LACK_MOST,
+      stopping: () => this.#closed || o.abandoned === true,
+      total: (bytes) => void (held || (o.total = bytes, o.done = 0, progress?.({ done: 0, total: bytes, unit: "bytes" }))),
+      done: (bytes) => void (held || (o.done += bytes, progress?.({ done: o.done, total: o.total, unit: "bytes" }))),
+    }, held, [], true).catch((e) => Promise.reject(carryWords(e)));
+    this.#given(o);
+    if (carry === null) throw new Said(why("stopping"));
+    const placed = await ask({ method: "handover.place", carry });
+    if (held && typeof placed?.missing === "number" && placed.missing > 0) throw new Said(why("filesMissing", { n: placed.missing }));
+  }
+
+  /// Held, steps 3 to 5 up to `gone`: its files again (what changed since the first pass), its rows, the counts.
+  async #send(o: Out, progress: ((p: { done: number; total: number; unit: string }) => void) | undefined, begun: Json): Promise<void> {
+    const here = this.#d.here()!;
+    const d = this.#d;
+    const ask = (request: Json) => d.ask(o.to, { ...request, workspace: o.ws, origin: here, id: o.id });
+    await this.#files(o, begun, progress, true);
+    // Its rows, a page at a time, then what B has compared with what was sent.
+    this.#given(o);
+    o.step = "rows";
+    await this.#save(o);
+    d.fail?.("rows");
+    const sent = await this.#sendRows(o, ask, null);
+    // (what the room there has that this one's lists no longer name goes there: a mirror of it)
+    await ask({ method: "handover.prune" });
+    const counts = (await ask({ method: "handover.counts" }))?.counts as Counts | undefined;
+    d.fail?.("counts");
+    this.#given(o);
+    const differs = counts === undefined ? "it said nothing" : differ(sent, counts);
+    if (differs !== null) throw new Said(why("notWhatSent", { what: differs }));
+    // Gone: said here first, durably, before anything else is told.
+    o.counts = counts!;
+    o.there = Object.fromEntries(o.keys.map((k) => [k, { thread: d.store.homeChat(k)?.id ?? null, there: typeof (counts as Json).homes?.[k] === "number" ? (counts as Json).homes[k] : null }]));
+    o.routes = [];
+    for (const k of o.keys) {
+      for (const t of d.store.sessionThreads(k)) {
+        if (t.thread.surface === STILLFAIL_SURFACE || isInternal(t.connect)) continue;
+        // (a connect that is not routed runs its chats where it runs: none of its threads is re-pointed)
+        const kind = d.connects?.kindOf(t.connect) ?? null;
+        if (kind !== null && !routed(kind)) continue;
+        o.routes.push({ connect: t.connect, channel: t.thread.channel, threadTs: t.thread.threadTs });
+      }
+    }
+    o.step = "gone";
+    await this.#save(o);
+    d.fail?.("gone");
+    // (where it went, for what its platforms say; still in sight here, held, until it is shown there: a device is
+    // pointed there only once it is there to be read, `#afterGone`)
+    d.store.goneTo(o.keys, o.to, o.there);
+    await d.went?.(o.keys);
+    await rm(scratch(d.data, o.id), { recursive: true, force: true });
+    log.info("handover", "a chat went to another station", { id: o.id, to: o.to, keys: o.keys.length });
+  }
+
+  /// The chat's rows sent a page at a time (`from`: each thread's entries and letters after what was sent, alone):
+  /// what was sent, counted as the station it goes to counts it.
+  async #sendRows(o: Out, ask: (r: Json) => Promise<Json>, from: Out["sent"] | null): Promise<Counts> {
+    const store = this.#d.store;
+    const sent: Counts = { sessions: 0, entries: {}, letters: {}, rows: {} };
+    const page = async (table: ChatTable, rows: Json[]) => {
+      if (rows.length === 0) return;
+      await ask({ method: "handover.rows", table, rows });
+      if (table === "sessions") sent.sessions += rows.length;
+      else if (table === "entries" || table === "letters") for (const r of rows) sent[table][String(r.thread)] = (sent[table][String(r.thread)] ?? 0) + 1;
+      else if (table !== "threads") sent.rows[table] = (sent.rows[table] ?? 0) + rows.length;
+    };
+    const pages = async (table: ChatTable, of: number | string, after: Json = null) => {
+      for (;;) {
+        const rows = store.chatPage(table, of, after, 500, o.keys);
+        await page(table, rows);
+        if (rows.length < 500 || table === "threads" || table === "sessions" || table === "thread_sessions" || table === "opened_chats") return rows.at(-1);
+        after = afterOf(table, rows.at(-1)!);
+      }
+    };
+    if (from === null) for (const k of o.keys) await pages("sessions", k);
+    for (let after = 0; ; ) {
+      const threads = store.chatThreads(o.keys, after, 200);
+      for (const t of threads) {
+        if (from === null) await pages("threads", t);
+        if (from === null) await pages("thread_sessions", t);
+        const was = from?.[String(t)] ?? { entries: 0, letters: 0 };
+        const lastE = await pages("entries", t, from === null ? null : was.entries);
+        const lastL = await pages("letters", t, from === null ? null : was.letters);
+        o.sent[String(t)] = { entries: Math.max(was.entries, Number(lastE?.n ?? 0)), letters: Math.max(was.letters, Number(lastL?.n ?? 0)) };
+        if (from === null) for (const table of [...BY_N.filter((x) => x === "closed_cards"), ...MARKS]) await pages(table, t);
+      }
+      if (threads.length < 200) break;
+      after = threads.at(-1)!;
+    }
+    for (const k of o.keys) {
+      for (const table of (from === null ? ["turns", "runtime_sessions", "pins", "opened_chats", "deliveries"] : ["deliveries"]) as ChatTable[]) await pages(table, k);
+    }
+    void CHAT_TABLES;
+    return sent;
+  }
+
+  /// After it went: what was said meanwhile (its logs' rest, its platforms' events waited for), then B told to show it,
+  /// then each of its platform threads re-pointed where its connect runs; told until each answers.
+  async #afterGone(o: Out): Promise<void> {
+    const d = this.#d;
+    // (the chat came back here since: nothing of this one is said or sent any more)
+    if (o.step === "done" || o.ended === true) return;
+    const here = d.here()!;
+    const ask = (request: Json) => d.ask(o.to, { ...request, workspace: o.ws, origin: here, id: o.id });
+    if (!o.shown) {
+      // (its threads of this station's own connects point there at once: what comes from now on goes there; what came
+      // before is waited for, and goes with the rest of its logs)
+      for (const r of o.routes) {
+        if (d.connects?.describedFor(r.connect)?.station === here) await d.connects.route(r.connect, r.channel, r.threadTs, o.to);
+        await d.hub.drained(r.connect, r.channel, r.threadTs);
+      }
+      await this.#sendRows(o, ask, o.sent);
+      d.fail?.("show");
+      // (with the messages written here under a client's key, so that one asked again there is not posted twice)
+      const threads = new Map<number, number>();
+      for (const t of Object.values(o.there)) if (t.thread !== null && t.there !== null) threads.set(t.thread, t.there);
+      await ask({ method: "handover.show", sends: d.keptSends?.(threads) ?? [] });
+      o.shown = true;
+      await this.#save(o);
+    }
+    // Shown there: out of sight here and devices told where, in one step; then what was taken here since its rows
+    // were last sent goes after it (a message sent here meanwhile), and it is shown again there, to take that up.
+    d.store.shownThere(o.keys, d.home());
+    for (const k of o.keys) d.hub.releaseChat(k);
+    if (!o.caught) {
+      // (only where something was taken: one page a thread and session at most to know it)
+      const since = Object.entries(o.sent).some(([t, was]) => d.store.chatPage("entries", Number(t), was.entries, 1, o.keys).length > 0 || d.store.chatPage("letters", Number(t), was.letters, 1, o.keys).length > 0)
+        || o.keys.some((k) => d.store.chatPage("deliveries", k, null, 1, o.keys).length > 0);
+      if (since) {
+        await this.#sendRows(o, ask, o.sent);
+        await ask({ method: "handover.show", sends: [] });
+      }
+      d.store.deliveredThere(o.keys);
+      o.caught = true;
+      await this.#save(o);
+    }
+    for (; o.routed < o.routes.length; o.routed++) {
+      const r = o.routes[o.routed]!;
+      await d.connects?.route(r.connect, r.channel, r.threadTs, o.to);
+      await this.#save(o);
+    }
+    o.step = "done";
+    await this.#save(o);
+  }
+
+  /// It did not go: B told to take out what it put in (told until it answers), the chat back to work here, its jobs
+  /// started again; why kept.
+  async #fail(o: Out, error: string): Promise<void> {
+    log.warn("handover", "a chat was not handed over: it goes on here", { id: o.id, to: o.to, error });
+    o.step = "failed";
+    o.error = error;
+    o.dropOwed = true;
+    await this.#save(o);
+    // (one not held yet goes on as it was)
+    if (o.held !== false) for (const k of o.keys) if (!this.#d.hub.releaseChat(k)) this.#d.hub.wakeChat(k);
+    for (const j of o.jobs) {
+      try {
+        this.#d.jobs.start(j);
+      } catch (e) {
+        log.warn("handover", "a job of a chat not handed over not started again", { job: j.name, error: (e as Error).message });
+      }
+    }
+    await rm(scratch(this.#d.data, o.id), { recursive: true, force: true });
+    await this.#drop(o).catch(() => this.#retry(o));
+  }
+
+  async #drop(o: Out): Promise<void> {
+    const here = this.#d.here()!;
+    await this.#d.ask(o.to, { method: "handover.drop", workspace: o.ws, origin: here, id: o.id });
+    o.dropOwed = false;
+    await this.#save(o);
+  }
+
+  /// What is owed to B told (after it went: the rest; failed: the drop), again until it answers.
+  #go(o: Out): void {
+    if (this.#closed || this.#runs.has(o.id)) return;
+    this.#again.get(o.id)?.();
+    this.#again.delete(o.id);
+    const run = (o.step === "gone" ? this.#afterGone(o) : o.dropOwed ? this.#drop(o) : Promise.resolve())
+      .then(() => void this.#tries.delete(o.id), () => this.#retry(o))
+      .finally(() => void this.#runs.delete(o.id));
+    this.#runs.set(o.id, run);
+  }
+
+  #retry(o: Out): void {
+    if (this.#closed) return;
+    const n = this.#tries.get(o.id) ?? 0;
+    this.#tries.set(o.id, n + 1);
+    this.#again.set(o.id, this.#d.fibers.after(Math.min(RETRY_MS * 2 ** n, RETRY_MOST_MS), () => this.#go(o))); // timer: a retry after a failure
+  }
+
+  /// The other station came up (its link opened): what is owed to it told now.
+  reached(station: string): void {
+    for (const o of this.#outs.values()) {
+      if (o.step !== "gone" && !o.dropOwed) continue;
+      // (shown there, only its threads' re-pointing is owed: to the stations their connects run on)
+      const owed = o.step === "gone" && o.shown
+        ? o.routes.slice(o.routed).some((r) => this.#d.connects?.runsOn(r.connect) === station)
+        : o.to === station;
+      if (owed) this.#go(o);
+    }
+  }
+
+  async #save(o: Out): Promise<void> {
+    await writeJson(outFile(this.#d.data, o.id), o);
+    this.#d.changed?.(o.id);
+  }
+  async #saveIn(i: In): Promise<void> {
+    await writeJson(inFile(this.#d.data, i.id), i);
+    this.#d.changed?.(i.id);
+  }
+
+  #bindingsOf(keys: string[]): Record<string, string> {
+    return this.#d.bindingsOf?.(keys) ?? {};
+  }
+
+  // ── the station it goes to ──
+
+  /// What this station answers of it (`handover.*`), from stations of the chat's workspace, of their own chats.
+  answers(inWorkspace: (peer: string, ws: string) => boolean) {
+    return async (peer: string, request: Json, workspace?: string): Promise<Json> => {
+      const bytes = bytesOf(request);
+      try {
+        const ws = typeof request?.workspace === "string" ? request.workspace : "";
+        const id = typeof request?.id === "string" ? request.id : "";
+        if (!WORKSPACE.test(ws) || (workspace !== undefined && workspace !== ws) || !inWorkspace(peer, ws) || request?.origin !== peer) throw new Refused(why("notStationOfWs"));
+        if (!/^[0-9a-z-]{1,80}$/.test(id)) throw new Refused(why("badRequest", { detail: "not a hand-over" }));
+        if (request.method === "handover.begin") return await this.#begin(peer, ws, id, request);
+        const i = this.#ins.get(id);
+        if (request.method === "handover.drop") return i === undefined ? { ok: true } : await this.#drop1(i);
+        if (i === undefined || i.origin !== peer) throw new Refused(why("badRequest", { detail: "not begun: handover.begin first" }));
+        // (dropped here, by its own drop or a newer hand-over of the chat: nothing more of it is taken)
+        if (i.step === "dropped" || this.#dropping.has(i.id)) throw new Refused(why("droppedThere"));
+        switch (request.method) {
+          case "handover.lacking": {
+            const hashes = Array.isArray(request.hashes) ? request.hashes : [];
+            if (hashes.length > (this.#d.lackMost ?? LACK_MOST) || !hashes.every((h: unknown) => typeof h === "string" && HASH.test(h))) throw new Refused(why("badRequest", { detail: "too many hashes" }));
+            const lacking = new Set(await lackingIn(inFiles(this.#d.data, id), hashes));
+            // (one in place here already, the same bytes where it goes, is not lacking: a room kept here, or placed
+            // by a hand-over before)
+            const files = (Array.isArray(request.files) ? request.files : []).slice(0, this.#d.lackMost ?? LACK_MOST);
+            const rooms = new Map<string, string>();
+            for (const f of files) {
+              if (!lacking.has(f?.hash) || typeof f?.path !== "string") continue;
+              // (where it lies here by the same answer its placing gives: restore.ts `carriedTo`)
+              let room: string | null = null;
+              if (typeof f.room === "string") {
+                room = rooms.get(f.room) ?? (await realOfSoon(moved(f.room, i.ctx.fromData, this.#d.data)));
+                rooms.set(f.room, room);
+              }
+              if (await inPlace(carriedTo(f.path, i.ctx.fromData, this.#d.data, room), this.#d.data, f)) lacking.delete(f.hash);
+            }
+            return { lacking: hashes.filter((h: string) => lacking.has(h)) };
+          }
+          case "handover.prune":
+            return await this.#serialIn(i, () => this.#prune(i));
+          case "handover.put": {
+            const name = String(request.name ?? "");
+            if (bytes === null || !HASH.test(name)) throw new Refused(why("badRequest", { detail: "not a file's hash" }));
+            await receiveFile(inFiles(this.#d.data, id), name, bytes as Bytes);
+            return { ok: true };
+          }
+          case "handover.place":
+            return await this.#serialIn(i, () => this.#place(i, String(request.carry ?? ""))).catch((e) => Promise.reject(carryWords(e)));
+          case "handover.rows": {
+            const table = String(request.table ?? "") as ChatTable;
+            // (shown: only what was said there after its rows went, its log's and what it has yet to be handed)
+            if (i.step !== "coming" && (i.step !== "shown" || !AFTER_SHOWN.includes(table))) throw new Refused(why("shownAlready"));
+            if (!CHAT_TABLES.includes(table) || !Array.isArray(request.rows) || request.rows.length > 500) throw new Refused(why("badRequest", { detail: "not a page of a chat's rows" }));
+            this.#d.fail?.("import");
+            this.#d.store.importRows(i.ctx, table, request.rows, i.step === "coming" ? i.id : undefined);
+            this.#d.fail?.("imported");
+            await this.#saveIn(i);
+            return { ok: true };
+          }
+          case "handover.counts": {
+            const homes: Record<string, number | null> = {};
+            for (const k of i.keys) homes[k] = this.#d.store.homeChat(k)?.id ?? null;
+            return { counts: { ...i.ctx.counts, homes } };
+          }
+          case "handover.show":
+            return await this.#show(i, Array.isArray(request.sends) ? request.sends : []);
+        }
+        throw new Refused(why("badRequest", { detail: "no such hand-over request" }));
+      } finally {
+        if (bytes !== null) await stopBytes(bytes).catch(() => {});
+      }
+    };
+  }
+
+  async #begin(origin: string, ws: string, id: string, request: Json): Promise<Json> {
+    const was = this.#ins.get(id);
+    if (was !== undefined && was.step !== "coming") throw new Refused(why("wasAlready", { step: was.step }));
+    const keys: string[] = Array.isArray(request.keys) ? request.keys.filter((k: unknown): k is string => typeof k === "string") : [];
+    if (keys.length === 0) throw new Refused(why("badRequest", { detail: "no chat named" }));
+    // (a chat of the same key that is live here went on apart from it: never merged into, nothing written)
+    const live = this.#d.store.liveOf(keys);
+    if (live.length > 0) throw new Refused(liveHereWords(live, this.#d.roster(ws)?.find((s) => s.id === this.#d.here())?.name || "this station"));
+    // (an older hand-over of the chat still coming here was given up where it began, its drop maybe not here yet: it is
+    // dropped now, before this one places anything, so that its drop, coming late, takes nothing this one counted)
+    for (const old of [...this.#ins.values()]) {
+      if (old.id !== id && old.origin === origin && old.step === "coming" && old.keys.some((k) => keys.includes(k))) await this.#drop1(old);
+    }
+    // Its accounts as they are here: each the profile of the same share, or of the same key; one not here refused,
+    // named.
+    const profiles: Record<string, string> = {};
+    const missing: string[] = [];
+    const nowhere = new Set<string>(Array.isArray(request.nowhere) ? request.nowhere.filter((x: unknown): x is string => typeof x === "string") : []);
+    for (const [pid, a] of Object.entries((request.accounts ?? {}) as Record<string, AccountOf | null>)) {
+      const here = a === null ? null : this.#d.accounts.here(a);
+      // (a login of no station's, here neither: no need of the chat's, which goes on as one whose account is missing)
+      if (here === null && nowhere.has(pid)) continue;
+      if (here === null) missing.push(a?.name || pid);
+      else profiles[pid] = here;
+    }
+    const stoppedFor = request.stoppedFor !== null && typeof request.stoppedFor?.module === "string" && typeof request.stoppedFor?.id === "string" ? { module: request.stoppedFor.module, id: request.stoppedFor.id, ...(typeof request.stoppedFor.label === "string" ? { label: request.stoppedFor.label } : {}) } as Need : null;
+    // (one that arrives stopped, waiting for its account, goes on its ids as they are until it comes)
+    if (missing.length > 0 && stoppedFor === null) throw new Refused(why("accountsMissing", { names: missing.join(", ") }));
+    for (const x of Array.isArray(request.described) ? request.described : []) {
+      if (x?.known && typeof x.station === "string" && x.described) this.#d.connects?.learnOf(x.known, x.station, x.described);
+    }
+    const strings = (v: Json) => Object.fromEntries(Object.entries(v ?? {}).filter((e): e is [string, string] => typeof e[1] === "string"));
+    const bindings: Record<string, string> = {};
+    for (const [c, k] of Object.entries((request.bindings ?? {}) as Record<string, string>)) if (typeof k === "string") bindings[strings(request.connects)[c] ?? c] = k;
+    const i: In = was ?? {
+      id, origin, keys, ws, at: this.#d.fibers.now(), step: "coming", carry: null, error: null, stoppedFor, bindings,
+      ctx: newCtx({ from: origin, here: this.#d.here() ?? undefined, fromData: String(request.dataDir ?? ""), toData: this.#d.data, connects: strings(request.connects), profiles, ws: comingWs(ws) }),
+    };
+    this.#ins.set(id, i);
+    this.#holdIn(i);
+    await this.#saveIn(i);
+    const [room, git] = await Promise.all([(this.#d.room ?? roomHere(this.#d.data))().catch(() => ({ free: null })), (this.#d.hasGit ?? (async () => true))().catch(() => false)]);
+    return { ok: true, free: room.free, git };
+  }
+
+  async #place(i: In, carry: string): Promise<Json> {
+    if (!HASH.test(carry)) throw new Refused(why("badRequest", { detail: "not a copy's name" }));
+    const files = inFiles(this.#d.data, i.id);
+    const index = join(files, carry);
+    // (what the first pass placed stays placed: the second looks only at what the lists say otherwise of)
+    const placed = await this.#work.place(this.#d.data, index, files, inMade(this.#d.data, i.id), inAside(this.#d.data, i.id), join(dir(this.#d.data), "in", i.id, "placed.txt"), true);
+    const c = JSON.parse(await readFile(index, "utf8")) as CarryIndex;
+    // (each worktree git makes for it kept, as the files it makes are: a drop takes it out again)
+    const gits = inGits(this.#d.data, i.id);
+    if (c.gits.length > 0 && this.#d.git !== undefined) await rebuildGits(this.#d.data, this.#d.reposDir, c, files, this.#d.git, { clone: false, made: (m) => appendFile(gits, `${JSON.stringify(m)}\n`) });
+    i.carry = carry;
+    await this.#saveIn(i);
+    return { ok: true, placed: placed.placed, missing: placed.missing };
+  }
+
+  /// What the chat's room and transcripts here hold that the lists sent no longer name, removed: this station's own
+  /// gathering of its sessions (as the rows put in say them) against the lists sent, so nothing is touched that a
+  /// gathering leaves out (what a build makes again, what git ignores) nor anything outside its room.
+  async #prune(i: In): Promise<Json> {
+    if (i.carry === null) return { ok: true, removed: 0 };
+    const files = inFiles(this.#d.data, i.id);
+    const index = JSON.parse(await readFile(join(files, i.carry), "utf8")) as CarryIndex;
+    const named = new Set<string>();
+    const mine = join(dir(this.#d.data), "in", i.id, "mine");
+    await mkdir(join(mine, "lists"), { recursive: true });
+    for (const s of index.sessions) {
+      const list = await readFile(join(files, s.list), "utf8").catch(() => "");
+      const here: string[] = [];
+      const roomHere = await realOfSoon(moved(s.workspace, index.dataDir, this.#d.data));
+      for (const line of list.split("\n")) {
+        if (line === "") continue;
+        try {
+          const f = JSON.parse(line);
+          f.path = carriedTo(f.path, index.dataDir, this.#d.data, roomHere);
+          named.add(f.path);
+          here.push(JSON.stringify(f));
+        } catch {}
+      }
+      // (what was sent, as its gathering here would list it before: what is in place by its size and time is not read
+      // again to be hashed, so this gathering only walks the room)
+      await writeFile(listFile(mine, s.key), here.length === 0 ? "" : `${here.join("\n")}\n`);
+    }
+    const g = await this.#work.gather(this.#d.data, join(this.#d.data, "stillfail.db"), i.ws, false, mine, undefined, null, i.keys);
+    const own = JSON.parse(await readFile(g.index, "utf8")) as CarryIndex;
+    let removed = 0;
+    for (const s of own.sessions) {
+      for (const line of (await readFile(s.at, "utf8").catch(() => "")).split("\n")) {
+        if (line === "") continue;
+        let path: string;
+        try {
+          path = JSON.parse(line).path;
+        } catch {
+          continue;
+        }
+        if (named.has(path) || !path.startsWith(s.room + sep)) continue;
+        // (a linked worktree's `.git`, which this station's git made as the chat's worktree was added here, names a
+        // repository of this station's: the lists sent never name it, and it stays)
+        if (basename(path) === ".git") continue;
+        // (put aside, not removed: one that is dropped puts it back)
+        await this.#putAside(i, path);
+        removed++;
+      }
+    }
+    await rm(mine, { recursive: true, force: true });
+    return { ok: true, removed };
+  }
+
+  /// Shown: of its workspace here, its agents told once where it runs now; its jobs are the jobs module's to start.
+  async #show(i: In, sends: KeptSend[]): Promise<Json> {
+    // (asked again after it was shown, too: what is kept of its messages there may have grown)
+    // (only of its own threads here: another's are not this hand-over's to keep)
+    const homes = new Set(i.keys.map((k) => this.#d.store.homeChat(k)?.id));
+    this.#d.keepSends?.(sends.filter((x) => typeof x?.thread === "number" && homes.has(x.thread)));
+    // (shown again, after what was said where it was meanwhile came: taken up)
+    if (i.step === "shown") {
+      for (const k of i.keys) this.#d.hub.wakeChat(k);
+      return { ok: true };
+    }
+    const home = this.#d.home();
+    // (one that arrives stopped is held before it is shown: no turn starts)
+    // (what it waits for is where it came from)
+    if (i.stoppedFor) await this.#d.arrivedStopped?.(i.keys, { ...i.stoppedFor, at: i.origin }, i.ws);
+    for (const [connect, key] of Object.entries(i.bindings ?? {})) if (this.#d.store.binding(connect) === null) this.#d.store.setBinding(connect, key);
+    this.#d.store.showChat(i.keys, i.ws === home ? null : i.ws);
+    await this.#endOuts(i.keys);
+    await this.#trimIns(i);
+    const from = this.#d.roster(i.ws)?.find((s) => s.id === i.origin)?.name || i.origin.slice(0, 12);
+    for (const k of i.keys) {
+      const row = this.#d.store.getSession(k);
+      if (row === null) continue;
+      this.#d.store.setMovedNote(k, movedHere(from, row.workspace, i.ctx.fromData, this.#d.data));
+    }
+    i.step = "shown";
+    await this.#saveIn(i);
+    this.#letIn(i.id);
+    this.#d.store.forgetImport(i.id);
+    // (what came for it, a file a hash as many as its room has, removed after it is shown, not while it waits: moved
+    // out of the way first)
+    const gone = join(dir(this.#d.data), "in", `.gone-${i.id}`);
+    await rename(join(dir(this.#d.data), "in", i.id), gone).catch(() => {});
+    void rm(gone, { recursive: true, force: true }).catch(() => {});
+    for (const k of i.keys) this.#d.hub.wakeChat(k);
+    await this.#d.shown?.(i.keys);
+    log.info("handover", "a chat handed here goes on here", { id: i.id, origin: i.origin, keys: i.keys.length });
+    return { ok: true };
+  }
+
+  #holdIn(i: In): void {
+    if (i.step === "coming" && !this.#inHeld.has(i.id) && this.#d.hold !== undefined) this.#inHeld.set(i.id, this.#d.hold());
+  }
+
+  /// Chats `keys` came here: every hand-over of them from here before is over for good, whatever its step (none replayed
+  /// as a start, none told again).
+  /// What is kept of them is bounded: an ended record is dropped once a newer ended one names all its chats (a chat
+  /// handed about for a year keeps one), never the newest.
+  async #endOuts(keys: readonly string[]): Promise<void> {
+    for (const o of [...this.#outs.values()]) {
+      if (o.ended === true || (o.step !== "gone" && o.step !== "done") || !o.keys.some((k) => keys.includes(k))) continue;
+      o.step = "done";
+      o.ended = true;
+      this.#again.get(o.id)?.();
+      this.#again.delete(o.id);
+      await this.#save(o);
+    }
+    const ended = [...this.#outs.values()].filter((o) => o.ended === true);
+    for (const o of ended) {
+      if (!ended.some((n) => n !== o && n.at >= o.at && n.id !== o.id && o.keys.every((k) => n.keys.includes(k)) && (n.at > o.at || n.id > o.id))) continue;
+      this.#outs.delete(o.id);
+      for (const k of o.keys) this.#outsOf.set(k, (this.#outsOf.get(k) ?? []).filter((x) => x.id !== o.id));
+      await rm(outFile(this.#d.data, o.id), { force: true });
+    }
+  }
+
+  /// Of a chat's arrivals here the newest record is kept (`i`, shown): an older one, shown or dropped, goes, never one
+  /// still coming, nor while a record from before (no `v: 2`) of that chat that `#cameBack` judges by it stands unended.
+  async #trimIns(i: In): Promise<void> {
+    const judged = (k: string) => [...this.#outs.values()].some((o) => o.v !== 2 && o.ended !== true && o.keys.includes(k));
+    for (const old of [...this.#ins.values()]) {
+      if (old.id === i.id || old.step === "coming" || !old.keys.every((k) => i.keys.includes(k)) || old.keys.some(judged)) continue;
+      this.#ins.delete(old.id);
+      await rm(inFile(this.#d.data, old.id), { force: true });
+    }
+  }
+
+  #letIn(id: string): void {
+    this.#inHeld.get(id)?.();
+    this.#inHeld.delete(id);
+    for (const done of this.#settledIn.get(id) ?? []) done();
+    this.#settledIn.delete(id);
+  }
+
+  /// What waits for a hand-over coming here to be shown here or dropped (by its id).
+  readonly #settledIn = new Map<string, (() => void)[]>();
+
+  /// The chats of workspace `ws` coming here now (by their keys, sorted): a hand-over begun here, not shown nor dropped
+  /// yet. Few at a time, read from the records kept of them.
+  comingIn(ws: string): string[][] {
+    return [...this.#ins.values()].filter((i) => i.step === "coming" && i.ws === ws).map((i) => [...i.keys].sort());
+  }
+
+  /// The station chat `key` is coming here from now (a hand-over of it begun here, not shown nor dropped yet): it waits
+  /// for that station to go on with it. Null: none.
+  comingFrom(key: string): string | null {
+    return [...this.#ins.values()].find((i) => i.step === "coming" && i.keys.includes(key))?.origin ?? null;
+  }
+
+  /// Once no hand-over of chat `key` coming here is still coming: each shown here (its rows the chat's, `showChat`) or
+  /// dropped. What brought it back waits for this: the station it came from may have gone on without having been
+  /// answered that it is shown here (its word lost on the way), telling it again by its retry.
+  /// `withinMs`: waited no longer (the clock's): false where one is still coming then.
+  async arrived(key: string, withinMs?: number): Promise<boolean> {
+    for (const i of [...this.#ins.values()]) {
+      if (i.step !== "coming" || !i.keys.includes(key) || this.#closed) continue;
+      let late = () => {};
+      const shown = new Promise<boolean>((resolve) => {
+        const list = this.#settledIn.get(i.id) ?? [];
+        list.push(() => resolve(true));
+        this.#settledIn.set(i.id, list);
+        if (withinMs !== undefined) late = this.#d.fibers.after(withinMs, () => resolve(false)); // timer: the most a move back waits for its chat to be shown
+      });
+      const ok = await shown;
+      late();
+      if (!ok) return false;
+    }
+    return true;
+  }
+
+  /// `path`, replaced or pruned by hand-over `i`, moved aside the first time (`inAside`'s list says where it was).
+  /// The directories a placing made for what it put, left empty as that is taken out: removed, up to the rooms'
+  /// roots (one that holds anything stays, and so does everything above it).
+  async #emptied(at: string): Promise<void> {
+    for (let d = at; ; d = dirname(d)) {
+      const parts = relative(this.#d.data, d).split(sep);
+      // (never the data directory's own, `sessions/` nor a runtime's `transcripts*/<runtime>/`)
+      if (parts[0] === "" || parts[0] === ".." || isAbsolute(parts[0]!) || parts.length <= (parts[0]!.startsWith("transcripts") ? 2 : 1)) return;
+      if (!(await rmdir(d).then(() => true, () => false))) return;
+    }
+  }
+
+  async #putAside(i: In, path: string): Promise<void> {
+    const aside = inAside(this.#d.data, i.id);
+    const list = join(aside, "list.txt");
+    const had = await readFile(list, "utf8").catch(() => "");
+    const made = await readFile(inMade(this.#d.data, i.id), "utf8").catch(() => "");
+    if (had.split("\n").some((l) => l.split("\t")[0] === path) || made.split("\n").includes(path)) return void (await rm(path, { force: true }));
+    await mkdir(aside, { recursive: true });
+    const name = `${createHash("sha256").update(path).digest("hex").slice(0, 32)}-${randomBytes(4).toString("hex")}`;
+    try {
+      await rename(path, join(aside, name));
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw e;
+    }
+    await writeFile(list, `${path}\t${name}\n`, { flag: "a" });
+  }
+
+  /// What a hand-over that did not go put in here, taken out: its rows (store `dropImport`) and the files placed where
+  /// nothing was; what it replaced or pruned put back.
+  /// Hand-over `i` dropped: nothing more of it taken from now, then undone once what it was doing to its files ended.
+  async #drop1(i: In): Promise<Json> {
+    this.#dropping.add(i.id);
+    try {
+      return await this.#serialIn(i, () => this.#dropIn(i));
+    } finally {
+      this.#dropping.delete(i.id);
+    }
+  }
+
+  /// `f`, after what hand-over `i` was doing to its files here ended.
+  #serialIn<T>(i: In, f: () => Promise<T>): Promise<T> {
+    const before = this.#inWork.get(i.id) ?? Promise.resolve();
+    const run = before.then(f, f);
+    const settled = run.catch(() => {});
+    this.#inWork.set(i.id, settled);
+    void settled.then(() => {
+      if (this.#inWork.get(i.id) === settled) this.#inWork.delete(i.id);
+    });
+    return run;
+  }
+
+  async #dropIn(i: In): Promise<Json> {
+    if (i.step === "dropped") return { ok: true };
+    if (i.step === "shown") throw new Refused(why("shownHere"));
+    this.#d.store.dropImport(i.ctx);
+    this.#d.store.forgetImport(i.id);
+    // What git made for it: each worktree's own `.git` taken out and its registration with it (`worktree prune`), the
+    // branch and the ref it made there deleted; the repository and all it had before stay.
+    const gits = new Map<string, MadeGit>();
+    for (const line of (await readFile(inGits(this.#d.data, i.id), "utf8").catch(() => "")).split("\n")) {
+      try {
+        const m = JSON.parse(line) as MadeGit;
+        const was = gits.get(m.dir);
+        gits.set(m.dir, { ...m, branch: m.branch ?? was?.branch ?? null, ref: m.ref ?? was?.ref ?? null });
+      } catch {}
+    }
+    for (const m of gits.values()) {
+      if (this.#d.git === undefined || !carriedPlace(this.#d.data, join(m.dir, ".git"))) continue;
+      // (its registration is the directory its `.git` names in the repository: that one alone, never a prune of others)
+      for (const at of [join(m.dir, ".git"), join(`${m.dir}.git-carrying`, ".git")]) {
+        const named = /^gitdir: (.+)$/m.exec(await readFile(at, "utf8").catch(() => ""))?.[1]?.trim();
+        const ours = named === undefined ? false : (await realpath(dirname(named)).catch(() => "")) === (await realpath(join(m.repo, ".git", "worktrees")).catch(() => null));
+        if (ours) await rm(named!, { recursive: true, force: true }).catch(() => {});
+        await rm(at, { force: true }).catch(() => {});
+      }
+      await rm(`${m.dir}.git-carrying`, { recursive: true, force: true }).catch(() => {});
+      if (m.branch !== null) await this.#d.git(m.repo, ["branch", "-D", m.branch]).catch(() => {});
+      if (m.ref !== null) await this.#d.git(m.repo, ["update-ref", "-d", m.ref]).catch(() => {});
+      await this.#emptied(m.dir);
+    }
+    const made = await readFile(inMade(this.#d.data, i.id), "utf8").catch(() => "");
+    for (const path of made.split("\n")) {
+      if (path === "") continue;
+      await rm(path, { force: true }).catch(() => {});
+      await this.#emptied(dirname(path));
+    }
+    const aside = inAside(this.#d.data, i.id);
+    for (const line of (await readFile(join(aside, "list.txt"), "utf8").catch(() => "")).split("\n")) {
+      const [path, name] = line.split("\t");
+      if (path === undefined || name === undefined || path === "") continue;
+      await rm(path, { recursive: true, force: true }).catch(() => {});
+      await mkdir(dirname(path), { recursive: true }).catch(() => {});
+      await rename(join(aside, name), path).catch(() => {});
+    }
+    i.step = "dropped";
+    this.#letIn(i.id);
+    await this.#saveIn(i);
+    await rm(join(dir(this.#d.data), "in", i.id), { recursive: true, force: true });
+    return { ok: true };
+  }
+}
+
+/// `path`'s real path, the part of it not there yet as it is (carry-worker.ts `realOf`, off the main thread's way).
+async function realOfSoon(path: string): Promise<string> {
+  const rest: string[] = [];
+  for (let at = path; ; at = dirname(at)) {
+    const real = await realpath(at).catch(() => null);
+    if (real !== null) return join(real, ...rest.reverse());
+    if (dirname(at) === at) return path;
+    rest.push(basename(at));
+  }
+}
+
+/// Whether the file at `path` (under `data`'s rooms) is the one described already: of its size, and of its time or its
+/// bytes' hash (read off the main thread's way, a stream).
+async function inPlace(path: string, data: string, f: { hash: string; size: number; mtimeMs?: number | null }): Promise<boolean> {
+  if (!carriedPlace(data, path)) return false;
+  const st = await stat(path).catch(() => null);
+  if (st === null || !st.isFile() || st.size !== f.size) return false;
+  if (typeof f.mtimeMs === "number" && Math.trunc(st.mtimeMs) === Math.trunc(f.mtimeMs)) return true;
+  const h = createHash("sha256");
+  for await (const piece of createReadStream(path)) h.update(piece as Buffer);
+  return h.digest("hex") === f.hash;
+}
+
+/// Where what was sent and what it has differ, in words (null: they do not).
+function differ(sent: Counts, there: Counts): string | null {
+  if (sent.sessions !== there.sessions) return why("countSessions", { sent: sent.sessions, there: there.sessions });
+  for (const k of ["entries", "letters"] as const) {
+    for (const [t, n] of Object.entries(sent[k])) if ((there[k][t] ?? 0) !== n) return why("countThread", { sent: n, what: k, there: there[k][t] ?? 0 });
+  }
+  for (const [t, n] of Object.entries(sent.rows)) if ((there.rows[t] ?? 0) !== n) return why("countRows", { sent: n, table: t, there: there.rows[t] ?? 0 });
+  return null;
+}
+
+/// Still.fail's own chats' connect (sessions/internal.ts), and the one of before.
+const isInternal = (c: string) => c === "ember" || c === "chat";
+/// Whether a connect's chats are routed to the station a chat of it runs on (connects/remote.ts ROUTED).
+const routed = (k: { kind: string; mode: string }) => k.mode !== "single-session" && (k.kind === "slack" || k.kind === "feishu");
+
+/// What a chat handed here is told once, as its next turn starts: where it runs now, where its files are.
+export function movedHere(from: string, workspace: string, fromData: string, toData: string): string {
+  const lines = [`<chat-moved>This chat was handed here from station ${from}: it goes on on this station.`];
+  if (fromData !== "" && fromData !== toData) lines.push(`Its files were under ${fromData} and are under ${toData} now: a path you noted under the old one is the same under the new one (your working directory is ${moved(workspace, fromData, toData)}).`);
+  lines.push("Its background jobs are started again here as they move; nobody asked anything of you by this, and it is said once.</chat-moved>");
+  return lines.join("\n");
+}

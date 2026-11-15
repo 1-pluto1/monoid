@@ -33,6 +33,8 @@ import { tr, stationLang } from "../ops/i18n.ts";
 import { iso, sessionPlaces, transcriptSources } from "../read/transcript.ts";
 import { type Attachment, MANUAL, type SessionRow, type Store, STILLFAIL_SURFACE, feishuSurface, commaSurface, slackSurface, type MessageRow, type ThreadRow, type ThreadSummary } from "../store/store.ts";
 import type { DeliveryCardState, InWorkspace, PendingMessage } from "../store/rows.ts";
+import { comingWs, handedWs } from "../store/rows.ts";
+import { isNotice, markNotice } from "./chat.ts";
 import { runShown } from "./run-change.ts";
 import type { PolicyChecks } from "./archive-policy.ts";
 import type { RecentChatList } from "../store/chat-list.ts";
@@ -163,6 +165,7 @@ export class Retiring extends Error {
 /// What a station retired from `ws` says its chats there are of once the station they went to took them: no workspace
 /// it is in, so they are out of every device's sight here (replica/retire.ts).
 export const retiredWs = (ws: string) => `retired:${ws}`;
+export { comingWs, handedWs } from "../store/rows.ts";
 
 export class Hub {
   readonly options: HubOptions;
@@ -306,7 +309,8 @@ export class Hub {
       // its chat as a change by hand is (lifecycle.ts `configure`).
       moved: (key, was) => {
         const now = this.store.getSession(key);
-        if (!now) return;
+        // (one handed to another station as this one was retired says nothing here: it goes on there)
+        if (!now || this.handedOver(key)) return;
         const named = (id: string) => {
           const name = this.accounts.profile(id)?.name;
           return typeof name === "string" ? name : null;
@@ -427,7 +431,7 @@ export class Hub {
     this.quieted.add(ws);
     const keys = new Set([...this.deadlines.keys(), ...this.actors.keys()].filter((key) => this.ofWorkspace(key, ws)));
     for (const [key, fiber] of this.deadlines) if (keys.has(key)) (this.interrupt(fiber), this.deadlines.delete(key));
-    await Promise.all([...this.actors.values()].filter((a) => keys.has(a.key)).map((a) => a.suspend()));
+    await Promise.all([...this.actors.values()].filter((a) => keys.has(a.key)).map((a) => a.suspend("its workspace's chats go to another station")));
   }
 
   /// `quiet` taken back (the retirement cancelled): what it cut off resumes and what waited goes on, as `backIn` does.
@@ -450,6 +454,97 @@ export class Hub {
     return this.quieted.has(ws);
   }
 
+  /// Whether session `key` is one of the chats this station hands, or handed, to another: of a workspace quiet here, put
+  /// out of sight (`retiredWs`, `handedWs`, one coming here and not shown yet, `comingWs`), or held one at a time
+  /// (`holdChat`).
+  handedOver(key: string): boolean {
+    const ws = this.store.sessionWs(key);
+    if (ws === undefined) return false;
+    if (this.heldChats.has(key)) return true;
+    if (ws !== null && (ws.startsWith(retiredWs("")) || ws.startsWith(handedWs("")) || ws.startsWith(comingWs("")))) return true;
+    return this.quieted.has(ws ?? this.workspaces()[0] ?? "");
+  }
+
+  /// The chats held one at a time (replica/handover.ts: one being handed to another station; move/: one stopped as what
+  /// it needs moved away), each with why: no turn starts, its process is ended as the station's leaving a workspace
+  /// ends it (its turn cut off stays marked running, its messages pending), what is said to it is kept in its threads'
+  /// logs, delivered where it ends up.
+  private readonly heldChats = new Map<string, string>();
+
+  /// What a chat stopped by a move says once, as a person next speaks in it (`stoppedNotice`): its words, made as it
+  /// is said, and whether they were said in this stop. Nothing is said by the stop itself: a login moved away never posts
+  /// into every chat that used it.
+  private readonly stopNotices = new Map<string, { words: () => string; told: boolean }>();
+
+  /// Holds session `key` (`why`: for the status), at once: none of its turns starts from now on. `notice`: what it
+  /// answers, once in this hold, as a person speaks in it (a chat stopped by a move: what it waits for and where).
+  async holdChat(key: string, why: string, notice?: () => string): Promise<void> {
+    this.heldChats.set(key, why);
+    // (a stop anew, or what it waits for now: said once in it)
+    if (notice !== undefined) this.stopNotices.set(key, { words: notice, told: false });
+    const fiber = this.deadlines.get(key);
+    if (fiber) (this.interrupt(fiber), this.deadlines.delete(key));
+    // (held for what it is: moving to another station, or stopped as what it needs moved away)
+    await this.actors.get(key)?.suspend(`the chat is held: ${why}`);
+  }
+
+  /// `holdChat` taken back: what it cut off resumes and what waited goes on, as `unquiet` does. False: it was not held.
+  releaseChat(key: string): boolean {
+    this.stopNotices.delete(key);
+    if (!this.heldChats.delete(key)) return false;
+    this.wakeChat(key);
+    return true;
+  }
+
+  /// A chat that may take turns now (let go, shown here): what was cut off resumes, what waited goes on.
+  wakeChat(key: string): void {
+    const row = this.store.getSession(key);
+    if (row === null || this.heldChats.has(key) || this.holdsNow.size > 0 || !this.online(row) || !this.inAWorkspace(key)) return;
+    if (row.running) void this.actor(row).recover();
+    else if (this.store.hasPending(key)) void this.actor(row).kick();
+  }
+
+  /// Whether session `key` is in a turn now.
+  busy(key: string): boolean {
+    return this.actors.get(key)?.processState() === "running";
+  }
+
+  /// Once session `key`'s turn ended, as the store says it (at once where none runs).
+  turnEnded(key: string): Promise<void> {
+    if (!this.busy(key)) return Promise.resolve();
+    return new Promise((resolve) => {
+      const off = this.store.subscribe((change) => {
+        if (change.type !== "session" || change.key !== key || this.busy(key)) return;
+        off();
+        resolve();
+      });
+    });
+  }
+
+  /// Why session `key` is held one at a time (null: it is not).
+  chatHeld(key: string): string | null {
+    return this.heldChats.get(key) ?? null;
+  }
+
+  /// What a connect's platform said in a thread, as far as it came, taken (`accept`'s turn of that thread waited for):
+  /// a chat handed over sends the rest of its log after it.
+  async drained(connectId: string, channel: string, threadTs: string): Promise<void> {
+    await this.inThread(`${this.surface(connectId)}\0${channel}\0${threadTs}`, async () => {});
+  }
+
+  /// The station a chat of `connect`'s thread was handed to (store `handedTo`): what it says there goes there.
+  movedTo(connect: string, channel: string, threadTs: string): string | null {
+    const thread = this.store.threadAt(this.surface(connect), channel, threadTs);
+    if (thread === null) return null;
+    for (const m of this.store.threadSessions(thread.id)) {
+      // (one being handed back here takes what comes here: it is to go on here)
+      if (m.connect !== connect || this.store.sessionWs(m.session)?.startsWith(comingWs("")) === true) continue;
+      const to = this.store.handedTo(m.session);
+      if (to !== null) return to.station;
+    }
+    return null;
+  }
+
   /// The station left one of its workspaces but is still in others: that workspace's
   /// sessions end their processes as `suspendAll` ends everyone's; `backIn` resumes them once it is back.
   async leftWorkspace(ws: string) {
@@ -457,7 +552,7 @@ export class Hub {
     const candidates = new Set([...this.deadlines.keys(), ...this.actors.keys()]);
     const keys = new Set([...candidates].filter((key) => this.store.sessionWs(key) === ws));
     for (const [key, fiber] of this.deadlines) if (keys.has(key)) (this.interrupt(fiber), this.deadlines.delete(key));
-    await Promise.all([...this.actors.values()].filter((a) => keys.has(a.key)).map((a) => a.suspend()));
+    await Promise.all([...this.actors.values()].filter((a) => keys.has(a.key)).map((a) => a.suspend("the station left its workspace")));
   }
 
   /// The station is in a workspace again: its sessions' cut-off turns resume, and what waited goes on.
@@ -735,6 +830,8 @@ export class Hub {
     // What a bot of this station posted is its agent's, recorded and handed to the thread as it was posted: Slack's
     // copy of it, seen through another connect, is not a message of its own.
     if (this.ownBot(config, message.user)) return;
+    // (a notice of another station's, come back through another bot's connect: no person said it)
+    if (this.stationNotice(config, message)) return;
     const connect = connectOf(config, connectId);
     // (a workspace whose chats go to another station: not taken here, so that it is said there)
     if (this.quieted.size > 0 && this.quieted.has(connect.workspace ?? this.workspaces()[0] ?? "")) throw new Retiring();
@@ -761,7 +858,7 @@ export class Hub {
     // Archived by hand: it takes no messages until someone shows it again; told so, once per message.
     if (existing && this.store.manuallyArchived(existing.id)) {
       if (this.store.messageNumberAt(existing.id, message.ts) === null) {
-        await chat.post(here, `⚠️ ${tr(stationLang(), "station.chat.archived")}`, []).catch((error) => log.warn("hub", "archived notice not posted", { thread: existing.id, error: (error as Error).message }));
+        await chat.post(here, markNotice(`⚠️ ${tr(stationLang(), "station.chat.archived")}`), []).catch((error) => log.warn("hub", "archived notice not posted", { thread: existing.id, error: (error as Error).message }));
       }
       return;
     }
@@ -772,7 +869,7 @@ export class Hub {
         if (single) this.store.setBinding(connect.id, key);
       } catch (error) {
         log.error("hub", "cannot create session", { session: key, error: (error as Error).message });
-        await chat.post(here, `⚠️ ${tr(stationLang(), "station.slack.sessionFailed", { error: (error as Error).message })}`, []);
+        await chat.post(here, markNotice(`⚠️ ${tr(stationLang(), "station.slack.sessionFailed", { error: (error as Error).message })}`), []);
         return;
       }
       // As the broker did: a new session says first where it can be followed. Once, as it starts; not waited for. In
@@ -780,7 +877,7 @@ export class Hub {
       const link = single ? undefined : this.link(key);
       const said = link === undefined ? null : chat.sessionLink ? chat.sessionLink(link, tr(stationLang(), "station.slack.viewSession")) : `<${link}|${tr(stationLang(), "station.slack.viewSession")}>`;
       if (said !== null) {
-        chat.post(here, said, []).catch((error) => log.warn("hub", "session link not posted", { session: key, error: (error as Error).message }));
+        chat.post(here, markNotice(said), []).catch((error) => log.warn("hub", "session link not posted", { session: key, error: (error as Error).message }));
       }
     }
     const thread = existing ?? (await this.openSlackThread(chat, surface, message, createdBy, key));
@@ -1096,9 +1193,11 @@ export class Hub {
 
   /// A profile was deleted: the sessions on it are taken on by another of their runtime's (their process ends now if
   /// idle, else when its turn is over); those no other profile can run are stopped, and their process ends.
+  /// A chat handed to another station as this one is retired is left as it is: it goes on there, and its account moving
+  /// away from here (share/index.ts `moveProfile`) says nothing in it.
   async profileGone(id: string) {
     for (const row of this.store.listSessions()) {
-      if (row.profile !== id) continue;
+      if (row.profile !== id || this.handedOver(row.key)) continue;
       let movable = true;
       try {
         this.accounts.runOn(row.key);
@@ -1111,6 +1210,20 @@ export class Hub {
       if (!movable) await actor.stop();
       await actor.changed();
     }
+  }
+
+  /// Chats moved here from a retired station whose accounts came after them (replica/retire.ts `retire.accounts`): those
+  /// of `keys` that ran on an account of `map` (its id there) go on on the id it has here, their runtime sessions too, so
+  /// that the next turn takes up its runtime session there and nothing is said in the chat; one with a process up takes
+  /// it as it is next idle. How many moved.
+  followAccounts(keys: string[], map: Map<string, string>): number {
+    let n = 0;
+    for (const key of keys) {
+      if (!this.store.followProfiles(key, map)) continue;
+      n++;
+      void this.actors.get(key)?.changed().catch(() => {});
+    }
+    return n;
   }
 
   /// Starts a session's runtime ahead of a message (the actor's `warm`).
@@ -1332,6 +1445,19 @@ export class Hub {
     return slackSurface(connect, this.chatOf(connect)?.workspace() ?? null);
   }
 
+  /// The bots of the connects the workspace's other stations run, as each told this one (connects/workspace.ts
+  /// `connect.bots`, told as they change), by station.
+  readonly toldBots = new Map<string, Set<string>>();
+
+  /// A station's own notice (chat.ts `NOTICE_MARK`) from a bot of any connect this station knows of the workspace's: its
+  /// own connects', those of other stations it learnt (their surfaces here), and those the other stations told it.
+  private stationNotice(config: HubConfig, message: InboundMessage): boolean {
+    if (!isNotice(message.text)) return false;
+    if (config.connects.some((c) => (this.chatOf(c.id)?.botUserId() ?? "") === message.user && message.user !== "")) return true;
+    for (const bots of this.toldBots.values()) if (bots.has(message.user)) return true;
+    return false;
+  }
+
   /// A Slack user that is one of this station's connects' bots.
   private ownBot(config: HubConfig, user: string): boolean {
     return config.connects.some((c) => {
@@ -1534,7 +1660,13 @@ export class Hub {
       archiveIsCold: (key) => this.cold.isCold(key),
       restoreArchive: (key) => this.cold.restore(key),
       cleanArchive: (key) => this.cold.pack(key),
-      held: (key) => this.holdsNow.size > 0 || !this.inAWorkspace(key),
+      held: (key) => this.holdsNow.size > 0 || this.heldChats.has(key) || !this.inAWorkspace(key),
+      stoppedNotice: (key) => {
+        const n = this.stopNotices.get(key);
+        if (n === undefined || n.told || !this.heldChats.has(key)) return null;
+        n.told = true;
+        return n.words();
+      },
       stopJobs: async (key) => {
         const jobs = this.jobs;
         if (!jobs) return;

@@ -255,7 +255,7 @@ async fn Actors::called(self : Actors, a : Actor, method : String, args : Array[
       })
       return match refused { Some(r) => jstr(r); None => Json::null() }
     }
-    "suspend" => return self.suspend(a)
+    "suspend" => return self.suspend(a, why=str_of(Some(arg(0))).unwrap_or("the station is in no workspace"))
     "runChanged" => self.notice(a, str_of(Some(arg(0))).unwrap_or(""), change=arg(1))
     "adopt" => self.adopt(a, arg(0), arg(1), arg(2), arg(3))
     "snapshot" => return self.snapshot(a)
@@ -769,8 +769,9 @@ async fn Actors::clear_now(
 }
 
 ///|
-/// actor.ts `suspend`.
-async fn Actors::suspend(self : Actors, a : Actor) -> Json raise {
+/// actor.ts `suspend`: `why`, what is said of it, in the log and as the turn's end (the station left its workspace, or
+/// this chat is held for a move).
+async fn Actors::suspend(self : Actors, a : Actor, why? : String = "the station is in no workspace") -> Json raise {
   a.delivery_interruptions += 1
   self.enqueue(a, async fn() {
     defer {
@@ -792,13 +793,13 @@ async fn Actors::suspend(self : Actors, a : Actor) -> Json raise {
       return
     }
     let resume = (turn is Some(_) || busy) && !(turn is Some({ declared: Some(d), .. }) && settled_state(d))
-    self.log(a, "info", "ending the runtime process: the station is in no workspace", fields={ "resume": jbool(resume) })
+    self.log(a, "info", "ending the runtime process: " + why, fields={ "resume": jbool(resume) })
     if agent is Some(g) {
       ignore(self.agent_do(a, g, "dispose", []))
     }
     if turn is Some(t) {
       let ended = kind_of(ended_in(t.declared, "aborted"))
-      ignore(self.store(a, "endTurn", [jstr(t.id), jstr("aborted"), jstr("other: the station left its workspace"), match ended { Some(k) => jstr(k); None => Json::null() }, Json::null()]))
+      ignore(self.store(a, "endTurn", [jstr(t.id), jstr("aborted"), jstr("other: " + why), match ended { Some(k) => jstr(k); None => Json::null() }, Json::null()]))
     }
     self.set_running(a, resume)
     if turn is Some(_) || busy {
@@ -997,7 +998,15 @@ fn Actors::interrupted(self : Actors, a : Actor) -> Bool {
 
 ///|
 async fn Actors::pump(self : Actors, a : Actor) -> Unit raise {
-  if a.delivery_interruptions > 0 || a.recoveries > 0 || a.recovery_deferred || self.held(a) || self.archived(a) || a.compacting {
+  // (stopped by a move and spoken to: said once in this stop what it waits for and what to do; what was said is kept:
+  // actor.ts `pump`, SessionDeps `stoppedNotice`)
+  let held = self.held(a)
+  if held && self.has_pending(a) {
+    if str_of(Some(self.deps(a, "stoppedNotice", [jstr(a.key)]))) is Some(words) {
+      self.notice(a, "⚠️ " + words)
+    }
+  }
+  if a.delivery_interruptions > 0 || a.recoveries > 0 || a.recovery_deferred || held || self.archived(a) || a.compacting {
     return
   }
   if a.codex_update is Some(u) {

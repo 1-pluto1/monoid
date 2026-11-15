@@ -4,6 +4,7 @@
 // skills' (src/skills/), and are held under ceilings (test/tools-weight.test.ts). What they do is src/sessions/.
 // chat_post still takes `options` beside `text` and kind need_decision, from before cards (sessions/args.ts), and
 // declares neither: with them its schema was over what Codex keeps the parameter descriptions of.
+import { NOTICE_MARK } from "../sessions/chat.ts";
 import { RUNTIME_KINDS } from "../agents/runtime.ts";
 import { chatHistory, chatLeave, chatPost, chatState, mayStage, staged, target, unheld, NOT_POSTED } from "../sessions/conversations.ts";
 import type { Hub } from "../sessions/hub.ts";
@@ -11,7 +12,7 @@ import { sessionSend } from "../sessions/messages.ts";
 import { chatCreate } from "../sessions/opened.ts";
 import { chatArchive } from "../sessions/chat-archive.ts";
 import type { Args } from "../sessions/args.ts";
-import { chatList, chatRead, elsewhere, readAfar, scopeOf, sessionHistory } from "../sessions/others.ts";
+import { chatList, chatRead, elsewhere, linkedSession, readAfar, scopeOf, sessionHistory } from "../sessions/others.ts";
 import { suggestArchive } from "../sessions/review.ts";
 import { STILLFAIL_SURFACE } from "../store/store.ts";
 import type { Tool } from "./mcp.ts";
@@ -449,7 +450,11 @@ export const SESSION_HISTORY = {
 /// here.
 function afar(hub: Hub, key: string, tool: "chat_read" | "session_history", args: Args): Promise<string> | null {
   const station = typeof args.chat === "string" ? elsewhere(hub, key, args.chat) : null;
-  return station !== null ? readAfar(hub, key, station, tool, args) : null;
+  if (station !== null) return readAfar(hub, key, station, tool, args);
+  // (a chat handed from here to another station is read where it is now: replica/handover.ts)
+  const ref = typeof args.chat === "string" ? (linkedSession(args.chat)?.[0] ?? args.chat.trim()) : "";
+  const moved = ref === "" ? null : hub.store.handedTo(ref);
+  return moved === null ? null : readAfar(hub, key, moved.station, tool, { ...args, chat: ref });
 }
 
 /// `run` with `args`' files (and with `links` its text's local links) in folders macOS protects copied first
@@ -476,7 +481,9 @@ export function chatTools(hub: Hub): Tool[] {
   return [
     {
       ...CHAT_POST,
-      run: async (key, args) => {
+      run: async (key, given) => {
+        // (what an agent says never ends as a station's notice does: chat.ts NOTICE_MARK)
+        const args = typeof given.text === "string" && given.text.includes(NOTICE_MARK) ? { ...given, text: given.text.replaceAll(NOTICE_MARK, "") } : given;
         // Its files and local links in a folder macOS protects copied first, never touched on the station's thread
         // (conversations.ts `staged`); links only where they become attachments (still.fail chats).
         let stillfail = false;

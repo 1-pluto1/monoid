@@ -3,6 +3,7 @@
 // now, and put into this station's database before its store opens: the same thread ids, entry numbers and session
 // keys, the paths in its rows moved from the lost station's data directory to this one's, its files put where the rows
 // say. Only into a station that has no chats of its own yet; the station then says it was that one (`formerly`).
+import { claudeProject } from "../read/transcript.ts";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { dirname, join, sep } from "node:path";
@@ -32,6 +33,25 @@ export function readCopy(dir: string): { head: Head; folded: Folded } {
   const folded = new Folded();
   for (const b of head.batches) for (const line of decodeBatch(readFileSync(join(dir, "log", b))).lines) folded.apply(line); // sync: in the restore's own thread (restore-worker.ts)
   return { head, folded };
+}
+
+/// Where a file of a chat carried from the station whose data directory is `from` lies here, the one answer for its
+/// placing, for whether it is in place already and for its pruning: as `moved`, and a Claude transcript
+/// (`transcripts*/claude/<project>/…`, its project named by the runtime after the real path of the directory it ran
+/// in, read/transcript.ts `claudeProject`) under the project of `room`, its room here as the runtime will see it (its
+/// real path, `/private/tmp/…` where the data directory is behind a symlink), whatever name it had there; none given:
+/// as `moved`. Kept under the other's name, it was not the one resumed: this station's own older copy of the same
+/// session, in place under this room's project, was (a chat moved there and back recalled nothing of its time there;
+/// 2026-11-14).
+export function carriedTo(path: string, from: string, to: string, room: string | null): string {
+  const at = moved(path, from, to);
+  const project = room === null ? null : claudeProject(room);
+  if (project === null || from === "" || at === path) return at;
+  const t = to.endsWith(sep) ? to.slice(0, -1) : to;
+  const parts = at.slice(t.length + 1).split(/[\\/]/);
+  if (parts.length < 4 || !parts[0]!.startsWith("transcripts") || parts[1] !== "claude") return at;
+  parts[2] = project;
+  return join(t, ...parts);
 }
 
 /// `path` as it is on this station: under `to` where it was under `from`.

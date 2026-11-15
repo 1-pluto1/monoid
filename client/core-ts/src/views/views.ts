@@ -2378,6 +2378,7 @@ export class Views implements Owner {
   /// station and exclusion), newest first, at most `view.messages`: each with its chat's row, who said it and its line.
   /// What the search (views/search.ts) reads of the views.
   readonly #searchSource: SearchSource = {
+    moved: (station, thread) => this.#core.data.movedThread(station, thread) !== undefined,
     value: (topic) => this.value(topic),
     ok: (topic) => this.ok(topic),
     stations: (scope) => this.stations(scope),
