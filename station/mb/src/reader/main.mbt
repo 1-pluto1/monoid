@@ -678,6 +678,9 @@ async fn replica_carry(host : @host.Host, sep : String) -> Unit {
       Some(t) => t
       None => raise Failure("\{name} is required")
     }
+    if yes("count") {
+      @replica.count_looks()
+    }
     match text("op") {
       Some("gather") =>
         Ok(
@@ -709,6 +712,41 @@ async fn replica_carry(host : @host.Host, sep : String) -> Unit {
           ),
         )
       Some("preview") => Ok(@replica.carry_preview(host, sep, need("dataDir"), need("db"), text("ws").unwrap_or(""), yes("home")))
+      Some("sizes") => {
+        // (move/sizes.ts: the gathering's own walk, each file's size counted; with `places`, the other side's)
+        let sizing = ask.get("sizing")
+        let most = match sizing {
+          Some(o) =>
+            match o.get("most") {
+              Some(Num(n)) => n.to_int()
+              _ => 500000
+            }
+          None => 500000
+        }
+        let of_text = (v : @jsjson.JValue?) => match v {
+          Some(Str(u)) => Some(@jsjson.text(u))
+          _ => None
+        }
+        let places = match sizing {
+          Some(o) =>
+            match o.get("places") {
+              Some(Arr(ps)) =>
+                Some(
+                  ps.map(p => (
+                    of_text(p.get("key")).unwrap_or(""),
+                    of_text(p.get("room")),
+                    match p.get("transcripts") {
+                      Some(Arr(ts)) => ts.filter_map(v => if v is Str(u) { Some(@jsjson.text(u)) } else { None })
+                      _ => []
+                    },
+                  )),
+                )
+              _ => None
+            }
+          None => None
+        }
+        Ok(@replica.carry_sizes(host, sep, need("dataDir"), text("db").unwrap_or(""), texts("keys").unwrap_or([]), most, places))
+      }
       _ => Err("no such ask")
     }
   } catch {

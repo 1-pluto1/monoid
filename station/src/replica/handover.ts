@@ -40,7 +40,7 @@ import { HASH, STATION, WORKSPACE } from "./format.ts";
 import type { Ask } from "./peers.ts";
 import { Gone, type Need, Said, UNANSWERED, sayOf } from "../move/module.ts";
 import type { KeptSend } from "../api/admin.ts";
-import { HEADROOM, LACK_MOST, type MadeGit, RETRY_MOST_MS, RETRY_MS, connectsThere, gatherSoon, placeSoon, rebuildGits } from "./retire.ts";
+import { LACK_MOST, type MadeGit, RETRY_MOST_MS, RETRY_MS, connectsThere, gatherSoon, placeSoon, rebuildGits } from "./retire.ts";
 import { lackingIn, receiveFile, sendGathered } from "./sending.ts";
 import { carriedTo, moved } from "./restore.ts";
 import { stationLang, tr } from "../ops/i18n.ts";
@@ -123,7 +123,11 @@ export type Out = {
 export type In = { id: string; origin: string; keys: string[]; ws: string; at: number; step: "coming" | "shown" | "dropped"; ctx: ImportCtx; carry: string | null; error: string | null; stoppedFor?: Need | null; bindings?: Record<string, string>;
   /// What answering it took here (the clock's ms), by request (`begin`, `lacking`, `put`, `place`, `rows`, `prune`,
   /// `counts`, `show`), each request of a kind added: what its line says it took.
-  spent?: Record<string, number> };
+  spent?: Record<string, number>;
+  /// The last page of rows taken (`handover.rows`'s `page`): the same page asked again (its answer lost on the way,
+  /// its sender's process or this one's stopping as it went: mesh/peer.ts PeerStopped) is answered as taken, not
+  /// counted twice.
+  page?: string };
 
 /// What a hand-over's steps took (ms), from when each began to when the next did, the last to `end`; and the whole.
 function tookOf(began: Record<string, number> | undefined, end: number): { ms: Record<string, number>; total: number } {
@@ -173,7 +177,7 @@ export type HandoverDeps = {
   /// station's to its chats unless the station they go to has it (the plan's rule, move/accounts.ts), no need of them.
   accounts: { of(id: string): AccountOf | null; here(a: AccountOf): string | null; present?(id: string): boolean };
   reposDir: string;
-  room?: () => Promise<{ free: number | null }>;
+  room?: () => Promise<{ free: number | null; total?: number | null }>;
   hasGit?: () => Promise<boolean>;
   git?: (dir: string, args: string[]) => Promise<string>;
   lackMost?: number;
@@ -189,13 +193,13 @@ export type HandoverDeps = {
   /// What keeps the station from updating itself while a chat comes here (updates/holds.ts `hold`): its let-go.
   hold?: () => () => void;
   /// Chats `keys` shown here (what their connect kept for them while they were on their way, taken: move/station.ts).
-  shown?: (keys: string[]) => Promise<void> | void;
+  shown?: (keys: string[], from?: string) => Promise<void> | void;
   /// Chats `keys` went from here (`gone`): what kept them stopped here is no longer this station's (the scheduler's
   /// stopped set): one that comes back is stopped anew as it arrives.
   went?: (keys: string[]) => Promise<void> | void;
   /// The single-session connects bound to sessions here (store `binding`), by connect.
   bindingsOf?: (keys: string[]) => Record<string, string>;
-  /// For a test: a step's failure made there (`files`, `rows`, `counts`, `show`).
+  /// For a test: a step's failure made there (`files`, `rows`, `counts`, `show`; taking: `put`, `import`).
   fail?: (step: string) => void;
 };
 
@@ -232,11 +236,24 @@ function readAll<T>(at: string): T[] {
   return out;
 }
 
-const roomHere = (data: string) => async () => {
+/// What this station's disk failing a write it was sent is (full, over its quota, read-only): the hand-over's own end
+/// here, told the asker in numbers.
+const WRITE_FAILED = new Set(["ENOSPC", "EDQUOT", "EROFS"]);
+
+export const roomHere = (data: string) => async () => {
   const s = await statfs(data).catch(() => null);
-  return { free: s === null ? null : Number(s.bavail) * Number(s.bsize) };
+  return { free: s === null ? null : Number(s.bavail) * Number(s.bsize), total: s === null ? null : Number(s.blocks) * Number(s.bsize) };
 };
 const gb = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GB`;
+
+/// What a move leaves free on the station it goes to, at the least: the larger of FLOOR_MIN and FLOOR_SHARE of its
+/// volume (`total`; one that does not say it, FLOOR_MIN). A station whose disk fills stops every chat on it, not only
+/// those that came (its database, transcripts and jobs' output are written there), and what its chats build and log
+/// is gigabytes a day: 1 GiB (retire.ts HEADROOM) was minutes of it. A tenth keeps a large disk's margin in proportion
+/// (macOS itself purges and slows below about that).
+export const FLOOR_MIN = 20 * 1024 ** 3;
+export const FLOOR_SHARE = 0.1;
+export const floorOf = (total: number | null | undefined) => Math.max(FLOOR_MIN, Math.floor((total ?? 0) * FLOOR_SHARE));
 
 /// The hand-over's id: of when, its sessions and the station it goes to, and a part of its own (two of the same chat
 /// to the same station in the same millisecond are two: the second was refused there as "shown already").
@@ -300,6 +317,7 @@ export class Handover {
     for (const i of readAll<In>(join(dir(d.data), "in"))) {
       // (what its rows' pages put in, as kept with them: newer than its file where a stop came between the two)
       if (i.step === "coming") i.ctx = d.store.importCtx(i.id) ?? i.ctx;
+      if (i.step === "coming") this.#unsure.add(i.id);
       this.#keepIn(i);
       this.#holdIn(i);
     }
@@ -325,6 +343,11 @@ export class Handover {
   }
 
   async start(): Promise<void> {
+    // (what was coming here as this station stopped: asked of where it came from whether it still goes on)
+    for (const id of this.#unsure) {
+      const i = this.#ins.get(id);
+      if (i !== undefined) this.#askStill(i);
+    }
     // (what was left to remove as a chat came here was shown, where this process stopped before it was gone)
     for (const name of await readdir(join(dir(this.#d.data), "in")).catch(() => [] as string[])) if (name.startsWith(".gone-")) void rm(join(dir(this.#d.data), "in", name), { recursive: true, force: true }).catch(() => {});
     // (gone, where it went said first, before anything else; shown there, out of sight here and let go as a hand-over
@@ -658,9 +681,14 @@ export class Handover {
     const g: Gathered = await this.#work.gather(d.data, db, o.ws, false, scratch(d.data, o.id), undefined, null, o.keys).catch((e) => Promise.reject(carryWords(e)));
     // (a file of its room this station cannot read: the chat does not go, rather than go without it)
     if ((g.unreadableCount ?? 0) > 0) throw new Said(why("cannotRead", { path: (g.unreadable ?? []).join("、"), count: g.unreadableCount }));
-    const need = HEADROOM + g.bytes + Math.ceil(g.bytes / 20);
+    const floor = floorOf(typeof begun?.total === "number" ? begun.total : null);
+    // (what it adds there, held before it is placed: what that station lacks of it, a twentieth more for what placing
+    // makes; what it has in place already, a room left there before, is not sent and adds nothing)
+    const fits = (adds: number) => {
+      const need = adds + Math.ceil(adds / 20);
+      if (typeof begun?.free === "number" && begun.free - need < floor) throw new Said(why("noRoom", { station: o.toName || o.to.slice(0, 12), free: gb(begun.free), need: gb(need), floor: gb(floor) }));
+    };
     if (g.gits > 0 && begun?.git === false) throw new Said(why("noGit", { station: o.toName || o.to.slice(0, 12), n: g.gits }));
-    if (typeof begun?.free === "number" && need > begun.free) throw new Said(why("noRoom", { station: o.toName || o.to.slice(0, 12), free: gb(begun.free), need: gb(need) }));
     d.fail?.("files");
     const carry = await sendGathered(g, {
       // (where each goes and how big, so that what is in place there already is not sent again)
@@ -671,6 +699,8 @@ export class Handover {
         return answer;
       },
       most: d.lackMost ?? LACK_MOST,
+      // (what it lacks there asked first only where all of it might not fit: else no more is asked than it sends)
+      ...(held || typeof begun?.free !== "number" || begun.free - (g.bytes + Math.ceil(g.bytes / 20)) >= floor ? {} : { adds: fits }),
       stopping: () => this.#closed || o.abandoned === true,
       total: (bytes) => void (held || (o.total = bytes, o.done = 0, progress?.({ done: 0, total: bytes, unit: "bytes" }))),
       done: (bytes) => void (held || (o.done += bytes, progress?.({ done: o.done, total: o.total, unit: "bytes" }))),
@@ -737,7 +767,8 @@ export class Handover {
     const sent: Counts = { sessions: 0, entries: {}, letters: {}, rows: {} };
     const page = async (table: ChatTable, rows: Json[]) => {
       if (rows.length === 0) return;
-      await ask({ method: "handover.rows", table, rows });
+      // (a page of its own: asked again, as its answer was lost, it is not taken twice there)
+      await ask({ method: "handover.rows", table, rows, page: randomBytes(8).toString("hex") });
       if (table === "sessions") sent.sessions += rows.length;
       else if (table === "entries" || table === "letters") for (const r of rows) sent[table][String(r.thread)] = (sent[table][String(r.thread)] ?? 0) + 1;
       else if (table !== "threads") sent.rows[table] = (sent.rows[table] ?? 0) + rows.length;
@@ -869,8 +900,35 @@ export class Handover {
     this.#again.set(o.id, this.#d.fibers.after(Math.min(RETRY_MS * 2 ** n, RETRY_MOST_MS), () => this.#go(o))); // timer: a retry after a failure
   }
 
+  /// The hand-overs coming here that were under way as this station started: whether each still goes on is asked of
+  /// the station it comes from as this one starts and as that one is heard from, and one that does not is dropped here
+  /// (its sender failed and its drop never came, or it lost its record). One begun in this process is the sender's
+  /// own to drop, as it does on failure, told until it is answered.
+  readonly #unsure = new Set<string>();
+  #asking = new Set<string>();
+
+  #askStill(i: In): void {
+    if (i.step !== "coming" || this.#asking.has(i.id) || this.#inWork.has(i.id)) return;
+    this.#asking.add(i.id);
+    void this.#d.ask(i.origin, { method: "handover.still", workspace: i.ws, origin: this.#d.here(), id: i.id })
+      .then(async (a) => {
+        this.#unsure.delete(i.id);
+        if (a?.going === false && i.step === "coming") {
+          log.info("handover", "a chat coming here no longer goes on where it came from: dropped here", { id: i.id, from: i.origin.slice(0, 12) });
+          await this.#drop1(i);
+        }
+      })
+      .catch(() => {})
+      .finally(() => void this.#asking.delete(i.id));
+  }
+
   /// The other station came up (its link opened): what is owed to it told now.
   reached(station: string): void {
+    for (const id of this.#unsure) {
+      const i = this.#ins.get(id);
+      if (i === undefined || i.step !== "coming") this.#unsure.delete(id);
+      else if (i.origin === station) this.#askStill(i);
+    }
     this.#look("reached", this.#owedOuts.size);
     for (const o of [...this.#owedOuts]) {
       if (o.step !== "gone" && !o.dropOwed) continue;
@@ -914,6 +972,12 @@ export class Handover {
           this.#spent(this.#ins.get(id), "begin", t0);
           return answer;
         }
+        // (whether a hand-over of this station's to the one asking still goes on: one asked as that station starts, or
+        // hears from this one again, holding what it began to take of it)
+        if (request.method === "handover.still") {
+          const o = this.#outs.get(id);
+          return { going: o !== undefined && o.to === peer && o.step !== "failed" };
+        }
         const i = this.#ins.get(id);
         if (request.method === "handover.drop") return i === undefined ? { ok: true } : await this.#drop1(i);
         if (i === undefined || i.origin !== peer) throw new Refused(why("badRequest", { detail: "not begun: handover.begin first" }));
@@ -949,6 +1013,7 @@ export class Handover {
             case "handover.put": {
               const name = String(request.name ?? "");
               if (bytes === null || !HASH.test(name)) throw new Refused(why("badRequest", { detail: "not a file's hash" }));
+              this.#d.fail?.("put");
               await receiveFile(inFiles(this.#d.data, id), name, bytes as Bytes);
               return { ok: true };
             }
@@ -959,9 +1024,12 @@ export class Handover {
               // (shown: only what was said there after its rows went, its log's and what it has yet to be handed)
               if (i.step !== "coming" && (i.step !== "shown" || !AFTER_SHOWN.includes(table))) throw new Refused(why("shownAlready"));
               if (!CHAT_TABLES.includes(table) || !Array.isArray(request.rows) || request.rows.length > 500) throw new Refused(why("badRequest", { detail: "not a page of a chat's rows" }));
+              const page = typeof request.page === "string" ? request.page : null;
+              if (page !== null && i.page === page) return { ok: true };
               this.#d.fail?.("import");
               this.#d.store.importRows(i.ctx, table, request.rows, i.step === "coming" ? i.id : undefined);
               this.#d.fail?.("imported");
+              if (page !== null) i.page = page;
               await this.#saveIn(i);
               return { ok: true };
             }
@@ -977,6 +1045,17 @@ export class Handover {
         };
         try {
           return await answer();
+        } catch (e) {
+          // (this station's own disk failing what it is sent (full, over its quota, read-only): nothing of the chat is
+          // kept here, dropped now by this station itself, and the asker told so in numbers, never as a stream reset)
+          // (a write of the program's, placing, says its code in its words)
+          const code = (e as NodeJS.ErrnoException)?.code ?? /\b(ENOSPC|EDQUOT|EROFS)\b/.exec((e as Error)?.message ?? "")?.[1] ?? "";
+          if (!WRITE_FAILED.has(code)) throw e;
+          log.warn("handover", "a chat coming here could not be written: dropped here", { id: i.id, error: (e as Error).message });
+          void this.#drop1(i).catch((d) => log.warn("handover", "a chat coming here not dropped after its write failed", { id: i.id, error: (d as Error).message }));
+          const room = await (this.#d.room ?? roomHere(this.#d.data))().catch(() => ({ free: null }));
+          const name = this.#d.roster(i.ws)?.find((s) => s.id === this.#d.here())?.name || (this.#d.here() ?? "").slice(0, 12);
+          throw new Refused(why("fullThere", { station: name, free: typeof room.free === "number" ? gb(room.free) : "?", error: code }));
         } finally {
           if (kind !== "show") this.#spent(i, kind, t0);
         }
@@ -1027,8 +1106,8 @@ export class Handover {
     this.#keepIn(i);
     this.#holdIn(i);
     await this.#saveIn(i);
-    const [room, git] = await Promise.all([(this.#d.room ?? roomHere(this.#d.data))().catch(() => ({ free: null })), (this.#d.hasGit ?? (async () => true))().catch(() => false)]);
-    return { ok: true, free: room.free, git };
+    const [room, git] = await Promise.all([(this.#d.room ?? roomHere(this.#d.data))().catch(() => ({ free: null, total: null })), (this.#d.hasGit ?? (async () => true))().catch(() => false)]);
+    return { ok: true, free: room.free, total: room.total ?? null, git };
   }
 
   async #place(i: In, carry: string): Promise<Json> {
@@ -1134,7 +1213,7 @@ export class Handover {
     await rename(join(dir(this.#d.data), "in", i.id), gone).catch(() => {});
     void rm(gone, { recursive: true, force: true }).catch(() => {});
     for (const k of i.keys) this.#d.hub.wakeChat(k);
-    await this.#d.shown?.(i.keys);
+    await this.#d.shown?.(i.keys, i.origin);
     this.#spent(i, "show", t0);
     const ms = { ...(i.spent ?? {}) };
     log.info("handover", "a chat handed here goes on here", { id: i.id, origin: i.origin, keys: i.keys.length, ms, total: Math.round(this.#d.fibers.now() - i.at) });

@@ -9,7 +9,7 @@ import { afterEach } from "node:test";
 import { PeerBus, bytesOf, withBytes } from "../src/mesh/bus.ts";
 import { WorkspaceConnects } from "../src/connects/workspace.ts";
 import { Fibers } from "../src/ops/fibers.ts";
-import { type CarriedJob, gatherSoon, placeSoon } from "../src/replica/carry.ts";
+import { type CarriedJob, gatherSoon, placeSoon, sizesSoon } from "../src/replica/carry.ts";
 import { hubConfig } from "../src/sessions/config.ts";
 import { newSession, say } from "../src/sessions/lifecycle.ts";
 import { Moves } from "../src/move/station.ts";
@@ -57,7 +57,7 @@ export type Station = {
   placed?: () => void;
   /// Its routes of move/routes.ts, as a device asks them.
   ask(method: string, path: string, body: Json, role?: string, query?: [string, string][]): Promise<{ status: number; body: Json }>;
-  jobs: (CarriedJob & { id: string })[]; started: string[]; free: number; fails: Set<string>; onFail: ((step: string) => void) | null;
+  jobs: (CarriedJob & { id: string })[]; started: string[]; free: number; total?: number; sized: string[]; fails: Set<string>; onFail: ((step: string) => void) | null;
   /// The jobs' rows read so far, as the store reads them (live.ts `up`): a session's by its index, a workspace's whole.
   jobsRead: number;
   /// Its own connects' surfaces, by their id here; git run as the station runs it.
@@ -78,15 +78,20 @@ export function world(ids: string[] = [A, B]) {
   const roster = ids.map((id) => ({ id, name: id.slice(0, 1).toUpperCase() }));
   /// A request on its way, changed (a test's: a hash refused).
   let tamper: ((to: string, request: Json) => Json) | null = null;
+  /// After a request was taken there, whether its answer is lost on the way back (a test's: what it fails with then).
+  let lose: ((to: string, request: Json) => Error | null) | null = null;
   const make = (id: string): Station => {
     const rig = new Rig({ place: { workspace: WS, station: id }, workspaces: [WS], fileStore: true, clock: t.clock });
-    const st = { id, rig, up: true, on: true, holds: 0, jobs: [], started: [], free: 1e15, fails: new Set<string>(), onFail: null, jobsRead: 0 } as unknown as Station;
+    const st = { id, rig, up: true, on: true, holds: 0, jobs: [], started: [], free: 1e15, sized: [], fails: new Set<string>(), onFail: null, jobsRead: 0 } as unknown as Station;
     st.bus = new PeerBus({ sleep: async () => {} });
     st.bus.attach(async (to, ws, request) => {
       const there = stations.get(to);
       if (there === undefined || !there.up || !st.up) throw new Error("station unreachable");
       const sent = tamper === null ? request : tamper(to, request);
-      return across(await there.bus.handle(ws ?? WS, id, across(sent)));
+      const answer = across(await there.bus.handle(ws ?? WS, id, across(sent)));
+      const lost = lose === null ? null : lose(to, sent);
+      if (lost !== null) throw lost;
+      return answer;
     });
     const tag = id.slice(0, 1);
     rig.raw.profiles = id === A
@@ -145,7 +150,12 @@ export function world(ids: string[] = [A, B]) {
         sessionsIn: (ws, after, limit) => rig.store.sessionPageOfWs(ws === WS ? null : ws, WS, after, limit),
         reposDir: join(rig.dir, "repos"),
         clonesElsewhere: async () => st.elsewhere ?? [],
-        room: async () => ({ free: st.free }),
+        room: async () => ({ free: st.free, total: st.total ?? null }),
+        // (sized as a move would gather them, at once; each session sized here named, the other side's by its places)
+        sizes: async (keys, sizing) => {
+          st.sized.push(...keys, ...(sizing.places ?? []).map((p) => `there:${p.key}`));
+          return sizesSoon(rig.dir, join(rig.dir, "stillfail.db"), keys, sizing);
+        },
         hasGit: async () => true,
         lackMost: 50,
         work: {
@@ -223,7 +233,7 @@ export function world(ids: string[] = [A, B]) {
       await s.rig.quiet();
     }
   };
-  return { t, stations, get: (id: string) => stations.get(id)!, quiet, tamper: (f: typeof tamper) => void (tamper = f) };
+  return { t, stations, get: (id: string) => stations.get(id)!, quiet, tamper: (f: typeof tamper) => void (tamper = f), lose: (f: typeof lose) => void (lose = f) };
 }
 
 /// The running turn of a station's session ended with a state, as its agent would.

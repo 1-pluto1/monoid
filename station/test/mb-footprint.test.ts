@@ -56,6 +56,28 @@ function workspace(): string {
   write(join(root, "kt/build.gradle.kts"), 100);
   write(join(root, "kt/build/classes/A.class"), 7_000);
   write(join(root, "site/build/index.html"), 2_500);
+  // Known by what is near or in them (the room a checkout: its .git below): Elixir's build and dependencies, MoonBit's
+  // build beside its manifest and below one within the checkout, its packages; Xcode's derived data and a Cargo target
+  // of any name by what is in them; and what only looks it.
+  write(join(root, "ex/mix.exs"), 100);
+  write(join(root, "ex/_build/dev/lib/a.beam"), 3_000);
+  write(join(root, "ex/deps/jason/mix.exs"), 800);
+  write(join(root, "mb/moon.mod.json"), 100);
+  write(join(root, "mb/src/moon.pkg.json"), 100);
+  write(join(root, "mb/_build/native/debug/a.o"), 5_000);
+  write(join(root, "mb/src/lib/_build/x.o"), 1_200);
+  write(join(root, "mb/.mooncakes/core/x.mbt"), 2_200);
+  write(join(root, "notmb/_build/out"), 1_100);
+  write(join(root, "notex/deps/x"), 900);
+  write(join(root, "ios-dd/Build/Products/Debug/App"), 8_000);
+  write(join(root, "ios-dd/Build/Intermediates.noindex/x.o"), 3_300);
+  write(join(root, "notios/Build/Products/App"), 700);
+  write(join(root, "rs-out/debug/deps/libx.rlib"), 9_500);
+  writeFileSync(join(root, "rs-out/CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\r\n# This file is a cache directory tag created by cargo.\n# For information about cache directory tags see https://bford.info/cachedir/\n");
+  write(join(root, "rs-info/.rustc_info.json"), 300);
+  writeFileSync(join(root, "rs-info/CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.");
+  write(join(root, "notrs-tag/debug/deps/x"), 600);
+  writeFileSync(join(root, "notrs-tag/CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n# made by something else\n");
   // Never found in a repository's metadata or the attachments, but counted.
   write(join(root, ".git/objects/pack/p"), 40_000);
   write(join(root, ".git/node_modules/meta"), 1_000);
@@ -79,7 +101,8 @@ test("a room's size and what is made again in it are the walk's, each kind of it
   const { program, reference } = await roomOfBoth(root);
   assert.deepEqual(program, reference);
   assert.deepEqual(program.rebuild.map(([p]) => p.slice(root.length + 1)).sort(),
-    ["android/.gradle", "app/node_modules", "kt/build", "py/__pycache__", "rs/target", "web/.next", "web/.turbo"]);
+    ["android/.gradle", "app/node_modules", "ex/_build", "ex/deps", "ios-dd", "kt/build", "mb/.mooncakes", "mb/_build", "mb/src/lib/_build", "py/__pycache__",
+      "rs-info", "rs-out", "rs/target", "web/.next", "web/.turbo"]);
   assert.equal(await measured(root), await measuredReference(root));
   assert.deepEqual(await measuredUpTo(root, Number.MAX_SAFE_INTEGER), await measuredUpToReference(root, Number.MAX_SAFE_INTEGER));
   // (the file of three names counted once: a measure of where it is alone is as much)
@@ -90,7 +113,7 @@ test("a room's size and what is made again in it are the walk's, each kind of it
 
 test("cut short at every count of entries as the walk is, what is made again included", { skip }, async () => {
   const root = workspace();
-  for (let most = 0; most <= 70; most++) {
+  for (let most = 0; most <= 120; most++) {
     const { program, reference } = await roomOfBoth(root, { maxEntries: most });
     assert.deepEqual(program, reference, `maxEntries ${most}`);
     const [p, r] = [await measuredUpTo(root, Number.MAX_SAFE_INTEGER, undefined, { maxEntries: most }), await measuredUpToReference(root, Number.MAX_SAFE_INTEGER, undefined, { maxEntries: most })];

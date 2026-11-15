@@ -15,6 +15,7 @@ import { Cloud } from "../src/cloud/state.ts";
 import { PeerBus, bytesOf, withBytes } from "../src/mesh/bus.ts";
 import type { ConfigFile } from "../src/ops/config.ts";
 import { Fibers } from "../src/ops/fibers.ts";
+import { sizesSoon } from "../src/replica/carry.ts";
 import { hubConfig } from "../src/sessions/config.ts";
 import { newSession, say } from "../src/sessions/lifecycle.ts";
 import { Moves } from "../src/move/station.ts";
@@ -157,6 +158,8 @@ function world(profiles: Json[], o: { third?: boolean; slack?: boolean; cUp?: bo
           move: (pid, to, made) => st.sharing.moveProfile(pid, to, undefined, made), unshare: (share, stations) => st.sharing.unshareMoved(share, stations),
           lend: (pid, to) => st.sharing.lendTo(pid, to), unlend: (share, to, made, widened) => st.sharing.unlend(share, to, made, widened),
         },
+        // (sized at once, as a move would gather them: no thread of its own in a test)
+        sizes: async (keys, sizing) => sizesSoon(rig.dir, join(rig.dir, "stillfail.db"), keys, sizing),
         sessionsIn: (ws, after, limit) => rig.store.sessionPageOfWs(ws === WS ? null : ws, WS, after, limit),
         reposDir: join(rig.dir, "repos"),
         room: async () => ({ free: 1e15 }),
@@ -347,6 +350,102 @@ test("an own Claude login of three chats, one chat moved with its needs: the log
   assert.equal(present(a, "max").share, undefined, "not shared any more");
   assert.equal(b.rig.raw.profiles.some((p: Json) => p.share?.id === share), false, "B keeps no copy");
   assert.deepEqual(lentShares(a), {}, "nothing kept lent");
+});
+
+test("a login lent stays lent while anything on the other station runs on it: a chat moved by a later turn is kept as one it is lent for, a chat begun there on it keeps it; taken back once nothing there runs on it", async () => {
+  const { a, b, quiet } = world([MAX]);
+  signIn(a, "max", CLAUDE_LOGIN);
+  const one = await chatOn(a, "max");
+  const two = await chatOn(a, "max");
+  const out = await a.moves.scheduler.move(WS, B, { module: "chats", item: one.key, withNeeds: true });
+  await quiet();
+  assert.equal(out.failed, null, JSON.stringify(out));
+  const share = present(a, "max").share.id as string;
+  // A later turn: the second chat alone, the login usable there as it is lent: kept as lent for it too.
+  const later = await a.moves.scheduler.move(WS, B, { module: "chats", item: two.key });
+  await quiet();
+  assert.equal(later.failed, null, JSON.stringify(later));
+  assert.deepEqual(sorted(lentShares(a)[share]?.for), sorted([`chats ${one.key}`, `chats ${two.key}`]), "lent for both");
+  // A chat B begins on the login it borrows (as a connect moved there begins one).
+  const [mine, mineThread] = newSession(b.rig.hub, { runtime: "claude", profile: ofShare(b, share).id, createdBy: "p@x" });
+  // The first back: lent still, for the second.
+  await a.moves.scheduler.back(WS, B, { module: "chats", item: one.key });
+  await quiet();
+  assert.equal(ofShare(b, share)?.share.borrowed, true, "B borrows it still: the second chat runs on it there");
+  await takesTurn(b, two.key, b.rig.store.homeChat(two.key)!.id, "still there?", "a turn there on the lent login");
+  // The second back: lent for nothing of A's, but B's own chat runs on it: kept lent.
+  await a.moves.scheduler.back(WS, B, { module: "chats", item: two.key });
+  await quiet();
+  assert.equal(ofShare(b, share)?.share.borrowed, true, "B borrows it still: its own chat runs on it");
+  assert.deepEqual(lentShares(a)[share]?.for, [], "kept lent, for nothing of A's");
+  say(b.rig.hub, mineThread.id, "p@x", "hello on the lent login");
+  await quiet();
+  assert.ok(b.rig.claude.sessions.some((x) => x.prompts.some((p) => p.includes("hello on the lent login"))), "B's chat takes its turn on it");
+  // B's chat archived: at the next turn's end, whatever it moved (here nothing: an item not there), nothing there runs
+  // on it, and it is taken back.
+  b.rig.store.setArchived(mine, true, "p@x");
+  await a.moves.scheduler.move(WS, B, { module: "chats", item: "chat:c-none" }).catch(() => {});
+  await quiet();
+  assert.equal(b.rig.raw.profiles.some((p: Json) => p.share?.id === share), false, "B keeps no copy");
+  assert.equal(present(a, "max").share, undefined, "not shared any more");
+  assert.deepEqual(lentShares(a), {}, "nothing kept lent");
+});
+
+test("a lent login is taken back as its last use on the station it is lent to ends by that station's doing: its chat handed to the lender by its own turn, archived there, or moved to another login there; one told while the lender is down is told as it is heard from", async () => {
+  for (const how of ["handed home", "archived", "another login", "lender down"] as const) {
+    const { a, b, quiet } = world([MAX]);
+    signIn(a, "max", CLAUDE_LOGIN);
+    const one = await chatOn(a, "max");
+    assert.equal((await a.moves.scheduler.move(WS, B, { module: "chats", item: one.key, withNeeds: true })).failed, null);
+    await quiet();
+    const share = present(a, "max").share.id as string;
+    // (a chat B begins on the login it borrows; the one it was lent for back: lent still, for B's)
+    const [mine] = newSession(b.rig.hub, { runtime: "claude", profile: ofShare(b, share).id, createdBy: "p@x" });
+    await quiet();
+    await a.moves.scheduler.back(WS, B, { module: "chats", item: one.key });
+    await quiet();
+    assert.equal(ofShare(b, share)?.share.borrowed, true, `${how}: lent still, for B's own chat`);
+    // Its last use there ends, by B's doing alone.
+    if (how === "handed home") assert.equal((await b.moves.scheduler.move(WS, A, { module: "chats", item: mine })).failed, null);
+    else if (how === "another login") b.rig.store.setSessionProfile(mine, "bx", false);
+    else {
+      if (how === "lender down") a.dead = true;
+      b.rig.store.setArchived(mine, true, "p@x");
+    }
+    await quiet();
+    if (how === "lender down") {
+      assert.equal(ofShare(b, share)?.share.borrowed, true, "not told yet: the lender down");
+      a.dead = false;
+      // (A heard from again: it asks B something, as a plan does)
+      await a.moves.scheduler.plan(WS, B);
+      await quiet();
+    }
+    assert.equal(b.rig.raw.profiles.some((p: Json) => p.share?.id === share), false, `${how}: B keeps no copy`);
+    assert.equal(present(a, "max").share, undefined, `${how}: not shared any more`);
+    assert.deepEqual(lentShares(a), {}, `${how}: nothing kept lent`);
+  }
+});
+
+test("what a station kept lent before it kept later turns' chats is mended as it starts: the chats handed to where it is lent that run on it", async () => {
+  const { a, quiet } = world([MAX]);
+  signIn(a, "max", CLAUDE_LOGIN);
+  const one = await chatOn(a, "max");
+  const two = await chatOn(a, "max");
+  await a.moves.scheduler.move(WS, B, { module: "chats", item: one.key, withNeeds: true });
+  await quiet();
+  await a.moves.scheduler.move(WS, B, { module: "chats", item: two.key });
+  await quiet();
+  const share = present(a, "max").share.id as string;
+  // (as the code before kept it: the second chat's line missing)
+  const log = join(a.rig.dir, "move", "accounts-lent.log");
+  writeFileSync(log, readFileSync(log, "utf8").split("\n").filter((l) => !l.includes(two.key)).join("\n"));
+  assert.deepEqual(lentShares(a)[share]?.for, [`chats ${one.key}`]);
+  await a.moves.close();
+  a.moves = a.make();
+  await a.moves.start();
+  // (what the start mends, written: as a turn's end waits for it)
+  await a.moves.modules.find((m) => m.id === "accounts")!.left!([]);
+  assert.deepEqual(sorted(lentShares(a)[share]?.for), sorted([`chats ${one.key}`, `chats ${two.key}`]), "mended");
 });
 
 test("moved back: the login is this station's own again, not shared, the other keeps no profile of it, nothing kept; started again between, the same", async () => {

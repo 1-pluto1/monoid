@@ -418,6 +418,99 @@ fn Files::rebuildable(self : Files, dir : String) -> Bool {
 }
 
 ///|
+/// footprint.ts `rebuiltByName`, the gathering's own decision from the listing it read anyway: `name` a directory's,
+/// `beside` the names of the directory it is in. 0: not made again; 1: by its name (and a file beside it); 2: known by
+/// what is beside it (Elixir's, MoonBit's).
+fn rebuilt_by_name(name : String, beside : Set[String]) -> Int {
+  match name {
+    "node_modules" | ".next" | ".turbo" | "__pycache__" => 1
+    "target" => if beside.contains("Cargo.toml") { 1 } else { 0 }
+    ".gradle" =>
+      if beside.contains("settings.gradle") ||
+        beside.contains("settings.gradle.kts") ||
+        beside.contains("build.gradle") ||
+        beside.contains("build.gradle.kts") {
+        1
+      } else {
+        0
+      }
+    "build" => if beside.contains("build.gradle") || beside.contains("build.gradle.kts") { 1 } else { 0 }
+    "_build" =>
+      if beside.contains("mix.exs") ||
+        beside.contains("moon.mod.json") ||
+        beside.contains("moon.work") ||
+        beside.contains("moon.pkg.json") {
+        2
+      } else {
+        0
+      }
+    "deps" => if beside.contains("mix.exs") { 2 } else { 0 }
+    ".mooncakes" => if beside.contains("moon.mod.json") || beside.contains("moon.work") { 2 } else { 0 }
+    _ => 0
+  }
+}
+
+///|
+/// footprint.ts `ANY_NAME_DEPTH`: how deep under a room's top (its own entries 1) what is made again of any name is
+/// asked.
+let any_name_depth = 3
+
+///|
+/// What Cargo writes in its target directory's CACHEDIR.TAG (footprint.ts `CARGO_TAG`).
+let cargo_tag : Array[String] = [
+  "Signature: 8a477f597d28d172789f06886806bc55", "# This file is a cache directory tag created by cargo.",
+]
+
+///|
+/// footprint.ts `rebuiltOfAnyName`: whether `dir`, whose listing is `names`, is Xcode's derived data or a Cargo target:
+/// looked at on the disk only where its listing shows the sign (a `Build`, a `CACHEDIR.TAG`).
+fn Files::rebuilt_of_any_name(self : Files, dir : String, names : Array[(String, String)]) -> Bool raise {
+  let has = (n : String) => names.iter().any(e => e.0 == n)
+  if has("Build") &&
+    self.kind(self.join([dir, "Build", "Products"])) == Some("dir") &&
+    self.kind(self.join([dir, "Build", "Intermediates.noindex"])) == Some("dir") {
+    return true
+  }
+  if !has("CACHEDIR.TAG") {
+    return false
+  }
+  guard (try self.read(self.join([dir, "CACHEDIR.TAG"])) catch { _ => None }) is Some(tag) else { return false }
+  // (footprint.ts: split at `\r?\n`, a `\r` that ends the text kept)
+  let pieces : Array[String] = tag.split("\n").map(l => l.to_string()).collect()
+  let lines = pieces.mapi((k, t) => if k < pieces.length() - 1 && t.has_suffix("\r") {
+    t.view(end_offset=t.length() - 1).to_string()
+  } else {
+    t
+  })
+  if !cargo_tag.iter().all(l => lines.contains(l)) {
+    return false
+  }
+  if has(".rustc_info.json") {
+    return true
+  }
+  for profile in ["debug", "release"] {
+    if has(profile) {
+      for own in ["deps", ".fingerprint"] {
+        if self.kind(self.join([dir, profile, own])) == Some("dir") {
+          return true
+        }
+      }
+    }
+  }
+  false
+}
+
+///|
+/// The names of a listing, as a set (what `rebuilt_by_name` is asked beside).
+fn names_of(entries : Array[(String, String)]) -> Set[String] {
+  let out : Set[String] = Set([])
+  for e in entries {
+    out.add(e.0)
+  }
+  out
+}
+
+///|
 /// footprint.ts `roomOf`: where a session's own directory is (sessions/<connect>/<session>), none where its workspace
 /// is not in the station's layout.
 fn Files::room_of(self : Files, data : String, workspace : String) -> String? {
@@ -553,6 +646,33 @@ priv struct Gathering {
   mut under : Under
   unreadable : Array[String]
   mut unreadable_count : Int
+  /// A sizing's (carry-reference.ts `sizes`): each file's size counted, nothing hashed or listed; the most entries a
+  /// session's walk takes, and how many it took.
+  mut tally : Tally?
+  most : Int?
+  mut walked : Int
+}
+
+///|
+/// A session's files counted, for a sizing.
+priv struct Tally {
+  mut files : Int
+  mut bytes : Double
+}
+
+///|
+/// A sizing's walk past its bound.
+priv suberror Cut
+
+///|
+/// One entry more of a sizing's walk; past its bound, the walk of that session ends there (said at least).
+fn Gathering::step(self : Gathering) -> Unit raise {
+  if self.most is Some(most) {
+    self.walked += 1
+    if self.walked > most {
+      raise Cut
+    }
+  }
 }
 
 ///|
@@ -579,12 +699,23 @@ fn Gathering::allowed(self : Gathering, path : String) -> Bool {
 
 ///|
 fn Gathering::add(self : Gathering, path : String) -> Unit raise {
-  guard self.list is Some(list) else { return }
+  if self.list is None && self.tally is None {
+    return
+  }
   if self.seen.contains(path) || !self.allowed(path) {
     return
   }
   self.seen.add(path)
+  self.step()
   guard self.files.lstat(path) is Some((kind, size, mode, mtime)) else { return }
+  if self.tally is Some(t) {
+    if kind == "file" {
+      t.files += 1
+      t.bytes += size
+    }
+    return
+  }
+  guard self.list is Some(list) else { return }
   if kind == "link" {
     list.add(jobj([("path", str(path)), ("link", str(self.files.read_link(path)))]), None)
     return
@@ -615,6 +746,7 @@ fn Gathering::add(self : Gathering, path : String) -> Unit raise {
 ///|
 /// Every file under `dir` as it is (a checkout's own repository).
 fn Gathering::whole(self : Gathering, dir : String) -> Unit raise {
+  self.step()
   guard self.files.listing(dir) is Some(entries) else {
     if self.denied(dir, true) {
       self.cannot_read(dir)
@@ -632,22 +764,29 @@ fn Gathering::whole(self : Gathering, dir : String) -> Unit raise {
 }
 
 ///|
-/// Every file under `dir`, but what a build makes again; a git checkout in it as `checkout` takes it.
-fn Gathering::tree(self : Gathering, dir : String) -> Unit raise {
+/// Every file under `dir`, but what a build makes again; a git checkout in it as `checkout` takes it. `depth`: under
+/// the room's top (its own entries 1): what is made again of any name is asked only down to `any_name_depth`, by its
+/// own listing, and by name from the listing of where it is.
+fn Gathering::tree(self : Gathering, dir : String, depth : Int) -> Unit raise {
+  self.step()
   guard self.files.listing(dir) is Some(entries) else {
     if self.denied(dir, true) {
       self.cannot_read(dir)
     }
     return
   }
-  if entries.iter().any(e => e.0 == ".git") && self.checkout(dir) {
+  if entries.iter().any(e => e.0 == ".git") && self.checkout(dir, depth) {
     return
   }
+  if depth <= any_name_depth && self.files.rebuilt_of_any_name(dir, entries) {
+    return
+  }
+  let here = names_of(entries)
   for e in entries {
     let path = self.files.join([dir, e.0])
     if e.1 == "dir" {
-      if e.0 == ".git" || !self.files.rebuildable(path) {
-        self.tree(path)
+      if e.0 == ".git" || rebuilt_by_name(e.0, here) == 0 {
+        self.tree(path, depth + 1)
       }
     } else {
       self.add(path)
@@ -678,7 +817,7 @@ fn Gathering::git(self : Gathering, dir : String, args : Array[String], timeout?
 
 ///|
 /// A git checkout at `dir`, taken (carry-reference.ts `checkout`); false where git does not read it.
-fn Gathering::checkout(self : Gathering, dir : String) -> Bool raise {
+fn Gathering::checkout(self : Gathering, dir : String, depth : Int) -> Bool raise {
   let dotgit = self.files.join([dir, ".git"])
   guard self.files.lstat(dotgit) is Some((kind, _, _, _)) else { return false }
   guard self.git(dir, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]) is Some(listed) else {
@@ -721,9 +860,10 @@ fn Gathering::checkout(self : Gathering, dir : String) -> Bool raise {
     for f in entries {
       let path = self.files.join([dir, f])
       guard self.files.lstat(path) is Some((k, _, _, _)) else { continue }
+      // (a repository in it git lists: nothing of any name asked in a checkout)
       if k == "dir" {
         if !self.files.rebuildable(path) {
-          self.tree(path)
+          self.tree(path, if depth + 1 > any_name_depth { depth + 1 } else { any_name_depth + 1 })
         }
       } else {
         self.add(path)
@@ -759,6 +899,10 @@ fn Gathering::checkout(self : Gathering, dir : String) -> Bool raise {
 /// A linked worktree at `dir`, as it is made again elsewhere (carry-reference.ts `linked`); none without a remote or a
 /// commit.
 fn Gathering::linked(self : Gathering, dir : String) -> JValue? raise {
+  // (a sizing fetches and bundles nothing: its `.git` file is counted, what git makes again there is not)
+  if self.tally is Some(_) {
+    return None
+  }
   let remote = self.git(dir, ["remote", "get-url", "origin"])
   let head = self.git(dir, ["rev-parse", "--verify", "-q", "HEAD"])
   guard remote is Some(r) && r != "" && head is Some(h) && h != "" else { return None }
@@ -858,6 +1002,9 @@ pub fn carry_gather(
     under: Data,
     unreadable: [],
     unreadable_count: 0,
+    tally: None,
+    most: None,
+    walked: 0,
   }
   files.mkdir(files.join([scratch, "lists"]))
   let sessions : Array[JValue] = []
@@ -909,21 +1056,7 @@ pub fn carry_gather(
     let room = files.room_for(data, real_data, workspace)
     match room {
       None => skipped.push(str(key))
-      Some(dir) =>
-        for e in files.listing(dir).unwrap_or([]) {
-          // (its lock, and what is being written as it is looked at, stay)
-          if e.0 == "archive.lock" || e.0.has_suffix(".writing") {
-            continue
-          }
-          let path = files.join([dir, e.0])
-          if e.1 == "dir" {
-            if !files.rebuildable(path) {
-              g.tree(path)
-            }
-          } else {
-            g.add(path)
-          }
-        }
+      Some(dir) => g.room_walk(dir)
     }
     g.list = None
     let hash = list.close(files)
@@ -993,7 +1126,165 @@ pub fn carry_gather(
     answer.push(("unreadable", Arr(g.unreadable.map(str))))
     answer.push(("unreadableCount", jnum(g.unreadable_count.to_double())))
   }
+  if looking.val is Some(seen) {
+    answer.push(("looked", Arr(seen.map(e => Arr([str(e.0), str(e.1)])))))
+  }
   jobj(answer)
+}
+
+///|
+/// carry-reference.ts `sizes`: sessions `keys` sized as a move would gather them (the same walk, each file's size added,
+/// nothing hashed, listed or written; at most `most` entries a session, past which it is said at least); with `places`
+/// (the other station's side: a session's room and transcripts as they would be here), what this station has there.
+pub fn carry_sizes(
+  host : @host.Host,
+  sep : String,
+  data : String,
+  db_path : String,
+  keys : Array[String],
+  most : Int,
+  places : Array[(String, String?, Array[String])]?,
+) -> JValue raise {
+  let files : Files = { host, sep }
+  let g : Gathering = {
+    files,
+    data,
+    scratch: "",
+    gits: [],
+    bundles: Map([]),
+    fetched: Set([]),
+    bytes: 0.0,
+    before: Map([]),
+    seen: Set([]),
+    list: None,
+    under: Data,
+    unreadable: [],
+    unreadable_count: 0,
+    tally: None,
+    most: Some(most),
+    walked: 0,
+  }
+  let out : Array[JValue] = []
+  let sized = (key : String, room : String?, tplaces : Array[String], t : Tally, complete : Bool) => jobj([
+    ("key", str(key)),
+    ("room", jopt(room)),
+    ("transcripts", Arr(tplaces.map(str))),
+    ("bytes", jnum(t.bytes)),
+    ("files", jnum(t.files.to_double())),
+    ("complete", Bool(complete)),
+  ])
+  // The other station's side: what it has where each session's things would go.
+  if places is Some(ps) {
+    for p in ps {
+      let (key, room, transcripts) = p
+      g.seen = Set([])
+      g.walked = 0
+      let t : Tally = { files: 0, bytes: 0.0 }
+      g.tally = Some(t)
+      let mut complete = true
+      try {
+        for i, at in transcripts {
+          if i >= 64 {
+            break
+          }
+          match files.lstat(at) {
+            Some(("dir", _, _, _)) => g.whole(at)
+            Some(_) => g.add(at)
+            None => ()
+          }
+        }
+        if room is Some(r) {
+          g.room_walk(r)
+        }
+      } catch {
+        Cut => complete = false
+        e => raise e
+      }
+      g.tally = None
+      out.push(sized(key, room, transcripts, t, complete))
+    }
+    return Arr(out)
+  }
+  let db = @sql.Db::attach(host, db_path, wait=30000)
+  defer db.close()
+  let real_data = files.real(data).unwrap_or(data)
+  let finder = @locate.Finder::new(host, sep)
+  let rows = db.all(sessions_in(false, true), [Json::string(@jsjson.stringify(Arr(keys.map(str))))])
+  for s in rows {
+    let key = field_str(s, "key").unwrap_or("")
+    let workspace = field_str(s, "workspace").unwrap_or("")
+    let runtime = field_str(s, "runtime").unwrap_or("")
+    g.seen = Set([])
+    g.walked = 0
+    let t : Tally = { files: 0, bytes: 0.0 }
+    g.tally = Some(t)
+    let tplaces : Array[String] = []
+    let mut complete = true
+    try {
+      let ids : Array[@locate.Source] = []
+      for r in db.all("SELECT id, profile, runtime FROM runtime_sessions WHERE session_key = ? ORDER BY at", [Json::string(key)]) {
+        ids.push({ id: field_str(r, "id").unwrap_or(""), profile: field_str(r, "profile"), runtime: field_str(r, "runtime").unwrap_or(runtime) })
+      }
+      if field_str(s, "runtime_session_id") is Some(rsid) && !ids.iter().any(r => r.id == rsid) {
+        ids.push({ id: rsid, profile: field_str(s, "profile"), runtime })
+      }
+      let places = session_places(field_str(s, "cwd"), workspace)
+      let looked : Array[String] = []
+      for p in places.map(p => files.real_of(p)) + places {
+        if !looked.contains(p) {
+          looked.push(p)
+        }
+      }
+      let (found, _) = finder.sources(data, [], ids.filter(r => @locate.runtime_kind(r.runtime)), looked, anywhere=true)
+      for f in found {
+        let (path, kind) = f
+        let at = if files.exists(path) { path } else { path + ".zst" }
+        g.add(at)
+        if tplaces.length() < 64 {
+          tplaces.push(at)
+        }
+        if kind == "claude" {
+          let name = path.view(start_offset=(path.rev_find(sep).unwrap_or(-1) + 1)).to_string()
+          let id = if name.has_suffix(".jsonl") { name.view(end_offset=name.length() - 6).to_string() } else { name }
+          let sub = files.join([files.dir_of(path), id])
+          g.whole(sub)
+          if tplaces.length() < 64 {
+            tplaces.push(sub)
+          }
+        }
+      }
+      if files.room_for(data, real_data, workspace) is Some(dir) {
+        g.room_walk(dir)
+      }
+    } catch {
+      Cut => complete = false
+      e => raise e
+    }
+    g.tally = None
+    out.push(sized(key, files.room_for(data, real_data, workspace), tplaces, t, complete))
+  }
+  Arr(out)
+}
+
+///|
+/// A session's room, whole (an archived one's workspace packed in it).
+fn Gathering::room_walk(self : Gathering, dir : String) -> Unit raise {
+  let entries = self.files.listing(dir).unwrap_or([])
+  let here = names_of(entries)
+  for e in entries {
+    // (its lock, and what is being written as it is looked at, stay)
+    if e.0 == "archive.lock" || e.0.has_suffix(".writing") {
+      continue
+    }
+    let path = self.files.join([dir, e.0])
+    if e.1 == "dir" {
+      if rebuilt_by_name(e.0, here) == 0 {
+        self.tree(path, 1)
+      }
+    } else {
+      self.add(path)
+    }
+  }
 }
 
 ///|
@@ -1004,10 +1295,12 @@ fn home_files(files : Files, agent : String, own : Array[String], each : (String
   file(files.join([agent, "presets.json"]))
   let skills = files.join([agent, "skills"])
   fn walk(dir : String) -> Unit raise {
-    for e in files.listing(dir).unwrap_or([]) {
+    let entries = files.listing(dir).unwrap_or([])
+    let here = names_of(entries)
+    for e in entries {
       let path = files.join([dir, e.0])
       if e.1 == "dir" {
-        if !files.rebuildable(path) {
+        if rebuilt_by_name(e.0, here) == 0 {
           walk(path)
         }
       } else if e.1 == "file" {

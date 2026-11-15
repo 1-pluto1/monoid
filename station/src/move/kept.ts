@@ -22,6 +22,13 @@ export class KeptSet {
     return this.#ids.has(id);
   }
 
+  values(): string[] {
+    return [...this.#ids];
+  }
+  get size(): number {
+    return this.#ids.size;
+  }
+
   async add(id: string): Promise<void> {
     if (this.#ids.has(id)) return;
     this.#ids.add(id);
@@ -152,6 +159,26 @@ export class KeptLog<T> {
   async delete(key: string): Promise<void> {
     if (!this.#map.delete(key)) return;
     await this.#append({ k: key });
+  }
+
+  /// Several changes in one write: each `[key, value]` set, each `[key, undefined]` let go (one not kept: nothing).
+  async many(changes: [string, T | undefined][]): Promise<void> {
+    const lines: unknown[] = [];
+    for (const [k, v] of changes) {
+      if (v !== undefined) (this.#map.set(k, v), lines.push({ k, v }));
+      else if (this.#map.delete(k)) lines.push({ k });
+    }
+    if (lines.length > 0) await this.#appendAll(lines);
+  }
+
+  #appendAll(lines: unknown[]): Promise<void> {
+    const text = lines.map((l) => `${JSON.stringify(l)}\n`).join("");
+    const done = this.#ready.catch(() => {}).then(async () => {
+      await mkdir(dirname(this.#path), { recursive: true });
+      await appendFile(this.#path, text);
+    });
+    this.#ready = done.catch(() => {});
+    return done;
   }
 
   /// One line more, after those asked before it (in the order the changes were made).

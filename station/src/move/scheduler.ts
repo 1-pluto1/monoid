@@ -49,6 +49,9 @@ export type SchedulerDeps = {
   /// Why a turn with that station of `ws` cannot begin (move/station.ts `refusal`: switched off here or there); null:
   /// it can. Asked before anything is held.
   refusal?: (ws: string, station: string) => Promise<string | null>;
+  /// Why moving all of a plan's chats to that station does not fit on its disk (move/station.ts `roomForAll`); null: it
+  /// fits, or cannot be known. Asked of a whole move once its plan is read, before anything is held.
+  roomForAll?: (ws: string, station: string, plan: Plan) => Promise<string | null>;
   /// What keeps the station from updating itself while a turn goes on (updates/holds.ts `hold`): its let-go.
   hold?: () => () => void;
   /// What a turn under way as the station stopped says as its outcome, in the viewer's words.
@@ -300,9 +303,15 @@ export class Scheduler {
     for (const p of planned) {
       // (one there already stops nothing by a move: what it stopped as it went is stopped, said by its own row)
       if (p.state === "there" || this.#modules.get(p.module)!.usableHere?.(p) === true) continue;
-      p.wouldStop = index.needing(p).filter((x) => x.state !== "there").map((x) => ({ module: x.module, id: x.id }));
+      p.wouldStop = index.needing(p).filter((x) => x.state !== "there" && this.#stoppable(x)).map((x) => ({ module: x.module, id: x.id }));
     }
     return { ws, to, modules: [...this.#modules.values()].map((m) => ({ id: m.id, needs: m.needs })), items: planned };
+  }
+
+  /// Whether an item that needs what moves away is stopped by it: only one whose module stops its items (a routed
+  /// connect has no `stop`: what it serves goes on where it runs, its threads routed). The plan says what the turn does.
+  #stoppable(x: Need): boolean {
+    return this.#modules.get(x.module)?.stop !== undefined;
   }
 
   #stateOf(item: Item): ItemState {
@@ -334,7 +343,12 @@ export class Scheduler {
       this.#d.turn?.(true, station);
       await mkdir(dirname(turnFile(this.#d.data)), { recursive: true });
       await writeFile(turnFile(this.#d.data), JSON.stringify({ ws, how, station, by }));
-      return await f();
+      try {
+        return await f();
+      } finally {
+        // (what was kept lent only for what the other station runs on it, looked at again, whatever the turn did)
+        for (const m of this.#modules.values()) await m.left?.([]).catch((e) => log.warn("move", "what is lent not looked at again", { error: (e as Error).message }));
+      }
     }).then(
       async (out) => {
         await this.#keepLast(ws, { at: this.#d.now?.() ?? 0, by, how, station, ...(this.#stopping !== null ? { stoppedBy: this.#stopping.by } : {}), ...out });
@@ -376,6 +390,10 @@ export class Scheduler {
   async #move(ws: string, to: string, sel: Selection): Promise<Outcome> {
     const out: Outcome = { done: [], refused: [], stopped: [], resumed: [], failed: null };
     const plan = await this.plan(ws, to);
+    if (sel.all === true) {
+      const why = await this.#d.roomForAll?.(ws, to, plan);
+      if (why) throw new Said(why);
+    }
     this.#hold(ws, to, plan);
     const all = plan.items;
     const index = new Items(all);
@@ -417,7 +435,7 @@ export class Scheduler {
     };
     const wouldStopOthers = (x: Planned) => {
       if (this.#modules.get(x.module)!.usableHere?.(x) === true) return [];
-      return index.needing(x).filter((y) => y.state !== "there" && !chosenNames.has(named(y)) && this.#modules.get(y.module)!.stop !== undefined);
+      return index.needing(x).filter((y) => y.state !== "there" && !chosenNames.has(named(y)) && this.#stoppable(y));
     };
     const take = (p: Planned) => {
       const k = named(p);
@@ -474,7 +492,7 @@ export class Scheduler {
     const thereNow = new Set(all.filter((x) => x.state === "there").map(named));
     // (an item whose move stops others here goes as late as it can, what it stops right after it: the owner's, an
     // account that cannot be shared followed at once by its chats)
-    const stopsOthers = (p: Planned) => this.#modules.get(p.module)!.usableHere?.(p) !== true && index.needing(p).some((x) => !thereNow.has(named(x)) && this.#modules.get(x.module)!.stop !== undefined);
+    const stopsOthers = (p: Planned) => this.#modules.get(p.module)!.usableHere?.(p) !== true && index.needing(p).some((x) => !thereNow.has(named(x)) && this.#stoppable(x));
     const going = sel.all === true || sel.withNeeds === true ? lateOrder([...wanted.values()], find, stopsOthers) : order([...wanted.values()], find);
     // (what moved here leaves the stopped set at once and is saved so as the turn ends: a start drops one that moved)
     let unsaved = false;
@@ -498,6 +516,15 @@ export class Scheduler {
       if (lending.has(named(p))) {
         hostAfter.push(p);
         continue;
+      }
+      // (what it needs that a turn before lent there, kept as lent for it too before it goes: never taken back while it
+      // is there)
+      for (const n of p.needs) {
+        const x = find(n);
+        if (x === undefined || lending.has(named(n)) || thereNow.has(named(n))) continue;
+        const m = this.#modules.get(x.module)!;
+        if (m.lentFor === undefined || m.state(x).lentTo !== to) continue;
+        await m.lentFor(x, to, [{ module: p.module, id: p.id }]).catch((e) => log.warn("move", "an item not kept as one a lent login is lent for", { item: named(p), lent: named(x), error: (e as Error).message }));
       }
       // (what it needs that is lent for it, lent now, before it goes)
       for (const n of p.needs) {
@@ -526,7 +553,7 @@ export class Scheduler {
       const m = this.#modules.get(p.module)!;
       // What here needs it and cannot have it here once it went is stopped first (its account moving away would move
       // it onto another), and goes on where the move fails.
-      const stops: Planned[] = m.usableHere?.(p) === true ? [] : index.needing(p).filter((x) => !thereNow.has(named(x)) && !this.#stopped.has(x) && this.#modules.get(x.module)!.stop !== undefined);
+      const stops: Planned[] = m.usableHere?.(p) === true ? [] : index.needing(p).filter((x) => !thereNow.has(named(x)) && !this.#stopped.has(x) && this.#stoppable(x));
       // (kept stopped before it is held: no read sees it held and not said stopped)
       this.#current = p;
       for (const x of stops) {

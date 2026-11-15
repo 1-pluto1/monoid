@@ -14,13 +14,43 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { MbProcess, mbReaderBinary } from "../src/read/mb-reader.ts";
 import { claudeProject } from "../src/read/transcript.ts";
-import { type CarryIndex, type Gathered, gatherSoon, inProgram, placeSoon, previewSoon } from "../src/replica/carry.ts";
+import { type CarryIndex, type Gathered, gatherSoon, inProgram, placeSoon, previewSoon, sizesSoon } from "../src/replica/carry.ts";
 import { Store } from "../src/store/store.ts";
-import { gather, linesOf, place, preview } from "./carry-reference.ts";
-import { HOME, OTHER, chat, dataDir, station } from "./replica-fakes.ts";
+import { gather, linesOf, place, preview, sizes } from "./carry-reference.ts";
+import { HOME, OTHER, chat, dataDir as madeDir, station as madeStation } from "./replica-fakes.ts";
 
 const binary = mbReaderBinary();
 const skip = binary === null ? "the MoonBit program (stillfail-reader) is not built here" : false;
+
+// What ends this file's process, said as it ends (scripts/check.sh shows each `as it ended:` line of a failing slice):
+// CI's Linux slice failed this file whole at 299b40fd64 and b6631c119d, every line of its own out of the tail, nothing
+// said why. An error no test took, by where it came from (a monitor: what Node and its runner do with it is unchanged),
+// and a process ending other than 0 with what still held it.
+const endSaid = (what: string) => process.stderr.write(`test/mb-replica-carry.test.ts: as it ended: ${what}\n`);
+const told = (error: unknown) => (error instanceof Error ? (error.stack ?? error.message) : String(error)).split("\n").slice(0, 12).join(" | ");
+process.on("uncaughtExceptionMonitor", (error, origin) => endSaid(`${origin}: ${told(error)}`));
+// (the runner takes a rejection itself, so one more listener changes nothing of what it does with it)
+process.on("unhandledRejection", (reason) => endSaid(`unhandledRejection: ${told(reason)}`));
+process.on("exit", (code) => {
+  if (code === 0 && !process.exitCode) return;
+  const held = (process as unknown as { _getActiveHandles(): { constructor?: { name?: string }; pid?: number; spawnargs?: string[] }[] })._getActiveHandles()
+    .map((h) => (h.constructor?.name === "ChildProcess" ? `ChildProcess ${h.pid} ${(h.spawnargs ?? []).join(" ").slice(0, 120)}` : (h.constructor?.name ?? "?")));
+  endSaid(`exit ${code} (exitCode ${process.exitCode ?? "unset"}), program ${binary ?? "none"}, held: ${held.join(", ") || "nothing"}`);
+});
+// What this file makes on the disk, each directory, so that its last test holds that nothing of it is left its station
+// could not remove (CI's Linux slice, 0ece7318d1: setup-env.mjs's exit hook failed removing the run's directory, a
+// directory of no permission left in it).
+const mine: string[] = [];
+const dataDir = (name?: string) => {
+  const dir = madeDir(name);
+  mine.push(dir);
+  return dir;
+};
+const station = (...args: Parameters<typeof madeStation>) => {
+  const made = madeStation(...args);
+  mine.push(made.data);
+  return made;
+};
 // (a bundle made twice of the same commits is the same bytes only when git packs it on one thread)
 Object.assign(process.env, { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "pack.threads", GIT_CONFIG_VALUE_0: "1" });
 const gitEnv = () => ({ ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x", GIT_CONFIG_NOSYSTEM: "1", HOME: dataDir("gh") });
@@ -51,6 +81,27 @@ function world() {
   }
   mkdirSync(join(aws, "lone", "target"), { recursive: true });
   writeFileSync(join(aws, "lone", "target", "kept.txt"), "no Cargo.toml beside it: kept");
+  // (by what is in them or beside them: Elixir's and MoonBit's, Xcode's derived data and a Cargo target of any name near
+  // the room's top, the same deep (gone), and what only looks like them (kept))
+  const put = (path: string, text = "made again") => (mkdirSync(join(path, ".."), { recursive: true }), writeFileSync(path, text));
+  put(join(aws, "ex", "mix.exs"), "x");
+  put(join(aws, "ex", "_build", "dev", "x.beam"));
+  put(join(aws, "ex", "deps", "jason", "lib.ex"));
+  put(join(aws, "mb", "moon.mod.json"), "{}");
+  put(join(aws, "mb", "_build", "main.wasm"));
+  put(join(aws, "mb", ".mooncakes", "x.mbt"));
+  put(join(aws, "bare", "_build", "kept-too.txt"), "a bare name: kept");
+  put(join(aws, "bare", "deps", "kept.txt"), "a bare name: kept");
+  for (const at of ["ios-dd", "a/b/c/d/dd"]) {
+    put(join(aws, at, "Build", "Products", "app"));
+    put(join(aws, at, "Build", "Intermediates.noindex", "o"));
+  }
+  put(join(aws, "only-products", "Build", "Products", "kept.app"), "products alone: kept");
+  put(join(aws, "rs-out", "CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n");
+  put(join(aws, "rs-out", ".rustc_info.json"), "{}");
+  put(join(aws, "rs-out", "debug", "app"));
+  put(join(aws, "other-cache", "CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n# another program's\n");
+  put(join(aws, "other-cache", ".rustc_info.json"), "{}");
   // what it cannot read
   mkdirSync(join(aws, "closed"));
   writeFileSync(join(aws, "closed", "in.txt"), "behind a closed door");
@@ -247,7 +298,8 @@ test("the program gathers what the worker thread gathered: the same lists, index
   for (const want of ["\u{1F600}.txt", "run-1/subagents/agent-x.jsonl", "run-b.jsonl.zst", "rollout-2026-11-15T00-00-00-cdx-1.jsonl", "session.v2.jsonl", "lone/target/kept.txt", "repo/.git/HEAD", "repo/inner/i.txt", "wt/y.txt", "workspace.tar.zst", "pic-link", "dangling"]) {
     assert.ok(listed.some((p) => p.endsWith(want)), want);
   }
-  for (const not of ["made.bin", "ignored.log", "node_modules", "archive.lock", ".writing", "mine.txt", "session.v1.jsonl"]) assert.ok(!listed.some((p) => p.includes(not)), not);
+  for (const not of ["made.bin", "ignored.log", "node_modules", "archive.lock", ".writing", "mine.txt", "session.v1.jsonl", "ex/_build", "ex/deps", "mb/_build", "mb/.mooncakes", "ios-dd/", "rs-out/"]) assert.ok(!listed.some((p) => p.includes(not)), not);
+  for (const kept of ["bare/_build/kept-too.txt", "bare/deps/kept.txt", "a/b/c/d/dd/Build/Products/app", "only-products/Build/Products/kept.app", "other-cache/.rustc_info.json"]) assert.ok(listed.some((p) => p.endsWith(kept)), kept);
   assert.ok(!listed.includes(join(wt, ".git")), "a linked worktree's .git is made again there, not carried");
   // JavaScript's order, not the bytes': 😀 (U+D83D…) before Ａ (U+FF21)
   assert.ok(listed.indexOf(join(aws, "\u{1F600}.txt")) < listed.indexOf(join(aws, "Ａ.txt")));
@@ -262,6 +314,23 @@ test("the program gathers what the worker thread gathered: the same lists, index
   assert.ok(again.mb.files === first.mb.files);
   chmodSync(join(aws, "closed"), 0o755);
   chmodSync(join(aws, "secret.txt"), 0o644);
+});
+
+test("the program sizes what the worker thread's walk would gather (move/sizes.ts): each session's bytes, files, places and whether all of it was walked, bounded or not; the other side's by places", { skip }, async () => {
+  const { data, db } = world();
+  const keys = ["chat:a", "chat:out", "chat:none"];
+  for (const most of [500_000, 7]) {
+    const ref = sizes(data, db, keys, { most });
+    const mb = await sizesSoon(data, db, keys, { most });
+    assert.deepEqual(mb, ref, `the same sizes at most ${most} entries a session`);
+    if (most === 7) assert.ok(mb.some((x) => !x.complete), "the bound reached");
+    // (the other side's: what is at the same places)
+    const places = ref.map((x) => ({ key: x.key, room: x.room, transcripts: x.transcripts }));
+    assert.deepEqual(await sizesSoon(data, "", [], { most, places }), sizes(data, "", [], { most, places }), "the same, by places");
+  }
+  // (what the world closed opened again, as the other tests do)
+  chmodSync(join(wsOf2(data, "chat:a"), "closed"), 0o755);
+  chmodSync(join(wsOf2(data, "chat:a"), "secret.txt"), 0o644);
 });
 
 test("the program gathers a chat handed over alone, another workspace's, and counts a preview as the worker thread did", { skip }, async () => {
@@ -333,7 +402,7 @@ test("the program puts in what the worker thread put: the same files, modes, tim
   await both("projects", { projects: true });
 });
 
-test("a gathering called off is answered at once, its program ended; one called off before it began starts none", { skip }, async () => {
+test("a gathering called off is answered at once, its program ended; one called off before it began starts none; one answered has ended as it is", { skip }, async () => {
   const made = station();
   made.store.close();
   // (this station's: each program says its shell's folder, in the data directory)
@@ -347,4 +416,22 @@ test("a gathering called off is answered at once, its program ended; one called 
   assert.equal(programs(), 1);
   c.abort();
   await assert.rejects(going, /called off/);
+  // (settled only once it has ended: nothing of it left running as its caller goes on, setup-env.mjs's leftover)
+  assert.equal(programs(), 0, "the program called off has ended as it is answered");
+  await gatherSoon(made.data, made.db, HOME, true, dataDir("scratch-2"));
+  assert.equal(programs(), 0, "the program that answered has ended as its answer is given");
+});
+
+test("nothing this file made is left that its station could not remove: every directory open to its owner", () => {
+  // (a directory its owner cannot write or search keeps what is in it: Linux's rm of the run's directory failed on
+  // one, the fixture's `closed` left at 0 by a test; a room placed so could not be dropped or deleted either)
+  const closed: string[] = [];
+  const walk = (dir: string) => {
+    const st = lstatSync(dir);
+    if (!st.isDirectory()) return;
+    if ((st.mode & 0o700) !== 0o700) return void closed.push(`${dir} (${(st.mode & 0o777).toString(8)})`);
+    for (const name of readdirSync(dir)) walk(join(dir, name));
+  };
+  for (const dir of mine) if (existsSync(dir)) walk(dir);
+  assert.deepEqual(closed, [], "every directory this file made open to its owner");
 });

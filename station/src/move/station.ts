@@ -4,11 +4,12 @@
 // the composition root (move/live.ts) and by the tests, given what it needs.
 import { createHash } from "node:crypto";
 import { Refused, bytesOf } from "../mesh/bus.ts";
-import { PeerGone } from "../mesh/peer.ts";
+import { PeerGone, PeerStopped } from "../mesh/peer.ts";
 import type { Fibers } from "../ops/fibers.ts";
-import type { CarriedJob } from "../replica/carry.ts";
-import { type AccountOf, Handover, type HandoverDeps } from "../replica/handover.ts";
-import { moved } from "../replica/restore.ts";
+import { type CarriedJob, SIZED_TRANSCRIPTS, type Sized, type SizedPlaces, type Sizing, sizesSoon } from "../replica/carry.ts";
+import { type AccountOf, Handover, type HandoverDeps, floorOf, roomHere } from "../replica/handover.ts";
+import { carriedTo, moved } from "../replica/restore.ts";
+import { SIZE_MOST, SIZES_BATCH, Sizes } from "./sizes.ts";
 import type { Ask } from "../replica/peers.ts";
 import type { Store } from "../store/store.ts";
 import type { SessionPage } from "../store/store.ts";
@@ -25,6 +26,7 @@ import { readFileSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { Scheduler } from "./scheduler.ts";
+import { KeptSet } from "./kept.ts";
 import { type Lang, stationLang, tr } from "../ops/i18n.ts";
 import { log } from "../ops/log.ts";
 import { hold as holdUpdates } from "../updates/holds.ts";
@@ -38,6 +40,8 @@ async function writeJsonFile(path: string, v: unknown): Promise<void> {
 }
 
 type Json = any;
+
+const gb = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GB`;
 
 export type MovesDeps = {
   data: string;
@@ -87,6 +91,8 @@ export type MovesDeps = {
   /// Whether moving is switched on here (config.json `move`, a machine's own setting, off unless set; move/AGENTS.md).
   /// None given: on (a test's).
   moveOn?: () => boolean;
+  /// Sessions sized as a move would gather them (carry.ts `sizesSoon`, the program's; a test's may count them).
+  sizes?: (keys: string[], sizing: Sizing) => Promise<Sized[]>;
   /// The chats a plan reads at a time (chats.ts `PLAN_PAGE`; a test's smaller).
   planPage?: number;
   /// The repositories found on the machine outside the repository cache (sessions/presets.ts `RepoIndex`, as it holds
@@ -119,6 +125,8 @@ export class Moves {
   readonly repos: ReposModule;
   readonly vault: VaultModule;
   readonly settings: SettingsModule;
+  /// What a move would send of each chat (sizes.ts).
+  readonly sizes: Sizes;
   readonly #d: MovesDeps;
   /// Whether a busy chat's turn is waited for as it moves (station_move `wait`, for the request under way).
   wait = true;
@@ -133,14 +141,21 @@ export class Moves {
   /// The stations a request was sent again to in this turn, after the first that met their connection gone: once a
   /// turn a station, not once a request.
   readonly #sentAgain = new Set<string>();
+  /// The stations found gone in this turn asked a drop all the same (once a turn a station).
+  readonly #dropAsked = new Set<string>();
   #inTurn = false;
 
   /// What this station's moves ask of another: in a turn, a station found gone is asked nothing more until it ends,
   /// every step toward it failing at once with the same words (drill 23's 185 s of asks of a station killed).
-  readonly #ask: Ask = async (station, request) => {
+  readonly #ask: Ask = (station, request) => this.#asked(station, request, false);
+
+  async #asked(station: string, request: Json, again: boolean): Promise<Json> {
     if (!this.#inTurn) return await this.#d.ask(station, request);
     const gone = this.#gone.get(station);
-    if (gone !== undefined) throw gone;
+    // (what undoes a hand-over there is asked all the same, once a turn a station: a station only slow to answer, not
+    // gone, takes it (drill rr34: a chat's files there left 502 MB as the turn asked nothing more); a gone one costs that
+    // one ask, the rest owed and told as it is heard from, or at their retry)
+    if (gone !== undefined && !(request?.method === "handover.drop" && !this.#dropAsked.has(station) && this.#dropAsked.add(station))) throw gone;
     try {
       const answer = await this.#d.ask(station, request);
       this.#suspect.delete(station);
@@ -149,6 +164,16 @@ export class Moves {
       if (e instanceof Refused) {
         this.#suspect.delete(station);
         throw e;
+      }
+      // (the other station's process stopped or handed over to its next as it was asked, closing its connection with no
+      // answer: the station is there. Each request is asked again once, on a connection dialed anew, whatever the turn
+      // asked before (not the once a turn a station of a connection found gone, below): every move request's handler
+      // takes a repeat as the same (by its ids, its versions, what is there already), as whether the process that
+      // stopped took it is not known; one with bytes by its caller from its start (`AskAgain`))
+      if (e instanceof PeerStopped && !again) {
+        log.info("move", "a request met the other station's process stopping or handing over: asked again once, dialed anew", { station: station.slice(0, 12), method: String(request?.method ?? "") });
+        if (bytesOf(request) !== null) throw new AskAgain(tr(stationLang(), "station.move.noAnswer", { station: this.#d.roster(this.#d.home() ?? "")?.find((r) => r.id === station)?.name || station.slice(0, 12) }));
+        return await this.#asked(station, request, true);
       }
       // (its connection found gone: a stream ended with no answer is that too, mesh/peer.ts having let the connection go,
       // so the next request dials anew. Once a turn a station the request is sent again on it: one with no bytes here,
@@ -161,7 +186,7 @@ export class Moves {
         this.#suspect.add(station);
         log.info("move", "a request met the other station's connection gone: sent again once, dialed anew", { station: station.slice(0, 12), error: (e as Error).message });
         if (bytesOf(request) !== null) throw new AskAgain(tr(stationLang(), "station.move.noAnswer", { station: name }));
-        return await this.#ask(station, request);
+        return await this.#asked(station, request, again);
       }
       if (unanswered || timedOut || this.#suspect.has(station)) {
         const gone = new Gone(tr(stationLang(), "station.move.gone", { station: name }));
@@ -171,10 +196,16 @@ export class Moves {
       }
       throw e;
     }
-  };
+  }
 
   constructor(d: MovesDeps) {
     this.#d = d;
+    this.#unusedOwed = new KeptSet(join(d.data, "move", "unused-owed.json"));
+    // (a borrowed login's last use here may end with any change of a session: looked at as one changes)
+    d.store.subscribe?.((c) => {
+      if (c.type === "session" || c.type === "sessionRemoved" || c.type === "moved") this.#usesMayEnd();
+    });
+    this.sizes = new Sizes({ data: d.data, measure: (keys) => this.#sized(keys, { most: SIZE_MOST }), gone: (key) => d.store.handedTo(key) !== null });
     let known: Record<string, AccountOf> = {};
     try {
       known = JSON.parse(readFileSync(join(d.data, "move", "accounts-known.json"), "utf8")) as Record<string, AccountOf>; // sync: read once, before the station serves
@@ -226,9 +257,11 @@ export class Moves {
       changed: () => d.changed?.(),
       arrivedStopped: (keys, need, ws) => this.scheduler.noteStopped({ module: "chats", id: keys[0]! }, need, ws),
       // (a chat here again by any route: what was lent for it alone is taken back)
-      shown: async (keys) => {
+      shown: async (keys, from) => {
         await d.connects?.arrived?.(keys);
         await this.#accounts.left?.(keys.map((id) => ({ module: "chats", id }))).catch((e) => log.warn("move", "what was lent for a chat back here not taken back", { error: (e as Error).message }));
+        // (a chat from a station a login is lent to: that login looked at, where it is lent there for nothing of ours)
+        if (from !== undefined) await this.#accounts.lookAt(from).catch((e) => log.warn("move", "a login lent not looked at as a chat came", { error: (e as Error).message }));
       },
       went: (keys) => this.scheduler.forget(keys.map((id) => ({ module: "chats", id }))),
       keptSends: d.keptSends, keepSends: d.keepSends,
@@ -254,7 +287,15 @@ export class Moves {
         return p?.share !== null && typeof p?.share === "object";
       },
       moveProfile: d.moveProfile, ask: this.#ask, here,
-      data: d.data, shareMoves: d.shareMoves,
+      data: d.data,
+      shareMoves: d.shareMoves === undefined ? undefined : {
+        ...d.shareMoves,
+        usesThere: async (to, share) => {
+          const answer = await this.#ask(to, { method: "move.uses", share });
+          return typeof answer?.uses === "number" ? answer.uses : null;
+        },
+        handedOn: (to, pid) => this.#handedOn(to, pid),
+      },
       profile: (id) => d.profiles().find((x) => x?.id === id),
       present: (id) => {
         // (one moved here is known by the id it had there: an own login by its profile's id)
@@ -266,7 +307,7 @@ export class Moves {
       this.#accounts,
       chatsModule({
         store: d.store, handover: this.handover, hub: d.hub, ask: this.#ask, here, reads: (ws) => this.reads(ws),
-        kindOf: (id) => d.connects?.kindOf(id) ?? null, wait: () => this.wait,
+        kindOf: (id) => d.connects?.kindOf(id) ?? null, wait: () => this.wait, sizes: this.sizes,
         name: (id) => d.roster(d.home() ?? "")?.find((r) => r.id === id)?.name || id.slice(0, 12),
         vaultsOf: (keys, ws) => new Map([...v.grantOwners(keys)].map(([k, owners]) => [k, owners.map((o) => `${vaultItemId(o)}@${ws}`)])),
         jobs: { keep: async (keys, why) => void (await this.jobs.keep(keys, why)), startKept: (keys) => this.jobs.startKept(keys) },
@@ -293,11 +334,14 @@ export class Moves {
       tellArrived: async (to, item) => void (await this.#ask(to, { method: "move.arrived", item })),
       now: () => d.fibers.now(),
       refusal: (ws, station) => this.refusal(ws, station),
+      roomForAll: (ws, station, plan) => this.roomForAll(ws, station, plan),
       hold: () => this.#hold(),
       restarted: () => tr(stationLang(), "station.move.restarted"),
       // (a turn's stations found gone are its own: forgotten as it begins and ends)
       turn: (on) => {
+        this.#dropAsked.clear();
         this.#inTurn = on;
+        this.sizes.quiet = on;
         this.#gone.clear();
         this.#suspect.clear();
         this.#sentAgain.clear();
@@ -308,6 +352,49 @@ export class Moves {
         return r;
       },
     });
+  }
+
+  /// The logins this station borrows (lent it for what moved here) whose last chat here ended (handed away, archived,
+  /// moved to another login, deleted) and whose lender is not told yet: `share\nhost`, kept until it answers (it may be
+  /// down: told as it is heard from), and those told since their last use ended (told once).
+  readonly #unusedOwed: KeptSet;
+  readonly #unusedTold = new Set<string>();
+  #lookingUses = false;
+
+  /// A session changed here: the borrowed logins looked at, once a turn of the loop, where there are any.
+  #usesMayEnd(): void {
+    if (this.#lookingUses) return;
+    this.#lookingUses = true;
+    setImmediate(() => {
+      this.#lookingUses = false;
+      for (const p of this.#d.profiles()) {
+        const s = p?.share;
+        if (s?.borrowed !== true || typeof s.id !== "string" || typeof s.host !== "string" || typeof p.id !== "string") continue;
+        const key = `${s.id}\n${s.host}`;
+        if (this.#d.store.liveSessionsOn(p.id, 1).length > 0) {
+          this.#unusedTold.delete(key);
+          if (this.#unusedOwed.has(key)) void this.#unusedOwed.delete(key);
+          continue;
+        }
+        if (this.#unusedTold.has(key) || this.#unusedOwed.has(key)) continue;
+        void this.#unusedOwed.add(key).then(() => this.#tellUnused(s.host));
+      }
+    });
+  }
+
+  /// What is owed to `host` of the borrowed logins' last uses told.
+  #tellUnused(host: string): void {
+    for (const key of this.#unusedOwed.values()) {
+      const [share, to] = key.split("\n");
+      if (to !== host) continue;
+      void this.#ask(host, { method: "move.unused", share }).then(
+        async () => {
+          this.#unusedTold.add(key);
+          await this.#unusedOwed.delete(key);
+        },
+        () => {},
+      );
+    }
   }
 
   /// The plan under way of each workspace's reads (`reads`), for what plans without being given them.
@@ -411,6 +498,87 @@ export class Moves {
     return this.#d.moveOn?.() ?? true;
   }
 
+  /// The chats handed from here to station `to` whose login is profile `pid` (read a page at a time, once, as a start
+  /// mends what it kept lent).
+  #handedOn(to: string, pid: string): string[] {
+    const out: string[] = [];
+    for (let after = "", page = this.#d.store.handedChats("", 500); page.length > 0; after = page.at(-1)!.session, page = this.#d.store.handedChats(after, 500)) {
+      for (const h of page) if (h.station === to && this.#d.store.getSession(h.session)?.profile === pid) out.push(h.session);
+    }
+    return out;
+  }
+
+  /// Sessions sized as a move would gather them (in the sizing's thread, unless a test's).
+  #sized(keys: string[], sizing: Sizing): Promise<Sized[]> {
+    return (this.#d.sizes ?? ((k, z) => sizesSoon(this.#d.data, join(this.#d.data, "stillfail.db"), k, z)))(keys, sizing);
+  }
+
+  /// What station `to` says of its disk (`move.open`: its free bytes and its volume's): null where it says none (one
+  /// from before) or does not answer.
+  async roomThere(ws: string, to: string): Promise<{ free: number; total: number | null } | null> {
+    const open = await this.#ask(to, { method: "move.open", workspace: ws }).catch(() => null);
+    return typeof open?.free === "number" ? { free: open.free, total: typeof open.total === "number" ? open.total : null } : null;
+  }
+
+  /// What moving all of `plan`'s chats would add to station `to`'s disk: of each chat, what it sends less what that
+  /// station has where it would go (`move.sizes`, sized there by the same walk), never under nothing. A room there
+  /// already (a copy left by a retirement, the same paths) mostly takes what arrives in its place, so its own bytes are
+  /// not added again. Null where it cannot be known (the other does not size, or does not answer): a move is then
+  /// refused by no sum, each chat checked as it goes (handover.ts).
+  async addsThere(ws: string, to: string, ids: string[]): Promise<{ adds: number; chats: number } | null> {
+    await this.sizes.settled();
+    let adds = 0;
+    let chats = 0;
+    for (let i = 0; i < ids.length; i += SIZES_BATCH) {
+      const places = ids.slice(i, i + SIZES_BATCH).flatMap((id) => this.sizes.placesOf(id));
+      if (places.length === 0) continue;
+      let answer: Json;
+      try {
+        answer = await this.#ask(to, { method: "move.sizes", workspace: ws, places, fromData: this.#d.data });
+      } catch (e) {
+        log.warn("move", "what the other station has of the chats' rooms not known: no whole move refused by their sum", { station: to.slice(0, 12), error: (e as Error).message });
+        return null;
+      }
+      const there = new Map<string, number>((Array.isArray(answer?.sized) ? answer.sized : []).filter((x: Json) => typeof x?.key === "string" && typeof x?.bytes === "number").map((x: Json) => [x.key, x.bytes]));
+      for (const p of places) {
+        const here = this.sizes.line(p.key)?.bytes ?? 0;
+        // (one it did not size is taken as there: the sum never says more than is added)
+        adds += Math.max(0, here - (there.get(p.key) ?? here));
+        chats++;
+      }
+    }
+    return { adds, chats };
+  }
+
+  /// Why moving all of `plan` to `to` does not fit there (null: it fits, or it cannot be known): what it adds there and
+  /// a twentieth more, leaving less than `floorOf` that disk free. Asked before anything is held.
+  async roomForAll(ws: string, to: string, plan: { items: { module: string; id: string; state: string; cannot?: string }[] }): Promise<string | null> {
+    const ids = plan.items.filter((x) => x.module === "chats" && x.state !== "there" && x.cannot === undefined).map((x) => x.id);
+    if (ids.length === 0) return null;
+    const there = await this.roomThere(ws, to);
+    if (there === null) return null;
+    const sum = await this.addsThere(ws, to, ids);
+    if (sum === null) return null;
+    const need = sum.adds + Math.ceil(sum.adds / 20);
+    const floor = floorOf(there.total);
+    const left = there.free - need;
+    log.info("move", "a whole move's room there", { station: to.slice(0, 12), chats: sum.chats, adds: sum.adds, free: there.free, floor });
+    if (left >= floor) return null;
+    const name = this.#d.roster(ws)?.find((r) => r.id === to)?.name || to.slice(0, 12);
+    return tr(stationLang(), "station.move.why.allNoRoom", { station: name, free: gb(there.free), adds: gb(need), floor: gb(floor), short: gb(floor - left), n: String(ids.length) });
+  }
+
+  /// What a move to `to` would send of chats `ids` here and what is free there, as far as it is known (the tool's
+  /// summary).
+  async room(ws: string, to: string, ids: string[]): Promise<Json> {
+    const sum = this.sizes.sum(ids);
+    const there = to === "" ? null : await this.roomThere(ws, to);
+    return {
+      sends: `${sum.atLeast ? "at least " : ""}${gb(sum.bytes)}`, sendsBytes: sum.bytes, known: sum.known, of: sum.of, measuring: sum.measuring,
+      ...(there !== null ? { freeThere: gb(there.free), floorThere: gb(floorOf(there.total)) } : {}),
+    };
+  }
+
   /// Why a move or a move back with `station` of `ws` cannot begin now (null: it can): the switch here, then there (a
   /// station that answers `move.open` with a refusal is from before moving, and is taken as off); one that does not
   /// answer at all is said to be out of reach, which is what is known of it. Nothing is held either way.
@@ -419,7 +587,8 @@ export class Moves {
     const name = () => this.#d.roster(ws)?.find((r) => r.id === station)?.name || station.slice(0, 12);
     let open: Json;
     // (a connection found gone fails its request, the next is dialed anew: asked once more before it is said to be out
-    // of reach, as the stations' other asks are; a station just started again answers then)
+    // of reach, as the stations' other asks are; a station just started again answers then, and so does the next process
+    // of one whose process stopped or handed over as it was asked, `PeerStopped`)
     const ask = () => this.#d.ask(station, { method: "move.open", workspace: ws });
     try {
       open = await ask().catch((e) => (e instanceof PeerGone ? ask() : Promise.reject(e)));
@@ -447,6 +616,8 @@ export class Moves {
   /// A station heard from: what is stopped here for what may have come from it meanwhile (a tell of its coming lost) is
   /// looked at (scheduler `settleStopped`), a burst of requests heard as one: while one look goes on, one more after it.
   heard(peer: string): void {
+    // (what this station owes it of a borrowed login's last use told now; nothing owed: a size check)
+    if (this.#unusedOwed.size > 0) this.#tellUnused(peer);
     // (only what waits for what is at that station: each need it waits for looked at once)
     if (!this.scheduler.hasStopped(peer)) return;
     this.#heardFrom.add(peer);
@@ -486,7 +657,32 @@ export class Moves {
       if (method.startsWith("move.vault.")) return this.vault.answer(request);
       switch (request?.method) {
         case "move.open":
-          return { on: this.on() };
+          return { on: this.on(), ...(await (this.#d.room ?? roomHere(this.#d.data))().catch(() => ({}))) };
+        case "move.unused": {
+          // (the station a login is lent to says its last chat on it ended: taken back where nothing here is lent for)
+          if (typeof request.share !== "string") throw new Refused("move.unused: which share");
+          await this.#accounts.lookAt(peer, { share: request.share, uses: 0 });
+          return { ok: true };
+        }
+        case "move.uses": {
+          // (how many chats here run on a login another station lends this one: kept lent while any do)
+          const share = typeof request.share === "string" ? request.share : "";
+          const pids = this.#d.profiles().filter((p) => p?.share?.id === share && typeof p.id === "string").map((p) => p.id as string);
+          return { uses: pids.reduce((n, pid) => n + this.#d.store.liveSessionsOn(pid, 1).length, 0) };
+        }
+        case "move.sizes": {
+          // (what this station has where another's chats would go, sized as a move would gather them: a batch at most)
+          const from = typeof request.fromData === "string" ? request.fromData : "";
+          const asked = (Array.isArray(request.places) ? request.places : []) as SizedPlaces[];
+          if (from === "" || asked.length > SIZES_BATCH) throw new Refused("move.sizes: at most a batch of places, and where they are there");
+          const places = asked.filter((p) => typeof p?.key === "string").map((p) => {
+            const room = typeof p.room === "string" ? moved(p.room, from, this.#d.data) : null;
+            const transcripts = (Array.isArray(p.transcripts) ? p.transcripts : []).slice(0, SIZED_TRANSCRIPTS).filter((t): t is string => typeof t === "string").map((t) => carriedTo(t, from, this.#d.data, room));
+            return { key: p.key, room, transcripts };
+          });
+          const sized = await this.#sized([], { most: SIZE_MOST, places });
+          return { sized: sized.map((x) => ({ key: x.key, bytes: x.bytes, complete: x.complete })) };
+        }
         case "move.accounts": {
           // (`hosts`: whether the login is this station's, its own or a share it hosts; else it borrows it)
           const out: Record<string, string | null> = {};

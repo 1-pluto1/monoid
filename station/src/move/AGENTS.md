@@ -19,7 +19,8 @@ chats paused 18 minutes, a half-moved state, no way back), whose start stays swi
   "needs" is "usable on this station" (an account moved away that this station borrows stops nothing, `usableHere`). A
   stopped chat is held as one being handed over is: no turn, its jobs stopped and kept, what is said to it kept in its
   logs and delivered once where it ends up; nothing posted, its agent not woken. It goes on as what it waits for comes
-  back, or as it moves itself. The plan says what a move would stop (`wouldStop`).
+  back, or as it moves itself. The plan says what a move would stop (`wouldStop`), by the turn's own predicate
+  (scheduler `#stoppable`: only an item whose module has `stop`; a routed connect goes on, its threads routed).
 - An item may go, either way, to where something it needs is not usable: it arrives there stopped, waiting for that,
   and goes on as it arrives (the owner's rule both ways, 2026-11-14). The stopped set is each station's own: the one an
   item arrives at keeps it (a hand-over's `stoppedFor`, scheduler `noteStopped`), and is told as what it waits for
@@ -31,9 +32,15 @@ chats paused 18 minutes, a half-moved state, no way back), whose start stays swi
   lent, not moved (the owner, 2026-11-15: its host never leaves, so nothing of it is stranded on a station that dies or
   leaves the workspace): shared with the station it goes to (with the two alone where it was not shared; that one added
   where it is shared with others), told to it directly and answered once its copy is there (share/index.ts `lendTo`,
-  `share.borrow`), before what needs it goes; kept as lent for those items (`accounts-lent.log`) and taken back by this
-  station alone when the last of them is here again (a move back, a failure, an arrival by any route), the other told
-  then or once it is heard from; the plan and the page say it is here and usable there (`lentTo`), a turn what it lent
+  `share.borrow`), before what needs it goes; kept as lent for those items (`accounts-lent.log`), and for every item a
+  later turn takes there that needs it (scheduler `lentFor`), and taken back by this station alone when the last of them
+  is here again (a move back, a failure, an arrival by any route) and the other says nothing there runs on it
+  (`move.uses`: a chat it began on it too, as a connect moved there begins them; the drill, 2026-11-15, took it back
+  from under five), asked again at each turn's end while it does or does not answer (one lent in the turn under way for
+  what did not go is taken back unanswered); the other told then or once it is heard from. The station it is lent to tells it, once and kept until told, as its last chat on it
+  ends there (handed away, archived, moved to another login, deleted: `move.unused`), and a chat arriving from there
+  has it looked at again (`lookAt`); either takes it back where nothing of this station's it was lent for is there.
+  A start mends what a station from before kept: the chats handed to where it is lent that run on it are added; the plan and the page say it is here and usable there (`lentTo`), a turn what it lent
   (`lent`). Asked for by name, or in a whole move, its host moves (share/index.ts `moveProfile`), after what needs it:
   one not shared, shared as it moves with the two stations alone, that share undone as it comes home by any route
   unless a person opened it to another station meanwhile (`accounts-shared.json`). One that cannot be shared
@@ -49,7 +56,11 @@ chats paused 18 minutes, a half-moved state, no way back), whose start stays swi
   there; a Comma or single-session connect's chats need it instead, so it goes first, stopping them here, and each goes
   on there as it moves: the connect arrives knowing which of its chats are still to come (`connect.take`'s
   `awaiting`) and keeps what its platform says, in order, until they are all there, never a new session for one on its
-  way, connects/workspace.ts `arrived`), `repos` (a canonical clone a chat's linked worktree hangs on, by its remote: cloned there, what
+  way, connects/workspace.ts `arrived`; from the moment the other is asked to take it, what this station's socket still
+  gives waits for the answer and goes to the holder, handled only there (`handing`: the two sockets overlap a few ms,
+  and Slack gives an event to any one of an app's sockets); its move is kept on disk until either side's answer is
+  heard (`connects-moving` in the data directory's `replica`), so a station stopped between, or one that heard no answer, asks the other whether
+  it holds it as it starts and as it is heard from (`settleMoving`, `connect.holds`): one of them holds it, never both), `repos` (a canonical clone a chat's linked worktree hangs on, by its remote: cloned there, what
   no remote has fetched from a bundle; back, removed there only where this move made it; the chat's move only adds
   its worktree, `rebuildGits` `clone: false`), `vault` (an owner's plain items and the vaults they own, rows sent as
   they are; back, the other lets go of what this move put there) and `settings` (config.json's settings that are a person's choice,
@@ -69,13 +80,20 @@ chats paused 18 minutes, a half-moved state, no way back), whose start stays swi
   answered from the turn's own plan (scheduler `held`: each module's items in order, each one's place, counts kept as
   items end), only the page's rows asked where they stand now: a read during a turn reads no page of the station's chats
   and asks nothing of the other (station/AGENTS.md: a read answers by an index and a limit); station_move plan and status
-  take the same plan, every item asked where it stands. At rest, and from the read the turn's end prompts, planned anew.
+  take the same plan, every item asked where it stands, and answer a summary of it, a module's items a page at a time or
+  one item (tools/move.ts `summaryOf`, `pageOf`): never every item, as an answer is one line of mesh/peer.ts
+  `MAX_MESSAGE` and a station has thousands of chats. At rest, and from the read the turn's end prompts, planned anew.
 - A plan never guesses what the other station has: a question of it not answered (`move.accounts`,
   `move.chats.live`, `move.repo.have`, `move.setting.values`) makes what it asks of unable to go this turn, said so
   (ask again), logged with what it failed with; with no station named it asks nothing. What needs an item that cannot go
   is refused in that item's own words, nothing of it tried. In a turn, a station found gone (its connection gone and
   dialed anew in vain, or no answer in time) is asked nothing more till the turn ends: every later step fails at once,
-  in the station's words. What a move says to people is the catalog's (`station.move.*`), naming things as people
+  in the station's words. A request whose connection the other station's own process closed as it stopped or handed
+  over to its next (mesh/peer.ts `PeerStopped`, by the close's reason `STOPPING`) is no sign of that: each such request
+  is asked again once on a connection dialed anew, whatever the turn asked before (drill 7h: an ask in a hand-over's
+  window was told the station could not be reached). Whether the process that stopped took it is not known, so every
+  move request's handler takes a repeat as the same (by its ids, versions, what is there already; a page of rows by its
+  `page`); chat-handover-moves.test.ts meets every request of a turn so, half taken with their answers lost. What a move says to people is the catalog's (`station.move.*`), naming things as people
   call them, never by id.
 - People move with `POST /move` and `POST /move/back` (owners and admins; 202, the scheduler's
   turn going on; one turn at a time, an agent's and a person's alike: a second while one runs is 409). No card there:
@@ -90,6 +108,18 @@ chats paused 18 minutes, a half-moved state, no way back), whose start stays swi
   here, not posted again (`keptSends`, `keepSends`).
 - A chat's files go twice (`station/src/replica/handover.ts`): first while it works, then held only for what changed
   since, the station it goes to keeping what the first placed (`placed.txt`), so its pause does not grow with its room.
+  It goes only where what it adds there leaves the floor free (handover.ts `floorOf`: the larger of 20 GiB and a tenth
+  of that disk): what that station lacks of it (sending.ts `adds`, asked before anything is sent, and only where its whole size might not fit), never its whole
+  size, as a room left there before (a retirement's, the same paths) takes what arrives in its place (the real run,
+  2026-11-15: 110 chats moved to Office-Host-2 and its free bytes did not fall). Refused in numbers before it is held.
+- What a move would send of each chat is known before it starts (`sizes.ts`): sized by the gathering's own walk in its
+  the MoonBit program (carry.ts `sizesSoon`, carry.mbt `carry_sizes`: the same walk, so the same files, bounded a session, said at least past it), kept a line a session
+  (`sizes.log`) against the session as it was (chats.ts `stampOf`: its last activity, archived or not, its last job and
+  where that stands); a plan read at rest starts one pass over those whose stamp changed and looks at no other room
+  (none while a turn runs here: what it reads then waits for a plan at rest; a chat that left needs no size). A whole
+  move waits for that pass, asks the other what it has where each chat would go (`move.sizes`, sized there the same
+  way) and its disk (`move.open`), and is refused before anything is held where what it adds would leave less than the
+  floor (`roomForAll`); one that answers neither is refused by no sum, each chat checked as it goes.
 - A turn holds the station's self-update from its first item to its end, and the station taking a request or a chat
   holds it while it does (`station/src/updates/holds.ts`). A turn cut by a stop is kept as `last` saying so (`turn.json`); as
   the station starts, and as a station is heard from again, what waits for an item that is here goes on

@@ -2,32 +2,16 @@
 // (src/sessions/footprint.ts, station/mb src/footprint): kept as the reference test/mb-footprint.test.ts holds the
 // program to, on the walk it used (src/ops/walk.ts `walkBounded`, `stat`). `now` is the tests' clock for its budget.
 import type { BigIntStats } from "node:fs";
-import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { wall } from "../src/ops/fibers.ts";
 import { fileName } from "../src/ops/paths.ts";
 import { walkBounded } from "../src/ops/walk.ts";
+import { rebuildableKind } from "../src/sessions/footprint.ts";
 
-/// footprint.ts `rebuildable`, synchronous (what the main thread's walk and test/carry-reference.ts asked).
+/// footprint.ts's rule, synchronous (`rebuildableKind`: by name and beside, by what is in or near it): what the
+/// program's measure (footprint.mbt `rebuildable`) is held to.
 export function rebuildable(dir: string): boolean {
-  const name = fileName(dir);
-  if (name === null) return false;
-  const beside = (file: string) => existsSync(join(dirname(dir), file));
-  switch (name) {
-    case "node_modules":
-    case ".next":
-    case ".turbo":
-    case "__pycache__":
-      return true;
-    case "target":
-      return beside("Cargo.toml");
-    case ".gradle":
-      return beside("settings.gradle") || beside("settings.gradle.kts") || beside("build.gradle") || beside("build.gradle.kts");
-    case "build":
-      return beside("build.gradle") || beside("build.gradle.kts");
-    default:
-      return false;
-  }
+  return rebuildableKind(dir) !== null;
 }
 
 /// Counts files once each however many links they have.

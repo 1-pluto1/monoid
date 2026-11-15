@@ -19,6 +19,28 @@ extern "C" fn list_ffi(path : Bytes, err : FixedArray[Int]) -> Bytes = "sff_list
 extern "C" fn exists_ffi(path : Bytes) -> Int = "sff_exists"
 
 ///|
+#borrow(path)
+extern "C" fn dir_ffi(path : Bytes) -> Int = "sff_dir"
+
+///|
+#borrow(path, err)
+extern "C" fn head_ffi(path : Bytes, most : Int, err : FixedArray[Int]) -> Bytes = "sff_head"
+
+///|
+/// How far up a MoonBit manifest is looked for above a `_build` (footprint.ts MANIFEST_UP).
+let manifest_up = 8
+
+///|
+/// The first bytes of a file looked at (footprint.ts HEAD_BYTES).
+let head_bytes = 512
+
+///|
+/// What Cargo writes in its target directory's CACHEDIR.TAG (footprint.ts CARGO_TAG).
+let cargo_tag : Array[String] = [
+  "Signature: 8a477f597d28d172789f06886806bc55", "# This file is a cache directory tag created by cargo.",
+]
+
+///|
 /// How deep a walk goes below its root (ops/walk.ts WALK_MAX_DEPTH).
 let max_depth = 32
 
@@ -141,20 +163,135 @@ fn Measure::join(self : Measure, base : String, name : String) -> String {
 }
 
 ///|
-/// footprint.ts `rebuildable`: a directory a build or an install makes again, by its name and what is beside it.
-fn Measure::rebuildable(self : Measure, parent : String, name : String) -> Bool {
-  let beside = (file : String) => exists_ffi(c_path(self.join(parent, file))) != 0
-  match name {
-    "node_modules" | ".next" | ".turbo" | "__pycache__" => true
-    "target" => beside("Cargo.toml")
-    ".gradle" =>
-      beside("settings.gradle") ||
-      beside("settings.gradle.kts") ||
-      beside("build.gradle") ||
-      beside("build.gradle.kts")
-    "build" => beside("build.gradle") || beside("build.gradle.kts")
-    _ => false
+/// Node's dirname of `p` (its last name taken off), as footprint.ts climbs: `p` itself at a root or with no separator.
+fn Measure::up(self : Measure, p : String) -> String {
+  let is_sep = (c : Char) => c.to_string() == self.sep ||
+    (self.sep == "\\" && c == '/')
+  let chars = p.to_array()
+  let mut end = chars.length()
+  while end > 1 && is_sep(chars[end - 1]) {
+    end -= 1
   }
+  let mut i = end - 1
+  while i >= 0 && !is_sep(chars[i]) {
+    i -= 1
+  }
+  if i < 0 {
+    return if self.sep == "\\" && end >= 2 && chars[1] == ':' { p } else { "." }
+  }
+  let mut cut = i
+  while cut > 0 && is_sep(chars[cut - 1]) {
+    cut -= 1
+  }
+  let head = String::from_array(chars[0:cut].to_owned())
+  if head == "" {
+    self.sep
+  } else if self.sep == "\\" && head.length() == 2 && head.has_suffix(":") {
+    head + self.sep
+  } else {
+    head
+  }
+}
+
+///|
+/// footprint.ts `moonAbove`: a MoonBit manifest in `from` or above it within its checkout (to the directory with
+/// `.git`, at most `manifest_up` up); outside a checkout only in `from` itself.
+fn Measure::moon_above(self : Measure, from : String) -> Bool {
+  let there = (at : String, file : String) => exists_ffi(c_path(self.join(at, file))) != 0
+  let mut found = false
+  let mut p = from
+  for i = 0; i < manifest_up; i = i + 1 {
+    for m in ["moon.mod.json", "moon.work", "moon.pkg.json"] {
+      if !there(p, m) {
+        continue
+      }
+      if p == from {
+        return true
+      }
+      found = true
+    }
+    if there(p, ".git") {
+      return found
+    }
+    let next = self.up(p)
+    if next == p {
+      break
+    }
+    p = next
+  }
+  false
+}
+
+///|
+/// Whether the text of a CACHEDIR.TAG has Cargo's lines (footprint.ts: split at `\r?\n`, each line whole).
+fn cargo_said(text : String) -> Bool {
+  let pieces : Array[String] = text.split("\n").map(l => l.to_string()).collect()
+  let lines = pieces.mapi((k, t) => if k < pieces.length() - 1 && t.has_suffix("\r") {
+    t.view(end_offset=t.length() - 1).to_string()
+  } else {
+    t
+  })
+  cargo_tag.iter().all(l => lines.contains(l))
+}
+
+///|
+/// footprint.ts `rebuildableKind` (its `decide`, look for look): a directory a build or an install makes again, by its
+/// name and what is beside it, by what is near it (Elixir's, MoonBit's), or of any name by what is in it (Xcode's
+/// derived data, a Cargo target). `parent` is where it is (its entries joined onto it), `path` it.
+fn Measure::rebuildable(
+  self : Measure,
+  parent : String,
+  name : String,
+  path : String,
+) -> Bool {
+  let beside = (file : String) => exists_ffi(c_path(self.join(parent, file))) != 0
+  let dir = (at : String) => dir_ffi(c_path(at)) != 0
+  match name {
+    "node_modules" | ".next" | ".turbo" | "__pycache__" => return true
+    "target" => if beside("Cargo.toml") { return true }
+    ".gradle" =>
+      if beside("settings.gradle") ||
+        beside("settings.gradle.kts") ||
+        beside("build.gradle") ||
+        beside("build.gradle.kts") {
+        return true
+      }
+    "build" =>
+      if beside("build.gradle") || beside("build.gradle.kts") {
+        return true
+      }
+    "_build" =>
+      if beside("mix.exs") || self.moon_above(parent) {
+        return true
+      }
+    "deps" => if beside("mix.exs") { return true }
+    ".mooncakes" =>
+      if beside("moon.mod.json") || beside("moon.work") {
+        return true
+      }
+    _ => ()
+  }
+  let build = self.join(path, "Build")
+  if dir(self.join(build, "Products")) &&
+    dir(self.join(build, "Intermediates.noindex")) {
+    return true
+  }
+  let err = FixedArray::make(1, 0)
+  let head = head_ffi(c_path(self.join(path, "CACHEDIR.TAG")), head_bytes, err)
+  if err[0] != 0 || !cargo_said(@utf8.decode_lossy(head[:])) {
+    return false
+  }
+  if exists_ffi(c_path(self.join(path, ".rustc_info.json"))) != 0 {
+    return true
+  }
+  for profile in ["debug", "release"] {
+    for own in ["deps", ".fingerprint"] {
+      if dir(self.join(self.join(path, profile), own)) {
+        return true
+      }
+    }
+  }
+  false
 }
 
 ///|
@@ -181,7 +318,7 @@ fn Measure::visit(
       self.walk(path, path, false)
       return if self.cut is Some(_) { Stop } else { Skip }
     }
-    if self.rebuildable(parent, name) {
+    if self.rebuildable(parent, name, path) {
       let before = self.bytes
       self.walk(path, path, false)
       if self.found is Some(found) {

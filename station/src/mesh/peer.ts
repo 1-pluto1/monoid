@@ -100,7 +100,12 @@ const within = wall.within;
 class Incoming implements AsyncIterableIterator<Buffer> {
   /// All of it came.
   ended = false;
+  /// Held by the station answering a request whose bytes these are: a handler that stops reading them (it failed as
+  /// they came: its disk full) stops the stream only once its answer is through (`letGo`), so that the asker is told
+  /// why, not that the stream was reset.
+  held = false;
   #over = false;
+  #stopLater = false;
   readonly #reader: Reader;
   constructor(reader: Reader) {
     this.#reader = reader;
@@ -132,9 +137,19 @@ class Incoming implements AsyncIterableIterator<Buffer> {
   async return(): Promise<IteratorResult<Buffer>> {
     if (!this.#over) {
       this.#over = true;
-      await this.#reader.stream.reset(STOPPED).catch(() => {});
+      if (this.held) this.#stopLater = true;
+      else await this.#reader.stream.reset(STOPPED).catch(() => {});
     }
     return { done: true, value: undefined };
+  }
+  /// The answer through (or not to be sent): what was not read of it stopped now.
+  async letGo(): Promise<void> {
+    this.held = false;
+    if (this.#stopLater || (!this.#over && !this.ended)) {
+      this.#stopLater = false;
+      this.#over = true;
+      await this.#reader.stream.reset(STOPPED).catch(() => {});
+    }
   }
 }
 
@@ -192,14 +207,35 @@ const CHECK_MS = 2_000;
 /// What a request fails with when its connection was found gone (its other end did not answer on it): it got no
 /// answer, and the station that was asked may not have had it. Not a live peer that was slow (that is the timeout's).
 export class PeerGone extends Error {
+  constructor(message = "the other station's connection was gone: the request got no answer from it (asked again, it is dialed anew)") {
+    super(message);
+  }
+}
+
+/// What a station's connections are closed with as its process stops or hands over to the next (mesh.ts `closing`; the
+/// front's, mb/src/front/mesh.mbt `part`, says the same words).
+export const STOPPING = "station stopping";
+
+/// A PeerGone the other station said: its process stopped or handed over to the next as the request waited, closing its
+/// connection (`STOPPING`) with no answer. The station is there (the next process answers on a connection dialed anew),
+/// but whether the one that stopped took the request is not known: it may have run it and lost its answer (a
+/// hand-over's "peer answer not sent: write EPIPE", drill 7h). So only a request whose handler takes a repeat as the same
+/// is asked again (move/station.ts `#ask`, `refusal`).
+export class PeerStopped extends PeerGone {
   constructor() {
-    super("the other station's connection was gone: the request got no answer from it (asked again, it is dialed anew)");
+    super("the other station's process stopped or handed over as it was asked: its connection closed and the request got no answer (asked again, it is dialed anew)");
   }
 }
 
 /// What the station transport's caller is given: its requests, and `arrived` for each connection another station
 /// opens to this one (what this one keeps to it is asked whether it is still there: a station started again dials anew).
 export type StationCall = PeerCall & { arrived(conn: Connection): void };
+
+/// Whether `conn` was closed by its other end's process stopping (`STOPPING`), as its close says.
+const closedStopping = (conn: Connection): boolean => {
+  const why = conn.closeReason?.() ?? null;
+  return why !== null && why.kind === "application" && why.reason === STOPPING;
+};
 
 /// Anything received on `conn` (packets, else bytes); null where its addon says nothing.
 const received = (conn: Connection): number | null => {
@@ -285,6 +321,15 @@ export function peerCall(
       dialing.set(target, dial);
     }
     return dial;
+  };
+  /// After a request failed on `conn`: whether its other end's process closed it stopping. Its close may be told a moment
+  /// after the stream failed (a front's connection hears it from the front): a connection not closed yet is asked
+  /// whether its other end is there (`there`, at once for one that is), and one that is not is waited for to close.
+  const stoppedThere = async (conn: Connection): Promise<boolean> => {
+    if (closedStopping(conn)) return true;
+    if (conn.closeReason === undefined || (!conn.isClosed() && (await there(conn)))) return false;
+    await conn.closed().catch(() => {});
+    return closedStopping(conn);
   };
   /// After a request failed on `conn`: closed, or its peer not heard, it goes (the next request dials again).
   const letGo = async (target: string, conn: Connection) => {
@@ -386,6 +431,12 @@ export function peerCall(
       const dialed = dial as Promise<Connection> | null;
       // (its connection found gone, by this request or another: said so, whatever the stream failed with as it closed)
       if (failed !== null && found.has(failed)) throw error instanceof PeerGone ? error : new PeerGone();
+      // (its connection closed by the other station's process stopping or handing over, with no answer: said so, and
+      // let go at once, so the next request dials the process that answers now)
+      if (failed !== null && !(error instanceof Refused) && !(error instanceof NoBytes) && (error as Error)?.message !== late && (await stoppedThere(failed))) {
+        if (connections.get(target) === failed) connections.delete(target);
+        throw new PeerStopped();
+      }
       if (!(error instanceof Refused) && !(error instanceof NoBytes) && failed !== null) void letGo(target, failed);
       // Not connected in time: the next request dials again rather than wait on this dial.
       if (failed === null && dialed !== null && dialing.get(target) === dialed) dialing.delete(target);
@@ -476,6 +527,7 @@ export async function servePeer(conn: Connection, cloud: Cloud, remote: Pick<Pee
       if (bytes && envelope.bytes === true) {
         if (envelope.request === null || typeof envelope.request !== "object") throw new Error("bytes after a request that is no object");
         incoming = new Incoming(reader);
+        incoming.held = true;
         envelope.request[BYTES] = incoming;
       }
       // A rig asks nothing of a station: it tells what became of a task it was sent and of its own grants and
@@ -532,12 +584,13 @@ export async function servePeer(conn: Connection, cloud: Cloud, remote: Pick<Pee
     } catch (error) {
       // The caller gone (it gave up, the connection closed, it stopped reading), or the answer's bytes failed on the way.
       log.info("mesh", "peer answer not sent", { error: (error as Error).message, ...(answer.error !== undefined ? { failed: answer.error } : {}) });
-      void incoming?.return();
+      void incoming?.letGo();
       return;
     }
-    // Bytes of the request not read (refused before): once the answer is through, the caller is stopped sending them.
+    // Bytes of the request not read (refused before, or its handler failed as they came): once the answer is through,
+    // the caller is stopped sending them.
     void within(10_000, stream.stopped(), "")
       .catch(() => {})
-      .finally(() => void (incoming !== null && !incoming.ended && incoming.return()));
+      .finally(() => void incoming?.letGo());
   }
 }

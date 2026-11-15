@@ -50,7 +50,10 @@ below, sends them along).
   replica-carry`, `station/mb/src/replica/carry.mbt`, a process each, a cancel killing it; built for every system a
   station runs on, so no worker thread to fall back to; the worker's from before is `station/test/carry-reference.ts`,
   which `station/test/mb-replica-carry.test.ts` holds it to): a checkout's files as git
-  lists them (`rebuildable` stays behind), its own `.git` as files, a repository in it gone into; a linked worktree is
+  lists them (`rebuildable` stays behind, decided from the listings the walk reads: by its name anywhere, one known by
+  what is in it only outside a checkout and within 3 levels of the room's top, as git ignores it inside one; carry.mbt
+  `rebuilt_by_name`, `rebuilt_of_any_name`, held to footprint.ts's by `station/test/mb-replica-carry.test.ts` on the same
+  trees), its own `.git` as files, a repository in it gone into; a linked worktree is
   made again there by git (its remote fetched and pruned first, a bundle of the commits no remote has, `git worktree add`
   and `repair`; one that cannot be keeps its bundle beside it; not begun where that station has no git). A station has
   a million files: nothing of them is one object on a main thread or in one message (a list a session on disk, an
@@ -123,7 +126,10 @@ below, sends them along).
   other counted what it has does this one say it went; before, a failure undoes it there and the chat goes on here
   (`handover.drop`: after the placing under way, what it placed and the directories made for it, a linked worktree
   git made with its registration, branch and ref, the repository staying; what it put aside back; a newer hand-over
-  of the chat drops an older one still coming first, so the older's drop, late, takes nothing of it);
+  of the chat drops an older one still coming first, so the older's drop, late, takes nothing of it; asked even of a
+  station the turn found gone, owed until answered). The station it goes to drops it by itself where its own disk fails
+  what it is sent (full, over quota, read-only: refused in numbers, never a stream reset: mesh/peer.ts `Incoming.held`),
+  and where one still coming as it starts, or as its sender is heard from, no longer goes on there (`handover.still`);
   after, nothing is undone and the rest is told until it is answered. Its platform threads are re-pointed where their
   connect runs (connects/workspace.ts `route`, `connect.route`); what still comes here of it goes on there
   (`movedTo`). A device naming it here is answered where it went (409 with `moved`, `GET /moved`, `chat-moved`),

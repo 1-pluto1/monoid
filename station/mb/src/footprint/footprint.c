@@ -1,8 +1,10 @@
 // What the measure of a directory's size (footprint.mbt) asks of the system: an entry's lstat as Node's bigint lstat
 // gives it (what it is, dev, ino, nlink, blocks), a directory's names as Node's readdir lists them, and whether a path
-// is there as existsSync says (its links followed). Each path is UTF-8, ended by a NUL. Called on the program's one
+// is there as existsSync says (its links followed), whether it is a directory as stat says, and a file's first bytes
+// (footprint.ts `answerNow`'s three looks, for what is made again). Each path is UTF-8, ended by a NUL. Called on the program's one
 // thread, a call each entry: none of it goes through the shell's JSON.
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "moonbit.h"
@@ -163,6 +165,23 @@ int sff_exists(moonbit_bytes_t path) {
   CloseHandle(h);
   return 1;
 }
+
+/// Whether `path` is a directory, its links followed (stat's isDirectory).
+int sff_dir(moonbit_bytes_t path) {
+  wchar_t *w = wide((const char *)path, NULL);
+  if (w == NULL) return 0;
+  DWORD a = GetFileAttributesW(w);
+  free(w);
+  return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static FILE *open_read(const char *path) {
+  wchar_t *w = wide(path, NULL);
+  if (w == NULL) return NULL;
+  FILE *f = _wfopen(w, L"rb");
+  free(w);
+  return f;
+}
 #else
 #include <dirent.h>
 #include <errno.h>
@@ -241,4 +260,31 @@ int sff_exists(moonbit_bytes_t path) {
   struct stat st;
   return stat((const char *)path, &st) == 0;
 }
+
+/// Whether `path` is a directory, its links followed (stat's isDirectory).
+int sff_dir(moonbit_bytes_t path) {
+  struct stat st;
+  return stat((const char *)path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static FILE *open_read(const char *path) { return fopen(path, "rb"); }
 #endif
+
+/// The first `most` bytes of the file `path` (fewer if it is shorter); err[0] 1 when it could not be read.
+moonbit_bytes_t sff_head(moonbit_bytes_t path, int32_t most, int32_t *err) {
+  char buf[4096];
+  if (most > (int32_t)sizeof buf) most = (int32_t)sizeof buf;
+  err[0] = 0;
+  FILE *f = open_read((const char *)path);
+  size_t got = 0;
+  if (f == NULL) {
+    err[0] = 1;
+  } else {
+    got = fread(buf, 1, (size_t)most, f);
+    if (ferror(f)) err[0] = 1;
+    fclose(f);
+  }
+  moonbit_bytes_t out = moonbit_make_bytes(err[0] ? 0 : (int32_t)got, 0);
+  if (!err[0] && got > 0) memcpy(out, buf, got);
+  return out;
+}

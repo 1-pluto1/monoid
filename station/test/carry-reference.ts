@@ -7,14 +7,13 @@ import { createHash, randomBytes } from "node:crypto";
 import { appendFileSync, chmodSync, closeSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { roomOf } from "../src/sessions/footprint.ts";
-import { rebuildable } from "./footprint-reference.ts";
+import { ANY_NAME_DEPTH, rebuildableByName, rebuiltByName, rebuiltOfAnyName, roomOf } from "../src/sessions/footprint.ts";
 import { BUILTIN_SKILLS, FEEDBACK_SKILL } from "../src/sessions/agent-home.ts";
 import { runtimeKind } from "../src/agents/runtime.ts";
 import { sessionPlaces, storage, transcriptSources } from "../src/read/transcript.ts";
 import { carriedTo, moved } from "../src/replica/restore.ts";
 
-import { type CarriedFile, type CarriedGit, type CarriedHome, type CarriedSession, type CarryIndex, type Gathered, carriedPlace, indexFile, listFile } from "../src/replica/carry.ts";
+import { type CarriedFile, type CarriedGit, type CarriedHome, type CarriedSession, type CarryIndex, type Gathered, SIZED_TRANSCRIPTS, type Sized, type Sizing, carriedPlace, indexFile, listFile } from "../src/replica/carry.ts";
 
 export type { CarriedFile, CarryIndex, Gathered };
 
@@ -144,6 +143,24 @@ export function preview(dataDir: string, db: string, ws: string, home: boolean):
   return { chats, archived, outside };
 }
 
+/// A sizing's walk past its bound.
+const CUT = Symbol("cut");
+
+/// A session's files counted, for a sizing (`ListFile`'s count, nothing written).
+class Tally {
+  files = 0;
+  bytes = 0;
+  add(f: CarriedFile): void {
+    if ("hash" in f) {
+      this.files++;
+      this.bytes += f.size;
+    }
+  }
+  close(): string {
+    return "";
+  }
+}
+
 /// What goes along with the chats of `ws` on the station whose data directory is `dataDir`: their transcripts and each
 /// one's room, a git checkout in it as git lists its files (tracked and not ignored) with its repository, a linked
 /// worktree's commits no remote has in a bundle; written in `scratch` (a list a session, the index of them). A file of
@@ -151,19 +168,34 @@ export function preview(dataDir: string, db: string, ws: string, home: boolean):
 /// `agent`: the workspace's agent home here, whose own files go along too (`homeFiles`). `keys`: those sessions alone,
 /// not the workspace's (a chat handed over: its scratch is its own).
 export function gather(dataDir: string, db: string, ws: string, home: boolean, scratch: string, agent: string | null = null, keys: readonly string[] | null = null): Gathered {
-  const d = new DatabaseSync(db, { readOnly: true, timeout: 30_000 });
+  return walked(dataDir, db, ws, home, scratch, agent, keys, null) as Gathered;
+}
+
+/// The sessions `keys` sized as a move would gather them (`Sizing`); with `places`, what this station has where those
+/// would go (no database read).
+export function sizes(dataDir: string, db: string, keys: readonly string[], sizing: Sizing): Sized[] {
+  return walked(dataDir, db, "", false, "", null, keys, sizing) as Sized[];
+}
+
+function walked(dataDir: string, db: string, ws: string, home: boolean, scratch: string, agent: string | null, keys: readonly string[] | null, sizing: Sizing | null): Gathered | Sized[] {
+  const d = sizing?.places !== undefined ? null : new DatabaseSync(db, { readOnly: true, timeout: 30_000 });
   const gits: CarriedGit[] = [];
   const sessions: CarriedSession[] = [];
   const skipped: string[] = [];
   const bundles: Record<string, string> = {};
   const fetched = new Set<string>();
-  mkdirSync(join(scratch, "lists"), { recursive: true });
+  if (sizing === null) mkdirSync(join(scratch, "lists"), { recursive: true });
   let files = 0;
+  /// A sizing's entries walked of the session at hand, and its bound.
+  let walkedOf = 0;
+  const step = sizing === null ? () => {} : () => {
+    if (++walkedOf > sizing.most) throw CUT;
+  };
   let bytes = 0;
   // (per session: what its list said before, and what is in its list now)
   let before = new Map<string, { size: number; mtimeMs: number; hash: string }>();
   let seen = new Set<string>();
-  let list: ListFile | null = null;
+  let list: ListFile | Tally | null = null;
   /// Where what is added may be (the agent home's own files are under it, not the data directory's sessions).
   let under: (path: string) => boolean = (path) => carriedPlace(dataDir, path);
   const unreadable: string[] = [];
@@ -175,6 +207,7 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
   const add = (path: string) => {
     if (seen.has(path) || !under(path) || list === null) return;
     seen.add(path);
+    step();
     let st;
     try {
       st = lstatSync(path);
@@ -186,6 +219,7 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
       return;
     }
     if (!st.isFile()) return;
+    if (sizing !== null) return list.add({ path, hash: "", size: st.size, mode: 0, mtimeMs: st.mtimeMs });
     const was = before.get(path);
     let hash: string;
     try {
@@ -198,6 +232,7 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
   };
   /// Every file under `dir` as it is (a checkout's own repository).
   const whole = (dir: string) => {
+    step();
     let names: string[];
     try {
       names = readdirSync(dir);
@@ -217,8 +252,11 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
       else add(path);
     }
   };
-  /// Every file under `dir`, but what a build makes again; a git checkout in it as `checkout` takes it.
-  const tree = (dir: string) => {
+  /// Every file under `dir`, but what a build makes again; a git checkout in it as `checkout` takes it. `depth`: under
+  /// the room's top (its own entries 1); what is made again of any name is asked only down to ANY_NAME_DEPTH, by its
+  /// listing (footprint.ts `rebuiltOfAnyName`), and by name from the listing of where it is (`rebuiltByName`).
+  const tree = (dir: string, depth: number) => {
+    step();
     let names: string[];
     try {
       names = readdirSync(dir);
@@ -226,7 +264,9 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
       if (denied(e)) cannotRead(dir);
       return;
     }
-    if (names.includes(".git") && checkout(dir)) return;
+    if (names.includes(".git") && checkout(dir, depth)) return;
+    if (depth <= ANY_NAME_DEPTH && rebuiltOfAnyName(dir, names)) return;
+    const here = new Set(names);
     for (const name of names.sort()) {
       const path = join(dir, name);
       let st;
@@ -236,7 +276,7 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
         continue;
       }
       if (st.isDirectory()) {
-        if (name === ".git" || !rebuildable(path)) tree(path);
+        if (name === ".git" || rebuiltByName(name, here) === null) tree(path, depth + 1);
       } else add(path);
     }
   };
@@ -244,7 +284,7 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
   /// it lists (a repository in it, a submodule) gone into; its `.git` as its files where it is the checkout's own
   /// repository or a submodule's (a relative `gitdir:`), made again from its remote where it is a linked worktree (an
   /// absolute one). False where git does not read it: its files then go as any others do, `.git` with them.
-  const checkout = (dir: string): boolean => {
+  const checkout = (dir: string, depth: number): boolean => {
     const dotgit = join(dir, ".git");
     let st;
     try {
@@ -254,14 +294,15 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
     }
     const listed = git(dir, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]);
     if (listed === null) return false;
-    // (what a build or an install makes again stays behind here too, where git does not ignore it)
+    // (what a build or an install makes again by its name stays behind here too, where git does not ignore it; one known
+    // by what is in it goes as git lists it: footprint.ts `Rebuilt`)
     const made = new Map<string, boolean>();
     const rebuilt = (f: string): boolean => {
       const parts = f.split("/");
       for (let i = 1; i < parts.length; i++) {
         const at = parts.slice(0, i).join("/");
         let r = made.get(at);
-        if (r === undefined) made.set(at, (r = rebuildable(join(dir, at))));
+        if (r === undefined) made.set(at, (r = rebuildableByName(join(dir, at))));
         if (r) return true;
       }
       return false;
@@ -276,8 +317,9 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
         } catch {
           continue;
         }
+        // (a repository in it git lists: what it ignores of its own, git says there; nothing of any name asked in a checkout)
         if (s.isDirectory()) {
-          if (!rebuildable(path)) tree(path);
+          if (!rebuildableByName(path)) tree(path, Math.max(depth + 1, ANY_NAME_DEPTH + 1));
         } else add(path);
       }
     };
@@ -302,6 +344,8 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
   /// there is not taken as still there), branch, commit, and its commits no remote has in a bundle. Null without a
   /// remote or a commit.
   const linked = (dir: string): CarriedGit | null => {
+    // (a sizing fetches and bundles nothing: its `.git` file is counted, what git makes again there is not)
+    if (sizing !== null) return null;
     const remote = git(dir, ["remote", "get-url", "origin"]);
     const head = git(dir, ["rev-parse", "--verify", "-q", "HEAD"]);
     if (remote === null || remote === "" || head === null || head === "") return null;
@@ -323,73 +367,123 @@ export function gather(dataDir: string, db: string, ws: string, home: boolean, s
     }
     return { dir, remote, branch: branch === null || branch === "" ? null : branch, head, bundle: hash };
   };
+  /// A session's room, whole (an archived one's workspace packed in it).
+  const roomWalk = (room: string) => {
+    let names: string[] = [];
+    try {
+      names = readdirSync(room);
+    } catch {}
+    const here = new Set(names);
+    for (const name of names.sort()) {
+      // (its lock, and what is being written as it is looked at, stay)
+      if (name === "archive.lock" || name.endsWith(".writing")) continue;
+      const path = join(room, name);
+      let st;
+      try {
+        st = lstatSync(path);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) {
+        if (rebuiltByName(name, here) === null) tree(path, 1);
+      } else add(path);
+    }
+  };
+  const sized: Sized[] = [];
+  // The other station's side: what it has where each session's things would go.
+  if (sizing?.places !== undefined) {
+    for (const p of sizing.places) {
+      seen = new Set();
+      walkedOf = 0;
+      const tally = new Tally();
+      list = tally;
+      let complete = true;
+      try {
+        for (const t of p.transcripts.slice(0, SIZED_TRANSCRIPTS)) {
+          let st;
+          try {
+            st = lstatSync(t);
+          } catch {
+            continue;
+          }
+          if (st.isDirectory()) whole(t);
+          else add(t);
+        }
+        if (p.room !== null) roomWalk(p.room);
+      } catch (e) {
+        if (e !== CUT) throw e;
+        complete = false;
+      }
+      list = null;
+      sized.push({ ...p, bytes: tally.bytes, files: tally.files, complete });
+    }
+    return sized;
+  }
   let realData = dataDir;
   try {
     realData = realpathSync(dataDir);
   } catch {}
   try {
-    const rows = d.prepare(sessionsIn(home, keys)).all(keys !== null ? JSON.stringify(keys) : ws) as SessionAt[];
-    const runs = d.prepare("SELECT id, profile, runtime FROM runtime_sessions WHERE session_key = ? ORDER BY at");
+    const rows = d!.prepare(sessionsIn(home, keys)).all(keys !== null ? JSON.stringify(keys) : ws) as SessionAt[];
+    const runs = d!.prepare("SELECT id, profile, runtime FROM runtime_sessions WHERE session_key = ? ORDER BY at");
     for (const s of rows) {
       const at = listFile(scratch, s.key);
       // (the hashes the list before said, by path: this session's alone)
       before = new Map();
-      if (existsSync(at)) for (const line of linesOf(at)) {
+      if (sizing === null && existsSync(at)) for (const line of linesOf(at)) {
         try {
           const f = JSON.parse(line) as CarriedFile;
           if ("hash" in f) before.set(f.path, { size: f.size, mtimeMs: f.mtimeMs, hash: f.hash });
         } catch {}
       }
       seen = new Set();
-      list = new ListFile(at);
-      // Its transcripts: each runtime session's, where the station keeps them (its shared place), and a Claude one's
-      // subagents beside it.
-      const ids = (runs.all(s.key) as { id: string; profile: string | null; runtime: string | null }[]).map((r) => ({ id: r.id, profile: r.profile, runtime: r.runtime ?? s.runtime }));
-      if (s.runtime_session_id !== null && !ids.some((r) => r.id === s.runtime_session_id)) ids.push({ id: s.runtime_session_id, profile: s.profile, runtime: s.runtime });
-      // (looked for first where the runtime resumes it: under the project of the room's real path; another of the same
-      // id elsewhere is an older copy)
-      const places = sessionPlaces(s);
-      const found = transcriptSources(dataDir, [], ids.filter((r) => runtimeKind(r.runtime) !== null), [...new Set([...places.map(realOf), ...places])]);
-      for (const t of found.paths) {
-        add(storage(t.path));
-        if (t.runtime === "claude") {
-          const id = t.path.slice(t.path.lastIndexOf(sep) + 1).replace(/\.jsonl$/, "");
-          whole(join(dirname(t.path), id));
-        }
-      }
-      // Its room, whole (an archived one's workspace packed in it): one that is not the station's goes nowhere.
-      const room = roomFor(dataDir, realData, s.workspace);
-      if (room === null) skipped.push(s.key);
-      else {
-        let names: string[] = [];
-        try {
-          names = readdirSync(room);
-        } catch {}
-        for (const name of names.sort()) {
-          // (its lock, and what is being written as it is looked at, stay)
-          if (name === "archive.lock" || name.endsWith(".writing")) continue;
-          const path = join(room, name);
-          let st;
-          try {
-            st = lstatSync(path);
-          } catch {
-            continue;
+      walkedOf = 0;
+      list = sizing !== null ? new Tally() : new ListFile(at);
+      let complete = true;
+      /// (a sizing's: where its transcripts are, which the other station is asked to size of its own)
+      const tplaces: string[] = [];
+      try {
+        // Its transcripts: each runtime session's, where the station keeps them (its shared place), and a Claude one's
+        // subagents beside it.
+        const ids = (runs.all(s.key) as { id: string; profile: string | null; runtime: string | null }[]).map((r) => ({ id: r.id, profile: r.profile, runtime: r.runtime ?? s.runtime }));
+        if (s.runtime_session_id !== null && !ids.some((r) => r.id === s.runtime_session_id)) ids.push({ id: s.runtime_session_id, profile: s.profile, runtime: s.runtime });
+        // (looked for first where the runtime resumes it: under the project of the room's real path; another of the same
+        // id elsewhere is an older copy)
+        const places = sessionPlaces(s);
+        const found = transcriptSources(dataDir, [], ids.filter((r) => runtimeKind(r.runtime) !== null), [...new Set([...places.map(realOf), ...places])]);
+        for (const t of found.paths) {
+          add(storage(t.path));
+          if (tplaces.length < SIZED_TRANSCRIPTS) tplaces.push(storage(t.path));
+          if (t.runtime === "claude") {
+            const id = t.path.slice(t.path.lastIndexOf(sep) + 1).replace(/\.jsonl$/, "");
+            whole(join(dirname(t.path), id));
+            if (tplaces.length < SIZED_TRANSCRIPTS) tplaces.push(join(dirname(t.path), id));
           }
-          if (st.isDirectory()) {
-            if (!rebuildable(path)) tree(path);
-          } else add(path);
         }
+        // Its room, whole (an archived one's workspace packed in it): one that is not the station's goes nowhere.
+        const room = roomFor(dataDir, realData, s.workspace);
+        if (room === null) skipped.push(s.key);
+        else roomWalk(room);
+      } catch (e) {
+        if (e !== CUT) throw e;
+        complete = false;
       }
-      const done = list;
+      const done = list!;
+      if (sizing !== null) {
+        list = null;
+        sized.push({ key: s.key, room: roomFor(dataDir, realData, s.workspace), transcripts: tplaces, bytes: done.bytes, files: done.files, complete });
+        continue;
+      }
       list = null;
       const hash = done.close();
-      sessions.push({ key: s.key, workspace: s.workspace, room, list: hash, files: done.files, bytes: done.bytes, at });
+      sessions.push({ key: s.key, workspace: s.workspace, room: roomFor(dataDir, realData, s.workspace), list: hash, files: done.files, bytes: done.bytes, at });
       files += done.files;
       bytes += done.bytes;
     }
   } finally {
-    d.close();
+    d!.close();
   }
+  if (sizing !== null) return sized;
   // The agent home's own files, a list as a session's, in the same way (the hashes of the gathering before kept).
   let carriedHome: CarriedHome | null = null;
   if (agent !== null && existsSync(agent)) {
@@ -439,6 +533,7 @@ export function homeFiles(agent: string): string[] {
     try {
       names = readdirSync(dir);
     } catch {}
+    const here = new Set(names);
     for (const name of names.sort()) {
       const path = join(dir, name);
       let st;
@@ -448,7 +543,7 @@ export function homeFiles(agent: string): string[] {
         continue;
       }
       if (st.isDirectory()) {
-        if (!rebuildable(path)) walk(path);
+        if (rebuiltByName(name, here) === null) walk(path);
       } else if (st.isFile()) out.push(path);
     }
   };
@@ -626,3 +721,4 @@ export function putFile(blob: string, tmp: string): void {
   }
   copyFileSync(blob, tmp);
 }
+
