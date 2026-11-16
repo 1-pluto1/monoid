@@ -2309,10 +2309,14 @@ export class Directory extends DurableObject<Env> {
     // for a station (which it would let ask anything of it). A rig is told the stations (they alone ask of it), not
     // the other rigs, and whose it is (`rig`).
     // (`ways`: the workspace's own relays and the ways it turned off, as kept here before its stations kept them: what a
-    // station takes as its first of them, station/src/mesh/ways.ts)
+    // station takes as its first of them, station/src/mesh/ways.ts), but one of still.fail's a workspace also added as its
+    // own before it was still.fail's: kept as both, a station took it for neither (2026-11-16, 上海 in hypershell-算法)
+    const told = relays(this.env);
+    const ours = told.relay_urls.map(sameUrl);
+    const theirs = (raw: unknown) => parseRelays(raw).filter((u) => !ours.includes(sameUrl(u)));
     const [home, ...joined] = found.map(({ relays, ways_off, rig, enrolled_by, ...row }) => ({
       ...(row as { workspace: string; workspace_name: string; name: string }),
-      ways: { relays: parseRelays(relays), off: parseRelays(ways_off) },
+      ways: { relays: theirs(relays), off: parseRelays(ways_off) },
       peers: this.#rows("SELECT m.station AS id, m.name, s.version FROM station_members m LEFT JOIN stations s ON s.id = m.station WHERE m.workspace = ? AND m.rig IS NULL ORDER BY m.enrolled_at, m.rowid", row.workspace),
       ...(rig === 1 ? { rig: { owner: enrolled_by as string } } : this.#rigsTold(row.workspace as string)),
       revocations: this.#rows("SELECT kind, id, at FROM revocations WHERE workspace = ? AND at >= ?", row.workspace, since),
@@ -2322,11 +2326,13 @@ export class Directory extends DurableObject<Env> {
     const { peers, revocations, lock: _, locked: __, ...row } = home! as typeof home & { locked?: true };
     // Every workspace's own relays after still.fail's (one endpoint, homed on any of them): a station from before them
     // keeps one more relay as it keeps the rest.
-    const told = relays(this.env);
+    // `stillfail_relays`: still.fail's alone, so a station tells them from its workspaces' own where one of those is
+    // also one of still.fail's (station/src/mesh/ways.ts `stillFails`).
+    const stillfail_relays = [...told.relay_urls];
     const relay_urls = [...told.relay_urls];
     for (const url of found.flatMap((w) => parseRelays(w.relays))) if (!relay_urls.map(sameUrl).includes(sameUrl(url))) relay_urls.push(url);
     const lock = this.#lockHead(row.workspace);
-    return JSON.stringify({ type: "state", peers, ...row, origin: this.env.PUBLIC_ORIGIN, ...told, relay_urls, grant_keys: grantKeys(this.env), revocations, lock, workspaces: joined });
+    return JSON.stringify({ type: "state", peers, ...row, origin: this.env.PUBLIC_ORIGIN, ...told, relay_urls, stillfail_relays, grant_keys: grantKeys(this.env), revocations, lock, workspaces: joined });
   }
 
   #offline(station: string): void {
