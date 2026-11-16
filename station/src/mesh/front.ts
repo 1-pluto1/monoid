@@ -578,12 +578,18 @@ class FrontEndpoint implements Endpoint {
           try {
             const { front: next, said } = await FrontEndpoint.#link(this.#socket, this.#bind);
             if (this.#closed) return next.close();
+            try {
+              // Restore restrictions before accepting or dialing on this endpoint.
+              for (const args of this.#disabled.values()) await next.ask("disabledRelays", { args });
+              if (this.#routed) await next.ask("route", this.#routed);
+              this.#relays = await next.ask("relayStatus").catch(() => []);
+            } catch (error) {
+              next.close();
+              throw error;
+            }
             this.#front = next;
             this.#said = said;
-            // (what the front gone said of the relays is not this one's)
-            this.#relays = await next.ask("relayStatus").catch(() => []);
             this.#watch(next);
-            if (this.#routed) await next.ask("route", this.#routed).catch(() => {});
             log.info("mesh", "linked to the front again", { station: said.id });
             return;
           } catch (e) {
@@ -594,7 +600,8 @@ class FrontEndpoint implements Endpoint {
     });
   }
 
-  #ask(op: string, args: Record<string, unknown> = {}) {
+  async #ask(op: string, args: Record<string, unknown> = {}) {
+    if (this.#again) await this.#again;
     return this.#front.ask(op, args);
   }
 
@@ -620,6 +627,24 @@ class FrontEndpoint implements Endpoint {
     this.#ask("relayStatus").then((r) => { this.#relays = r; }, () => {}).finally(() => (this.#asking = false));
   }
   // (what the endpoint is on now is what a link made again binds with: else a relay removed came back as it did)
+  /// The stations' disabled relays as given (`disabledRelays`), given again to a front linked to anew (its endpoint bound
+  /// afresh): as they are now, never one taken back.
+  readonly #disabled = new Map<string, { peer: string; relays: string[]; public: boolean }>();
+  disabledRelays(id: string, relays: string[], noPublic: boolean) {
+    const args = { peer: id, relays, public: noPublic };
+    const before = this.#disabled.get(id);
+    this.#disabled.set(id, args);
+    return this.#ask("disabledRelays", { args }).then(() => {
+      if (relays.length === 0 && !noPublic && this.#disabled.get(id) === args) this.#disabled.delete(id);
+    }, (error) => {
+      // An older front has no policy to replay. Other failures keep the desired set for reconnect.
+      if (/no operation|not a function/.test((error as Error).message) && this.#disabled.get(id) === args) {
+        if (before) this.#disabled.set(id, before);
+        else this.#disabled.delete(id);
+      }
+      throw error;
+    });
+  }
   insertRelay(url: string) { return this.#ask("insertRelay", { args: { url } }).then(() => this.#relayUrls((urls) => urls.some((u) => bare(u) === bare(url)) ? urls : [...urls, url])); }
   removeRelay(url: string) { return this.#ask("removeRelay", { args: { url } }).then(() => this.#relayUrls((urls) => urls.filter((u) => bare(u) !== bare(url)))); }
   #relayUrls(change: (urls: string[]) => string[]) {

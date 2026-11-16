@@ -1,6 +1,7 @@
 // The station on the mesh, once it is in a workspace (cloud.json there): its endpoint, its relays, its presence at
 // its control plane, members' connections, and the control plane's gateways' (the device tools, mesh/tools.ts). Everything here lives in the layer's scope: stopping the station closes
 // the endpoint and every connection and loop it started.
+import { closePeerRelays } from "./peer-relays.ts";
 import { Cause, Effect, FiberSet, Layer, Option, Stream } from "effect";
 import { log } from "../ops/log.ts";
 import { stationLog } from "../ops/log-export.ts";
@@ -103,7 +104,7 @@ export const MeshLive = Layer.effectDiscard(
       const call = peerCall(endpoint, cloud.state, undefined, { reaches: (target, workspace) => side.outside?.reaches(target, workspace) === true });
       peers.attach(call);
       // (its watch of the ways, which lets go of connections through a relay turned off, ends with the mesh)
-      yield* Effect.addFinalizer(() => Effect.sync(() => call.close?.()));
+      yield* Effect.addFinalizer(() => Effect.sync(() => { call.close?.(); closePeerRelays(endpoint); }));
       // The agents' door's way to the other stations' web services (peer-http.ts).
       yield* Effect.acquireRelease(
         Effect.sync(() => {
@@ -239,7 +240,7 @@ export const MeshLive = Layer.effectDiscard(
           storms.watch(conn);
           if (conn.alpn().equals(ALPN)) void superseded.arrived(conn);
           // (another station: what this one keeps to it, from before it started again, asked whether it is still there)
-          else if (conn.alpn().equals(PEER_BYTES_ALPN) || conn.alpn().equals(PEER_ALPN)) call.arrived(conn);
+          else if (conn.alpn().equals(PEER_BYTES_ALPN) || conn.alpn().equals(PEER_ALPN) || conn.alpn().equals(PEER_HTTP_ALPN)) call.arrived(conn);
         },
         serve: (conn) =>
           conn.alpn().equals(PEER_BYTES_ALPN) || conn.alpn().equals(PEER_ALPN) ? servePeer(conn, cloud.state, peers)
