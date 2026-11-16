@@ -3,7 +3,7 @@
 // through a direct `call` that answers as the transport does.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -442,6 +442,25 @@ describe("remote", { concurrency: true }, () => {
     await assert.rejects(call(r, "peer-a", "file.put", { path: "input", offset: 0, data: "", final: true }));
   });
 
+  test("a transfer's path stays in its task's directory, as this machine's paths go (the program's own join)", async () => {
+    const r = station();
+    await call(r, "peer-a", "task.prepare", { spec: { command: "true", name: "paths" } });
+    const win = process.platform === "win32";
+    // (out of the directory: up, the root; on Windows a backslash separates too, and a drive, a share or a stream is
+    // not relative, mb nodepath `relative_parts`)
+    const out = ["../outside", "a/../../outside", "/etc/passwd", "./a", ...(win ? ["..\\outside", "a\\..\\..\\outside", "C:\\Windows\\win.ini", "C:outside", "\\\\server\\share\\x", "\\x", "file:stream"] : [])];
+    for (const path of out) await assert.rejects(call(r, "peer-a", "file.put", { path, offset: 0, data: b64("x"), final: true }), Error, path);
+    // (in it: where this machine's own join puts it, a backslash a name's on Unix)
+    const inside: [string, string[]][] = [["nested/file", ["nested", "file"]], ...(win ? [["nested\\deeper", ["nested", "deeper"]] as [string, string[]]] : [["a\\..\\b", ["a\\..\\b"]] as [string, string[]]])];
+    for (const [path, parts] of inside) {
+      await call(r, "peer-a", "file.put", { path, offset: 0, data: b64(path), final: true });
+      assert.equal(unb64(await call(r, "peer-a", "file.get", { path })), path);
+      const written = (readdirSync(join(r.dir, "remote"), { recursive: true }) as string[]).filter((f) => f.endsWith(join("work", ...parts)));
+      assert.equal(written.length, 1, `${path} written where Node's join puts it: ${written.join(", ")}`);
+      assert.equal(readFileSync(join(r.dir, "remote", written[0]!), "utf8"), path);
+    }
+  });
+
   test("removal from the workspace stops only that peer's task", async () => {
     const r = station();
     for (const peer of ["peer-a", "peer-b"]) {
@@ -733,6 +752,20 @@ describe("remote", { concurrency: true }, () => {
     await assert.rejects(use("station_task", { ...task, action: "prepare", command: "true", dir: "relative" }), /absolute path/);
     await assert.rejects(use("station_task", { ...task, action: "start" }), /prepare.*failed|prepare.*again/i);
     assert.deepEqual((await use("station_task", { ...task, action: "get" })).job, null);
+  });
+
+  test("a task's directory and what comes back stays in its task's directory, as this machine's paths go (Node's isAbsolute)", async () => {
+    const { home, use } = pair();
+    const src = join(home, "src");
+    mkdirSync(src);
+    writeFileSync(join(src, "input.txt"), "in\n");
+    // (absolute as this machine has it: `C:\…` on Windows, which the program's POSIX-only check once refused)
+    const prepared = await use("station_task", { station: "B", key: "dir", action: "prepare", dir: src, command: "true", back: ["out/result.txt"] });
+    assert.equal(prepared.prepared, true, JSON.stringify(prepared));
+    const win = process.platform === "win32";
+    for (const back of ["/etc/passwd", "../outside", "a/../../outside", ...(win ? ["C:\\outside", "\\outside", "a\\..\\..\\outside"] : [])]) {
+      await assert.rejects(use("station_task", { station: "B", key: "dir", action: "prepare", dir: src, command: "true", back: [back] }), /back must be paths relative/, back);
+    }
   });
 
   test("a failed prepare stays fenced after migration of an older record and a restart", async () => {
