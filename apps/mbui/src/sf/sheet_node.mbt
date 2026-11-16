@@ -710,8 +710,9 @@ fn sheet_node(
               }
           }
         }))
-        // (another in its place: none of it drawn from then, where it is, till its layer is let go)
-        .alpha(By(fn() { if vanished() { 0.0 } else { 1.0 } }))
+        // (another in its place: none of it drawn from then, where it is, till its layer is let go; none of it drawn
+        // either while it waits under the window for what it reads (OpenGate's holding): nothing of it till it rises)
+        .alpha(By(fn() { if vanished() || gate.holding() { 0.0 } else { 1.0 } }))
         // (below its place by its own height as it comes and goes, over the time that height takes, as tall as it is
         // laid out in the frame drawing it; down where a finger has its top, or going back)
         // (what is leaving with it, its layer, kept till it has sunk away, however tall: as the host's is, gone once it
@@ -1120,7 +1121,12 @@ fn sheet_node(
                         panel_in_lend(col, Narrow, sheet_panel_sides, sides=0.0)
                         col.lends(sheet_win_lent, body_win_h) |> ignore
                         match pg.nodes {
-                          Some(n) => (n.body)(col, close)
+                          Some(n) => {
+                            // (what it holds come to another height for a cause of its own: the sheet from as tall as
+                            // it is seen, where it shows, panel_reshaped_node)
+                            col.lends(panel_reshape_lent, fn() { page_reshaped(0.0) }) |> ignore
+                            (n.body)(col, close)
+                          }
                           None => ()
                         }
                       })
@@ -1181,7 +1187,11 @@ fn sheet_node(
                           }
                           col.lends(sheet_win_lent, body_win_h) |> ignore
                           match pg.nodes {
-                            Some(n) => (n.body)(col, close)
+                            Some(n) => {
+                              // (what it holds come to another height for a cause of its own: panel_reshaped_node)
+                              col.lends(panel_reshape_lent, fn() { page_reshaped(0.0) }) |> ignore
+                              (n.body)(col, close)
+                            }
                             None => ()
                           }
                         })
