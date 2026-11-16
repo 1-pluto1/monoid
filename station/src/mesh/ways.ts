@@ -171,6 +171,29 @@ export function stillFails(cloud: Cloud): string[] {
   return cloud.relays().filter((u) => !theirs.some((t) => sameUrl(t) === sameUrl(u)));
 }
 
+/// The relays `ws`'s stations and devices go through: still.fail's, then its own not among them, but those its ways turn
+/// off (`ours`: all of still.fail's; a relay's URL). Never none: a record that would leave none (one made by hand, or
+/// from before `setWay` kept the last on) is taken as turning none off.
+export function workspaceRelays(ways: Ways, ws: string): string[] {
+  const { all, on } = relaysOf(ways, ws);
+  return on.length > 0 ? on : all;
+}
+
+/// The relays `ws`'s ways turn off (none where they would turn off all: `workspaceRelays`): what is not dialed to its
+/// stations, nor taken where Address Lookup names it.
+export function offRelays(ways: Ways, ws: string): string[] {
+  const { all, on } = relaysOf(ways, ws);
+  return on.length > 0 ? all.filter((u) => !on.includes(u)) : [];
+}
+
+function relaysOf(ways: Ways, ws: string): { all: string[]; on: string[] } {
+  const ours = stillFails(ways.cloud);
+  const v = ways.view(ws);
+  const all = [...ours, ...v.relays.map((r) => r.url).filter((u) => !ours.some((o) => sameUrl(o) === sameUrl(u)))];
+  const off = (u: string) => v.off.some((w) => sameUrl(w) === sameUrl(u)) || (v.off.includes("ours") && ours.some((o) => sameUrl(o) === sameUrl(u)));
+  return { all, on: all.filter((u) => !off(u)) };
+}
+
 /// `url` added to `ws`'s own relays, by `by`. One already there stays as it is.
 export function addRelay(ways: Ways, ws: string, raw: string, by: string | null): WaysRecord {
   const url = relayUrl(raw, insecure(ways.cloud));
@@ -325,7 +348,12 @@ export function followWays(ways: Ways, call: PeerCall, after: (ms: number, f: ()
   const look = () => {
     const st = cloud.state;
     if (stopped || !st || !cloud.peersCurrent) return;
-    for (const m of cloud.memberships()) for (const p of m.peers) if (typeof p?.id === "string" && p.id !== st.station) bring(p.id, m.workspace, m.home);
+    for (const m of cloud.memberships()) {
+      for (const p of m.peers) if (typeof p?.id === "string" && p.id !== st.station) bring(p.id, m.workspace, m.home);
+      // Its rigs too (stations that only run tasks, rig/): kept on the relays the workspace keeps on, as a station is
+      // (relays.ts), they answer `ways.*` as a station does (peer.ts servePeer).
+      for (const r of cloud.rigs(m.workspace)) if (r.id !== st.station && !m.peers.some((p) => p?.id === r.id)) bring(r.id, m.workspace, m.home);
+    }
   };
   look();
   const unlistenCloud = cloud.listen(look);
