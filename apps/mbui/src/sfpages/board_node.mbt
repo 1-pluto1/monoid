@@ -1403,60 +1403,74 @@ fn board_add(a : @view.View, own : BoardOwn, wide : Bool, tips : @sf.TipLayer) -
     .padding(By(fn() { (foot_in(), card_pad, foot_in(), foot_in()) }))
     .gap(Is(12.0))
     |> ignore
-    // its words, on the card's own paper: no frame round them, where a card's title begins
-    card.box(fn(w) {
-      w.row(Is(true)).padding(By(fn() { (card_pad - foot_in(), 0.0, if wide { card_title_end() + card_pad - foot_in() } else { card_pad - foot_in() }, 0.0) })) |> ignore
-      let typed = @ui.field(
-        w,
-        own.field,
-        placeholder=board_words("placeholder"),
-        label=board_words("placeholder"),
-        max_lines=3,
-        enter_sends=true,
-        submitted=fn(_) { add() },
-        files=fn(got) {
-          let w = @signals.untracked(writing)
-          let station = @signals.untracked(fn() { board_station_now(own) })
-          for f in got { @sfbase.writing_add(own.src, w, station, f.0, f.1) }
-        },
-        leaves=[@ui.key_escape],
-        size_by=fn() { @sf.theme().t.ui },
-        colors_by=fn() {
-          let th = @ui.tree_theme()
-          (th.fg, th.subtle, th.accent)
-        },
-      )
-      own.input = Some(typed)
-      typed.owns(fn() {
-        match own.input {
-          Some(input) if input.id() == typed.id() => own.input = None
-          _ => ()
-        }
-      }) |> ignore
-      // (tall enough to be found by a finger, all of it the field's)
-      typed.grow(Is(1.0)).basis(Is(Some(0.0))).shrink(Is(1.0)).min_height(Is(Some(32.0))) |> ignore
-      // (Escape puts it away, as × does)
-      if wide {
-        w.on_key(fn(k) {
-          if k.code == @ui.key_escape {
-            cancel()
-            true
-          } else {
-            false
-          }
+    // its pictures over its words, as the composer has them, only once there are some (pasted, dropped or picked: the
+    // field takes them, nothing says it does); clear of 取消's corner where that stands. A room opening on them and
+    // closing on them (the last one removed from its own ✕ too), the words, 添加 and the cards under the entry going
+    // with it, never a jump; shut, nothing at all over the words, not even the card's gap.
+    card.box(fn(top) {
+      @motion.reveal_node(top, fn() { !files().is_empty() }, fn(at) {
+        at.padding(By(fn() { (0.0, 0.0, if wide { card_title_end() + card_pad - foot_in() } else { 0.0 }, 12.0) })) |> ignore
+        board_files_node(at, own.src, fn() { @sfbase.board_file_key(ws, own.draft_id.get()) }, files, remove=fn(f) {
+          @sfbase.writing_remove(own.src, @signals.untracked(writing), f.id)
         })
-        |> ignore
-      }
-      // (opened to be written in: the cursor in it, each time it opens)
-      // (once what opened it is done: its room in use by then)
-      typed.reacts(fn() { @sfbase.board_adding.get() }, fn(on) {
-        if on {
-          @signals.after_flush(fn() { typed.ask_focus() |> ignore })
-          // (and once its room is laid out open where the host gives the focus by where it is: a browser's)
-          typed.at_moment(typed.cause_at() + 1.0, fn() { if @sfbase.board_adding.untracked() { typed.ask_focus() |> ignore } })
+      }, deferred=true)
+      |> ignore
+      // its words, on the card's own paper: no frame round them, where a card's title begins
+      top.box(fn(w) {
+        w.row(Is(true)).padding(By(fn() { (card_pad - foot_in(), 0.0, if wide { card_title_end() + card_pad - foot_in() } else { card_pad - foot_in() }, 0.0) })) |> ignore
+        let typed = @ui.field(
+          w,
+          own.field,
+          placeholder=board_words("placeholder"),
+          label=board_words("placeholder"),
+          max_lines=3,
+          enter_sends=true,
+          submitted=fn(_) { add() },
+          files=fn(got) {
+            let w = @signals.untracked(writing)
+            let station = @signals.untracked(fn() { board_station_now(own) })
+            for f in got { @sfbase.writing_add(own.src, w, station, f.0, f.1) }
+          },
+          leaves=[@ui.key_escape],
+          size_by=fn() { @sf.theme().t.ui },
+          colors_by=fn() {
+            let th = @ui.tree_theme()
+            (th.fg, th.subtle, th.accent)
+          },
+        )
+        own.input = Some(typed)
+        typed.owns(fn() {
+          match own.input {
+            Some(input) if input.id() == typed.id() => own.input = None
+            _ => ()
+          }
+        }) |> ignore
+        // (tall enough to be found by a finger, all of it the field's)
+        typed.grow(Is(1.0)).basis(Is(Some(0.0))).shrink(Is(1.0)).min_height(Is(Some(32.0))) |> ignore
+        // (Escape puts it away, as × does)
+        if wide {
+          w.on_key(fn(k) {
+            if k.code == @ui.key_escape {
+              cancel()
+              true
+            } else {
+              false
+            }
+          })
           |> ignore
         }
+        // (opened to be written in: the cursor in it, each time it opens)
+        // (once what opened it is done: its room in use by then)
+        typed.reacts(fn() { @sfbase.board_adding.get() }, fn(on) {
+          if on {
+            @signals.after_flush(fn() { typed.ask_focus() |> ignore })
+            // (and once its room is laid out open where the host gives the focus by where it is: a browser's)
+            typed.at_moment(typed.cause_at() + 1.0, fn() { if @sfbase.board_adding.untracked() { typed.ask_focus() |> ignore } })
+            |> ignore
+          }
+        })
       })
+      |> ignore
     })
     |> ignore
     card.box(fn(r) {
@@ -1482,9 +1496,6 @@ fn board_add(a : @view.View, own : BoardOwn, wide : Bool, tips : @sf.TipLayer) -
       |> ignore
     })
     |> ignore
-    board_files_node(card, own.src, fn() { @sfbase.board_file_key(ws, own.draft_id.get()) }, files, remove=fn(f) {
-      @sfbase.writing_remove(own.src, @signals.untracked(writing), f.id)
-    })
   })
   |> ignore
   if wide {
@@ -1501,17 +1512,10 @@ fn board_files_node(
   files : () -> Array[@sfbase.BoardFile],
   remove? : (@sfbase.BoardFile) -> Unit,
 ) -> Unit {
-  // The entry always has room for its attachments, so adding or removing one never moves its actions or the cards below.
   let strip = fn(p : @view.View) {
     p.height(Is(Some(64.0))).min_width(Is(Some(0.0))) |> ignore
     p.scrolls(@view.Scroll::across(), slop=@ui.touch_slop(), fn(row) {
       row.row(Is(true)).gap(Is(6.0)).padding(Is((0.0, 8.0, 8.0, 0.0))) |> ignore
-      match remove {
-        Some(_) => row.show(fn() { files().is_empty() }, at_once=true, fn(hint) {
-          @sf.words_node(hint, fn() { @sf.t("web-main.board.paste_image") }, fn() { card_meta_look }) |> ignore
-        })
-        None => ()
-      }
       let by_id = row.keyed_by(files, fn(f) { f.id })
       row.each(fn() { by_id.keys() }, fn(id) { id }, fn(slot, id) {
         let file = fn() { by_id.get(id.get()).unwrap_or({ id: "", name: "" }) }
@@ -1549,6 +1553,8 @@ fn board_files_node(
       })
     }) |> ignore
   }
+  // (with `remove`, the entry's: in a room of its own that opens while it has some and closes as it has none; a card's
+  // only where it has some)
   match remove {
     Some(_) => parent.box(strip) |> ignore
     None => parent.show(fn() { !files().is_empty() }, at_once=true, fn(p) { p.box(strip) |> ignore })
