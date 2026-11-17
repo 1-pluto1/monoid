@@ -377,7 +377,8 @@ jobs:
   # checks that need macOS/Xcode on macos-ci only when their inputs changed (check-mac), the station's tests in slices
   # on Linux runners of their own (check-station), and the rest beside them on Linux (check-linux).
   check:
-    needs: plan
+    needs: [plan, natives]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.natives.result) }}
     runs-on: ${{ fromJSON(vars.CI_1 != 'off' && '["self-hosted", "linux-ci"]' || '["self-hosted", "macos-ci"]') }}
     # Usually under 2 minutes, all of it with Rust built anew a few: a test that hangs (one waiting on what never comes,
     # up to its 10 minutes each) held one of macos-ci's four runners for most of an hour, and every run behind it waited
@@ -394,6 +395,8 @@ jobs:
         uses: ./.github/actions/setup-mac
       # (the station's programs in MoonBit: station/mb)
       - uses: ./.github/actions/mbui-moonbit
+      # Use the reader built by natives so this test job does not repeat its cold build.
+      - uses: ./.github/actions/natives
       - name: Full check (station, core)
         run: |
           range='${{ needs.plan.outputs.range }}'
