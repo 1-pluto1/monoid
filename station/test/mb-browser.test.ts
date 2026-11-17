@@ -70,9 +70,17 @@ const clockFibers = new Fibers("mb-browser", t.clock);
 after(() => clockFibers.close());
 const later = (ms: number, f: () => void) => clockFibers.after(ms, f); // timer: the TypeScript's tabs' own, on the test's clock
 
-/// Turns of the loop until what was set going here is done (the TypeScript's side of `quiet`).
+/// Turns of the loop until what was set going here is done (the TypeScript's side of `quiet`): `n` of them with no file
+/// request out, as hub-fakes.ts `settle`. The TypeScript's tabs read and write their files on libuv's threads (a login's
+/// state.json read as its tab opens, user-tabs.json written as it changes), and how many turns that takes is the
+/// machine's: counted alone, a CI runner compared the two sides before the TypeScript's had read it (134186072690,
+/// 2026-11-17).
 async function turns(n = 30) {
-  for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r));
+  for (let quiet = 0; quiet < n; ) {
+    await new Promise((r) => setImmediate(r));
+    // (a file handle's close, the last step of fs/promises' writeFile and readFile, is a request of its own: CloseReq)
+    quiet = process.getActiveResourcesInfo().some((r) => r === "FSReqPromise" || r === "FSReqCallback" || r === "CloseReq") ? 0 : quiet + 1;
+  }
 }
 
 // ── what both sides do, written down the same way ──
@@ -155,6 +163,11 @@ async function mbOutcome(f: () => Promise<Json>): Promise<Json> {
 
 // ── the program ──
 
+// Socket and program messages wake waits for facts delivered from outside this process.
+const farviewEvents = new EventEmitter();
+let farviewVersion = 0;
+function wakeFarview() { farviewVersion++; farviewEvents.emit("changed"); }
+
 class Program {
   readonly child: ChildProcessWithoutNullStreams;
   #next = 0;
@@ -207,13 +220,14 @@ class Program {
         this.due.set(m.timer, clockFibers.now() + Math.max(0, m.ms));
         this.#timers.set(m.timer, clockFibers.after(m.ms, () => (this.due.delete(m.timer), void this.cmd("fire", { timer: m.timer })))); // timer: the program's own, armed on the test's clock
       } else if (m.tell === "cancel") (this.#timers.get(m.timer)?.(), this.#timers.delete(m.timer), this.due.delete(m.timer));
-      else this.entries.push(tellEntry(m.tell, m.inst, m.args));
+      else { this.entries.push(tellEntry(m.tell, m.inst, m.args)); wakeFarview(); }
       return;
     }
     if (typeof m.call === "string") {
       this.#asked++;
       if (m.call === "connect") this.conns.push(m.args[0]);
       this.entries.push(askEntry(m.call, m.inst, m.args));
+      wakeFarview();
       const run = (async () => {
         try {
           const ok = await this.world(m.call, m.inst, m.args);
@@ -370,8 +384,21 @@ function sameSince(p: Program, what: string) {
   p.entries = [];
 }
 
+/// The browsers a case made on both sides, the TypeScript's and the program's instance of it: those a case that failed
+/// left open are closed as the next begins, so that what their timers do is not told among its entries (a case that
+/// failed at one assertion went on to fail the one after it, 134186072690, 2026-11-17). Closing one closed is nothing.
+const made: { ts: { close(): Promise<void> }; inst: string }[] = [];
+function held<T extends { close(): Promise<void> }>(ts: T, inst: string): T {
+  made.push({ ts, inst });
+  return ts;
+}
+
 /// A fresh start for a case: no entries, the connections' ids counted from 1 on both sides.
 async function begin(p: Program) {
+  for (const m of made.splice(0)) {
+    await m.ts.close().catch(() => {});
+    await p.call(m.inst, "close").catch(() => {});
+  }
   await p.quiet();
   tsEntries = [];
   p.entries = [];
@@ -508,7 +535,7 @@ test("the pages' scripts are the TypeScript's, character for character", { skip 
 
 test("Farview: its wire, its release, its config and its words", { skip }, async () => {
   const p = await mb();
-  const asks: Json[] = [{ kind: "look" }, { kind: "eval", script: "1+1" }, { kind: "cookies", verb: "set", arg: JSON.stringify([{ name: "é", value: "x".repeat(300) }]) }, { kind: "act", verb: "type", selector: "[a]", text: "pässwörd" }, { kind: "eval", script: "x".repeat(70000) }];
+  const asks: Json[] = [{ kind: "look" }, { kind: "eval", script: "1+1" }, { kind: "cookies", verb: "set", arg: JSON.stringify([{ name: "é", value: "x".repeat(300) }]) }, { kind: "act", verb: "type", selector: "[a]", text: "pässwörd" }, { kind: "eval", script: "x".repeat(70000) }, { kind: "passkeys", verb: "set", arg: JSON.stringify(PASSKEYS) }, { kind: "passkeys", verb: "clear", arg: "github.com" }];
   await sameFn(p, "encodeAsk", (a: Json) => encodeAsk(a).toString("base64"), asks.map((a) => [a]));
   const body = (kind: number, ...strs: string[]) => {
     const out: number[] = [];
@@ -1340,7 +1367,7 @@ test("the station's browser: started once however many ask, its tabs screens wit
   const worldTs = stationWorld(stateTs);
   p.world = stationWorld(stateMb);
   const both = (f: (s: Json) => void) => (f(stateTs), f(stateMb));
-  const ts = new StationBrowser({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later });
+  const ts = held(new StationBrowser({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later }), "st");
   await p.make("station", "st", { dir: mbDir });
   await settleBoth(p);
   sameSince(p, "made");
@@ -1429,7 +1456,7 @@ test("the station's browser: started once however many ask, its tabs screens wit
   sameFiles(tsDir, mbDir, "as the station ended");
   // the next process: the Chrome left running taken up, its tabs coming again as Chrome tells of them
   both((s) => (s.left = runningOf(3)));
-  const next = new StationBrowser({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later });
+  const next = held(new StationBrowser({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later }), "st2");
   await p.make("station", "st2", { dir: mbDir });
   await bothCall(p, "resume", () => next.resume(), "st2", "resume");
   const k = tsConns.length - 1;
@@ -1455,7 +1482,7 @@ test("the station's own tabs: opened behind (the browser started for it), in an 
   const stateMb: Json = { cookies: COOKIES_READ, credentials: [KEY_A] };
   const worldTs = stationWorld(stateTs);
   p.world = stationWorld(stateMb);
-  const ts = new StationBrowser({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later });
+  const ts = held(new StationBrowser({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later }), "own");
   await p.make("station", "own", { dir: mbDir });
   // a tab of its own context: waited for until Chrome tells of it
   const a = outcome(() => ts.openTab("https://login.test/"));
@@ -1525,7 +1552,7 @@ test("a person's own pages: opened by the app's id, asleep when unwatched, woken
   const mbDir = fresh("user-mb");
   const worldTs = stationWorld({});
   p.world = stationWorld({});
-  const ts = new StationBrowser({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later });
+  const ts = held(new StationBrowser({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later }), "user");
   await p.make("station", "user", { dir: mbDir });
   const a = outcome(() => ts.openUserTab("mail.proton.me", "u_abc123"));
   const b = mbOutcome(() => p.call("user", "openUserTab", "mail.proton.me", "u_abc123"));
@@ -1612,7 +1639,7 @@ test("each chat's own context: made as its agent asks, its gate's parts, its sig
   const stateMb: Json = { cookies: COOKIES_READ, credentials: [KEY_A] };
   const worldTs = stationWorld(stateTs);
   p.world = stationWorld(stateMb);
-  const ts = new Browsers({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later });
+  const ts = held(new Browsers({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later }), "bs");
   listen(ts);
   await p.make("browsers", "bs", { dir: mbDir });
   await bothCall(p, "context", () => ts.context("chat:a"), "bs", "context", "chat:a");
@@ -1665,7 +1692,7 @@ test("each chat's own context: made as its agent asks, its gate's parts, its sig
   // the next station process: the contexts kept taken up with the Chrome left running, their passkeys put in again
   stateTs.left = runningOf(2);
   stateMb.left = runningOf(2);
-  const next = new Browsers({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later });
+  const next = held(new Browsers({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later }), "bs2");
   listen(next);
   await p.make("browsers", "bs2", { dir: mbDir });
   await bothCall(p, "resume", () => next.resume(), "bs2", "resume");
@@ -1683,7 +1710,7 @@ test("the browser tool: endpoint by default, tabs, status, stop, each the chat's
   const mbDir = fresh("tool-mb");
   const worldTs = stationWorld({});
   p.world = stationWorld({});
-  const ts = new Browsers({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later });
+  const ts = held(new Browsers({ dir: tsDir, chrome: tsChrome(() => worldTs), screens: tsScreens(), clock: t.clock, later }), "tb");
   listen(ts);
   await p.make("browsers", "tb", { dir: mbDir });
   const door = "http://127.0.0.1:4777/mcp";
@@ -1698,10 +1725,27 @@ test("the browser tool: endpoint by default, tabs, status, stop, each the chat's
 
 // ── a chat's Farview tab, over ports served here ──
 
-/// Until `f` holds, turning the loop (what the sockets carry comes in its own time); bounded.
-async function until(what: string, f: () => boolean) {
-  for (let i = 0; i < 5000 && !f(); i++) await new Promise((r) => setImmediate(r));
-  assert.ok(f(), `${what}: it did not come`);
+/// Wait for socket or program events; an async query also yields to the OS between checks.
+async function until(what: string, f: () => boolean | Promise<boolean>) {
+  const end = Date.now() + 15_000;
+  for (;;) {
+    const version = farviewVersion;
+    const result = f();
+    const asynchronous = result instanceof Promise;
+    const left = end - Date.now();
+    if (left <= 0) throw new Error(`${what}: it did not come`);
+    let limit: ReturnType<typeof setTimeout> | undefined;
+    const timed = new Promise<never>((_, reject) => { limit = setTimeout(() => reject(new Error(`${what}: it did not come`)), left); });
+    try { if (await Promise.race([Promise.resolve(result), timed])) return; }
+    finally { clearTimeout(limit); }
+    if (farviewVersion !== version) continue;
+    await new Promise<void>((resolve) => {
+      const wake = () => { clearTimeout(timer); farviewEvents.off("changed", wake); resolve(); };
+      const timer = setTimeout(wake, asynchronous ? Math.min(5, left) : left);
+      farviewEvents.once("changed", wake);
+      if (farviewVersion !== version) wake();
+    });
+  }
 }
 
 /// An agent port as a Farview host's: each ask read off its wire and written down, answered as `answer` says.
@@ -1720,7 +1764,7 @@ async function agentPort(answer: (ask: Json) => Json) {
         const int = () => { let shift = 0, u = 0; for (;;) { const c = body[i++]!; u |= (c & 0x7f) << shift; shift += 7; if (c < 0x80) break; } u >>>= 0; return (u >>> 1) ^ -(u & 1); };
         const str = () => { const k = int(); const v = body.subarray(i, i + k).toString("utf8"); i += k; return v; };
         const kind = int();
-        const ask = kind === 19 ? { kind: "look" } : kind === 32 ? { kind: "eval", script: str() } : kind === 35 ? { kind: "cookies", verb: str(), arg: str() } : { kind: "act", verb: str(), selector: str(), text: str() };
+        const ask = kind === 19 ? { kind: "look" } : kind === 32 ? { kind: "eval", script: str() } : kind === 35 ? { kind: "cookies", verb: str(), arg: str() } : kind === 42 ? { kind: "passkeys", verb: str(), arg: str() } : { kind: "act", verb: str(), selector: str(), text: str() };
         heard.push(ask);
         const a = answer(ask);
         if (a === undefined) continue;
@@ -1812,6 +1856,7 @@ async function framePortOf(picture: Buffer) {
   const server = createServer((s) => {
     const k = sockets.length;
     sockets.push(s);
+    wakeFarview();
     let buf = "";
     s.on("data", (d) => {
       buf += d.toString("latin1");
@@ -1820,6 +1865,7 @@ async function framePortOf(picture: Buffer) {
         const m = JSON.parse(Buffer.from(buf.slice(0, nl), "latin1").toString("utf8"));
         buf = buf.slice(nl + 1);
         heard.push([k, m]);
+        wakeFarview();
         if (m.frame) {
           s.write(`${JSON.stringify({ frame: { seq: seq++, width: 640, height: 450, format: "jpeg", bytes: picture.length } })}\n`);
           s.write(picture.subarray(0, 2));
@@ -1850,7 +1896,7 @@ test("a Farview tab as a screen: its page and size heard, a view's size, a pictu
     // a link alone: a picture asked for, the lines after it heard, nothing after its end
     const link = new FrameLink(portTs.port);
     const linkHeard: Json[] = [];
-    link.heard = (m) => linkHeard.push(m);
+    link.heard = (m) => { linkHeard.push(m); wakeFarview(); };
     await p.make("frameLink", "link1", { port: portMb.port });
     const pic = await link.picture();
     const mbPic = await p.call("link1", "picture");
@@ -1866,7 +1912,7 @@ test("a Farview tab as a screen: its page and size heard, a view's size, a pictu
     // the screen and a view of it
     const screen = new FarviewScreen({ session: "chat:c-1", port: portTs.port, n: 2 });
     const opened: string[] = [];
-    screen.opened = (url) => opened.push(url);
+    screen.opened = (url) => { opened.push(url); wakeFarview(); };
     await p.make("farviewScreen", "fs1", { session: "chat:c-1", port: portMb.port, n: 2 });
     screen.watch();
     await p.call("fs1", "watch");
@@ -1898,13 +1944,13 @@ test("a Farview tab as a screen: its page and size heard, a view's size, a pictu
       await p.call(mbView, "input", input);
     }
     for (const port of [portTs, portMb]) port.said({ size: { width: 500, height: 900 } });
-    await until("the size heard", () => portTs.heard.length === portMb.heard.length);
+    await until("the size heard", async () => portTs.heard.length >= 6 && portMb.heard.length === portTs.heard.length && screen.size().height === 1800 && (await p.call("fs1", "info")).size.height === 1800);
     await view.setClipboard!({ type: "text", text: "pasted" } as never, true);
     await p.call(mbView, "setClipboard", { type: "text", text: "pasted" }, true);
     await view.setClipboard!({ type: "text", text: "" } as never, true);
     await p.call(mbView, "setClipboard", { type: "text", text: "" }, true);
     const copiedTs: Json[] = [];
-    view.watchClipboard!((c) => copiedTs.push(plain(c)));
+    view.watchClipboard!((c) => { copiedTs.push(plain(c)); wakeFarview(); });
     await p.call(mbView, "watchClipboard");
     for (const port of [portTs, portMb]) port.said({ copied: "copied words" });
     await until("the copy heard", () => copiedTs.length === 1 && p.entries.some((e) => e[0] === "clip"));

@@ -2624,7 +2624,7 @@ fn step_label(name : String) -> String {
     "Write" | "write" | "write_file" | "write_to_file" => "新建"
     "Glob" | "Grep" | "LS" | "ToolSearch" | "search_tool" | "mcp_list_tools" | "glob" | "grep" | "grep_search" | "find_by_name" | "find_file_by_name" | "list_dir" | "search" => "搜索"
     "Bash" | "bash" | "BashOutput" | "KillShell" | "exec_command" | "exec" | "shell" | "local_shell" | "write_stdin" | "wait" | "job_output" | "unified_exec" | "run_command" | "run_terminal_command" | "command_status" | "send_command_input" | "manage_task" => "命令"
-    "WebFetch" | "WebSearch" | "web_search" | "web_fetch" | "search_web" | "read_url_content" | "web__run" => "网页"
+    "WebFetch" | "WebSearch" | "web_search" | "web_fetch" | "search_web" | "read_url_content" | "web__run" => @sf.t("web-main.history.tool.web")
     "Task" | "Agent" | "spawn_agent" | "subagent" | "invoke_subagent" | "define_subagent" | "manage_subagents" | "swarm" | "send_message" | "SendMessage" | "followup_task" | "list_agents" | "wait_agent" => "代理"
     "chat_history" | "chat_list" | "chat_read" | "session_history" | "chat_archive" | "chat_leave" => "对话"
     "chat_post" | "chat_state" | "session_send" | "chat_create" | "feishu_api" | "slack_api" => "消息"
@@ -2779,9 +2779,12 @@ fn step_node(v : @view.View, src : Source, station : String, key : String, rk : 
   let step_said = if raw_said != "" { raw_said } else { fallback_said }
   let step_hint = if raw_hint != "" { raw_hint } else { fallback_hint }
   let render_summary = fn(sum : @view.View) {
-    let label = step_label(text(step, "name"))
-    let show_secondary_hint = label == "读取" || label == "编辑" || label == "新建" || label == "搜索"
-    steps_words(sum, fn() { label }, if failed { h_step_name_red } else { h_step_name })
+    let label = fn() { step_label(text(step, "name")) }
+    let show_secondary_hint = match @signals.untracked(label) {
+      "读取" | "编辑" | "新建" | "搜索" => true
+      _ => false
+    }
+    steps_words(sum, label, if failed { h_step_name_red } else { h_step_name })
     steps_box_node(sum, h_grow_clip, fn(c) {
       match (step_said, step_hint) {
         ("", hint) => steps_run(c, fn() { hint }, h_step_hint_line, mono=true)
@@ -3201,9 +3204,17 @@ fn open_tool_reader(title : String, raw_copy : String, body : (@view.View) -> Un
   @sf.panel_nodes(
     if title != "" { title } else { "查看内容" },
     fn(p, _) {
-      p.box(fn(b) {
-        @sf.style_node(b, fn() { @sf.panel_words_in_node(b).then(tool_reader_body) })
-        body(b)
+      // (what it holds scrolling in itself past the panel's share of the window, its title and foot where they are: a
+      // tall panel's body scrolls itself, panel_nodes' `tall`)
+      p.box(fn(room) {
+        room.scrolls(@view.Scroll::new(), slop=@ui.touch_slop(), bar=@ui.tree_scroll_bar(), fn(s) {
+          s.box(fn(b) {
+            @sf.style_node(b, fn() { @sf.panel_words_in_node(b).then(tool_reader_body) })
+            body(b)
+          })
+          |> ignore
+        })
+        |> ignore
       })
       |> ignore
     },

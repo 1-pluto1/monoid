@@ -60,6 +60,13 @@ test("global mesh enrollment is atomic, addresses are signed, and revocation pre
     assert.equal((await post("address",wrongCloud)).status,401);
     const removed = await admin("mesh-remove",{node});
     assert.equal(removed.status,200,await removed.text());
+    const operator = h.as(await h.login("alice"), "admin");
+    const auditResponse = await operator("GET", "/v1/admin/audit");
+    assert.equal(auditResponse.status, 200);
+    const audit = (await auditResponse.json() as any).audit;
+    assert.ok(audit.some((entry: any) => entry.action === "relay.token" && entry.target === "mesh test"));
+    assert.ok(audit.some((entry: any) => entry.action === "relay.remove" && entry.target === node));
+    assert.equal(JSON.stringify(audit).includes(invite), false, "audit must not contain enrollment tokens");
     assert.deepEqual(await list(),[]);
     assert.deepEqual((await next()).relays,[]);
     assert.equal((await reader.read()).done,true);

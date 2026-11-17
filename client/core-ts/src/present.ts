@@ -117,7 +117,7 @@ export function stamp(ms: number, c: Clock): Record<string, unknown> {
 }
 
 /// Times kept in seconds (still.fail cloud's) and in milliseconds (the station's).
-const SECONDS = new Set(["created_at", "expires_at", "used_at", "revoked_at", "last_seen", "lastSeen"]);
+const SECONDS = new Set(["created_at", "expires_at", "used_at", "revoked_at", "last_seen", "lastSeen", "updated_at", "delivered_at", "added_at"]);
 const MILLIS = new Set(["createdAt", "lastActiveAt", "lastUsedAt", "checkedAt", "resetsAt"]);
 /// The fields `times` says in words (`time`), each a moment.
 export const TIME_KEYS: readonly string[] = [...SECONDS, ...MILLIS];
@@ -274,7 +274,7 @@ export function times(value: unknown, c: Clock): unknown {
 /// What `times` puts in a value, for the test that holds it to how it was written before (present.test.ts).
 export const timesParts = { windows, resetsText, presentReset };
 
-const NO_TICK = new Set(["chats", "live", "thread", "letters", "history", "host", "net", "way", "stationNet", "status", "notices", "notify", "connection", "draft", "composer", "prefs", "doing", "slackTokens", "joinable", "memberships", "screenCard", "longJobs"]);
+const NO_TICK = new Set(["chats", "live", "thread", "letters", "history", "host", "net", "way", "stationNet", "status", "notices", "notify", "connection", "draft", "composer", "prefs", "doing", "slackTokens", "joinable", "memberships", "screenCard", "terminalCard", "longJobs"]);
 
 /// Whether a topic shows times in words, sent again each minute while shown.
 export function ticks(topic: Topic): boolean {
@@ -1450,6 +1450,11 @@ export function decorate(topic: Topic, value: unknown, c: Clock): unknown {
     // their bytes asked beside (peek-pictures.ts).
     case "linkPreview": {
       const shown = linkShown(v);
+      if (shown?.kind === "github_actions_run" && shown.startedAt > 0) {
+        if (!shown.finishedAt) byMinute();
+        value = { ...shown, elapsed: format.duration(Math.max(0, (shown.finishedAt ?? c.now) - shown.startedAt)) };
+        break;
+      }
       value = isObject(shown) && typeof shown.updatedAt === "number" && shown.updatedAt > 0 ? { ...shown, time: { updatedAt: stamp(shown.updatedAt, c) } } : shown;
       break;
     }

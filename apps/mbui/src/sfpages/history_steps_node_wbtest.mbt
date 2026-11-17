@@ -1,6 +1,36 @@
 // A reminder in an agent's history: its label stays readable beside a long first line, and its whole text opens below.
 
 ///|
+test "a web call's history row names the tool and the pages opened" {
+  for case in [("zh", "联网", "打开 2 个网页"), ("en", "Web", "Opening 2 web pages")] {
+    let (lang, label, said) = case
+    for w in [390.0, 900.0] {
+      steps_reset()
+      @sf.set_words(@sfbase.fill)
+      let src = @sffixture.fixture("history")
+      let step : Json = {
+        "name": "WebSearch",
+        "said": Json::string(said),
+        "hint": "",
+        "meta": "",
+        "call": "{\"open\":[{\"ref_id\":\"turn8search2\"},{\"ref_id\":\"turn6search1\"}]}",
+        "result": "",
+        "failed": false,
+      }
+      let t = @ui.Tester::new(fn(c) { @sf.begin(c) |> ignore }, w~, h=160.0, env=[("MBUI_LOCALE", lang)], tree=fn(root) {
+        @ui.set_tree_theme(@sf.ui_theme_now)
+        root.box(fn(v) { step_node(v, src, "ws1/st1", "s-c1", "web", Some(step)) }) |> ignore
+      })
+      t.draw()
+      assert_true(t.rect_of(label) is Some(_), msg="\{lang}, \{w}: web tool label")
+      assert_true(t.rect_of(said) is Some(_), msg="\{lang}, \{w}: page count")
+      assert_eq(t.audit(), [])
+    }
+  }
+  steps_reset()
+}
+
+///|
 test "history reminder keeps its label on one line beside a long note and opens it whole" {
   let first = "This is a new conversation: your earlier one in this session is no longer available."
   let note = first + "\nThe agent can continue here."
@@ -687,4 +717,56 @@ test "sent messages, received messages, and long turn-state reasons share statio
   assert_eq(t.corner_faults(), [])
   assert_eq(t.lit_all_faults(), [])
   steps_reset()
+}
+
+///|
+test "全屏查看's reader: what is longer than its room scrolls in it, its last line reached between its title and its foot" {
+  for case in [(390.0, 2), (900.0, 0)] {
+    let (w, platform) = case
+    @sf.presenters_reset()
+    let t = @ui.Tester::new(
+      fn(c) {
+        @sf.begin(c) |> ignore
+        c.with_theme(@sf.ui_theme(), fn() { @ui.old_views_here(c) })
+      },
+      w~,
+      h=600.0,
+      platform~,
+      tree=fn(root) {
+        @ui.set_tree_theme(@sf.ui_theme_now)
+        @sf.presented_nodes(root)
+      },
+    )
+    t.draw()
+    open_tool_reader("输出", "", fn(rb) {
+      for i in 0..<120 {
+        @sf.words_node(rb, fn() { "第\{i}行" }, fn() { @sf.paragraph }) |> ignore
+      }
+    })
+    t.run_for(@ui.move_most_ms * 2.0)
+    // (the last line drawn whole between the title's foot and the foot's button's top)
+    let shown = fn(s : String) {
+      let over = t.words().filter(fn(x) { x.0 == "输出" }).map(fn(x) { x.2 + x.4 }).last().unwrap_or(0.0)
+      let under = t.query(Button, label=@sf.t("common.done")).map(fn(r) { r.rect.1 }).unwrap_or(600.0)
+      t.words().any(fn(x) { x.0 == s && x.2 >= over && x.2 + x.4 <= under })
+    }
+    assert_true(shown("第0行"), msg="\{w}: its first line at first")
+    assert_true(!shown("第119行"), msg="\{w}: its last line not yet")
+    guard t.query(Dialog, label="输出") is Some(d) else {
+      // (on 小屏 a sheet: the wheel over its middle all the same)
+      for _ in 0..<40 {
+        t.wheel(w / 2.0, 400.0, 300.0)
+      }
+      t.run_for(@ui.move_most_ms * 2.0)
+      assert_true(shown("第119行"), msg="\{w}: its last line reached")
+      continue
+    }
+    for _ in 0..<40 {
+      t.wheel(d.rect.0 + d.rect.2 / 2.0, d.rect.1 + d.rect.3 / 2.0, 300.0)
+    }
+    t.run_for(@ui.move_most_ms * 2.0)
+    assert_true(shown("第119行"), msg="\{w}: its last line reached")
+    assert_eq(t.corner_faults(), [])
+  }
+  @sf.presenters_reset()
 }

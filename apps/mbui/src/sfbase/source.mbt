@@ -215,12 +215,15 @@ fn Source::topic_said(
   said : String,
 ) -> @signals.Computed[TopicState] {
   // (read as a card, a panel or a sheet is made: waited for by it before it comes in, @sf.OpenGate)
-  if @sf.open_gate_collecting() && (src.gates_opens)() {
-    let sig = topic_read_by(src, name, params, said)
+  let legacy_collecting = @sf.open_gate_collecting() && (src.gates_opens)()
+  let sig = topic_read_by(src, name, params, said)
+  if legacy_collecting {
     @sf.open_gate_note(fn() { topic_told(sig.get()) })
-    return sig
   }
-  topic_read_by(src, name, params, said)
+  if @view.hold_collecting() {
+    @view.hold_note(fn() { topic_told(sig.get()) })
+  }
+  sig
 }
 
 ///|
@@ -368,7 +371,7 @@ fn read_topic_state(src : Source, name : String, params : Map[String, Json]) -> 
 // what Home's bar shows of the stations' newer releases (`stationUpdates`: its key made again as Home was taken back).
 // kept across runs: a value (nothing of it changes)
 let lasting : Array[String] = [
-  "workspace", "stations", "stationNet", "profiles", "connects", "vaults", "usage", "archive", "chats", "longJobs", "changelog",
+  "workspace", "stations", "stationNet", "screens", "terminals", "profiles", "connects", "vaults", "usage", "archive", "chats", "longJobs", "changelog",
   "stationUpdates",
 ]
 

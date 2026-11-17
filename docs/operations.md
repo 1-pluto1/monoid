@@ -50,6 +50,14 @@ libs/mesh-transport/target/release/mesh-relay --global /path/to/global-relay-dat
 
 下面的配置与会话说明包含旧版本兼容字段。新安装使用 workspace 设置管理连接、账号和 station。
 
+### Claude Code 交互式 TUI
+
+在新对话、已有对话或预设的模型设置中选择 Claude Code，点击「运行模式」并选 TUI。已有对话从下次启动 Claude 进程起生效。默认模式为 Print，可在同一处切回。
+
+勾选「新对话默认使用 TUI」后，从当前设备新建的 Claude 对话会在支持 TUI 的 station 上优先使用 TUI。可以单独为其中一个对话选择 Print。已有对话和绑定了模型的预设沿用各自的运行模式。
+
+Claude Code 需要用该 profile 信任聊天的工作目录才能执行 hooks。在 Claude Code 中一次信任该 station 数据目录下的 `sessions`，即可覆盖其下的会话。组织策略禁用 hooks 时请使用默认模式。TUI 会话通过 MCP 发言，运行中收到的新消息由 station 排队，当前回合结束后投递。中断会结束该 TUI 进程，下次使用原会话的 transcript 恢复。重新生成标题使用默认模式。
+
 ## config.json
 
 也可以直接编辑，格式如下（改完需要重启 still.fail）：

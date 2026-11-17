@@ -1227,6 +1227,8 @@ fn tape_side_at(side : @view.View) -> SideAt {
     ground: if k <= 0.0 { apart_ground() } else { @sf.behind_ground(k~) },
     brand: side_brand_h(false, r.top),
     band: 1.0,
+    list_brand: side_brand_h(false, r.top),
+    list_band: 1.0,
     tape: true,
   }
 }
@@ -1296,7 +1298,7 @@ fn tape_side_node(pane : @view.View, src : Source) -> Unit {
     }, fn(b) { side_bar_node(b, src, r, shown, true, tips) })
     let front = fn() {
       match shown().1 {
-        front if side_node_tab(front) => front
+        front if side_node_tab(front) => full_elsewhere(r, front)
         _ => ""
       }
     }
@@ -1305,7 +1307,10 @@ fn tape_side_node(pane : @view.View, src : Source) -> Unit {
     // tab's nodes, 添加 in those corners too; a station's page its page's nodes; any other tab its old view)
     q.pick(at_once=true, front, fn(s, agent) {
       s.grow(Is(1.0)).shrink(Is(1.0)).basis(Is(Some(0.0))).min_height(Is(Some(0.0))) |> ignore
-      if agent == "" {
+      if agent == tab_full_mark {
+        // (over the whole window: nothing of it here meanwhile, tab_full_node.mbt)
+        ()
+      } else if agent == "" {
         behind(
           s,
           fn(c) {
@@ -1323,14 +1328,26 @@ fn tape_side_node(pane : @view.View, src : Source) -> Unit {
         .min_height(Is(Some(0.0)))
         |> ignore
       } else if @sfbase.view_tab_file(agent) is Some(_) {
-        side_view_node(s, src, r, agent)
+        tab_held_beside(s, r, agent)
+        side_view_node(s, src, r, agent, fn(n) { side_whole(src, n) }, full_of(r, agent))
       } else if tab_service(agent) is Some(job) {
+        tab_held_beside(s, r, agent)
         // (alone on the tape: its bar the panel's, its × closing the panel, in the panel's corners)
         let round = Some(beside_column(tape_pane_corners(Panel, true), tape_room_now().under))
         let alone = @signals.untracked(fn() { shown().0.length() == 1 && !column_short.get() })
-        service_tab_node(s, src, r, job, if alone { Some(fn() { side_change(src, r, "clear", None) }) } else { None }, round, tips)
+        service_tab_node(
+          s,
+          src,
+          r,
+          job,
+          if alone { Some(fn() { side_change(src, r, "clear", None) }) } else { None },
+          full_of(r, agent),
+          round,
+          tips,
+        )
       } else if tab_file(agent) is Some((session, path, name)) {
-        file_tab_node(s, src, r, session, path, name, tips)
+        tab_held_beside(s, r, agent)
+        file_tab_node(s, src, r, session, path, name, full_of(r, agent), tips)
       } else if side_screen_tab(agent) is Some(_) {
         side_screen_node(s, src, r, agent, fn() { shown().0 }, true)
       } else if side_adb_tab(agent) is Some(station) {
@@ -1346,6 +1363,8 @@ fn tape_side_node(pane : @view.View, src : Source) -> Unit {
       } else if side_station_tab(agent) is Some(station) {
         // (as wide as the panel on the tape is laid out now)
         side_station_node(s, src, station, tips, fn() { tape_room_now().panel_w }, true)
+      } else if side_terminal_tab(agent) {
+        side_terminal_node(s, src, r, agent)
       } else if side_own_tab(agent) {
         side_own_node(s, src, r, agent, tips, fn() {
           @sf.pane_round.val = Some(beside_column(tape_pane_corners(Panel, true), tape_room_now().under))
@@ -1576,10 +1595,7 @@ pub fn tape_under(c : @ui.Ctx, src : Source, w : Workspace, all : Array[Workspac
   wide.bar_ml = 0.0
   wide.bar_mr = 0.0
   wide.brand_h = side_brand_h(false, r.top)
-  wide.list_top = wide.brand_h
-  wide.list_band = 1.0
   wide.band = 1.0
-  list_room_told()
   wide.mark = 0.0
   land(src, w)
   // (beside the system's action at the column's foot, the cards' foot corners the one the composer stands concentric in

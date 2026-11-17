@@ -12,6 +12,7 @@
   const params = new URLSearchParams(location.search);
   const H = {};
   let cb = null;
+  let modifiersSaid = 0;
   let canvas, gl, prog, post, vao, instBuf, atlasTex, ta;
   const U = {}, PU = {};
   let cssW = 0, cssH = 0, dpr = 1;
@@ -19,7 +20,7 @@
   // the numbers of an instance (src/ui/scene.mbt)
   const INST = 60;
   let f32 = new Float32Array(INST * 4096);
-  let pending = false, pendingRaf = 0;
+  let pending = false;
   window.__logs = [];
 
   // ---- frames ----
@@ -37,7 +38,6 @@
   let frames = 0, inFrame = false;
   function tick() {
     pending = false;
-    pendingRaf = 0;
     resize();
     inFrame = true;
     const t = shotAt >= 0 ? clock : performance.now();
@@ -71,18 +71,9 @@
   H.requestFrame = () => {
     if (!pending && cb && known && window.__done === undefined && window.__shot === undefined) {
       pending = true;
-      pendingRaf = requestAnimationFrame(tick);
+      requestAnimationFrame(tick);
     }
   };
-  // The frame a touch asked for, drawn while the browser still handles that touch rather than at the display's next:
-  // iOS brings its soft keyboard up for a field focused (setIme's focus) only while a person's gesture is handled, and
-  // a requestAnimationFrame later is out of it, so a field tapped took the focus with no keyboard, which came up only on
-  // a second tap (its pointerdown's focus, setupInput). The display's frame asked for is called off: drawn once.
-  function frameInGesture() {
-    if (!pending || !pendingRaf || shotAt >= 0) return;
-    cancelAnimationFrame(pendingRaf);
-    tick();
-  }
   // A frame asked for what moves on by the clock that needs only `hz` a second (@hostapi.frames_paced: a slow fill, a
   // spinner): a browser says nothing of how often it refreshes, so it is the next animation frame, as request_frame_on.
   // (None at all till 2026-11-17: what moved on by the clock alone, paced, stood still between inputs.)
@@ -379,6 +370,8 @@
       canvas.width = w;
       canvas.height = h;
     }
+    // (the system's bars as the page's size changes: a phone turned, a window moved)
+    if (barsSetUp) barsNow();
   }
 
   // ---- WebGL2 renderer ----
@@ -2252,12 +2245,21 @@
     const had = narrowFaces.get(face);
     if (had !== undefined) return had;
     narrowFaces.set(face, false);
-    const files = faceFiles.get(face) || [];
-    Promise.all(files.map(([src, weight]) => {
-      const d = faceDescriptors(face, weight);
+    const cjk = cjkFiles.get(face);
+    const files = [...(faceFiles.get(face) || []), ...(cjk || [])];
+    Promise.all(files.map(([src, weight, desc]) => {
+      const d = desc ? { ...desc } : faceDescriptors(face, weight);
       d.featureSettings = d.featureSettings ? `${d.featureSettings}, "pwid" 1` : '"pwid" 1';
       const ff = new FontFace(`mbface${face}n`, src, d);
-      return ff.load().then(() => document.fonts.add(ff));
+      // (a CJK companion's (setCjkFace) kept with it, gone as it goes; one of its files the system has not: the rest
+      // narrow as they are)
+      return ff.load().then(() => {
+        if (desc) {
+          if (cjkFiles.get(face) !== cjk) return;
+          cjkLoaded.get(face).push(ff);
+        }
+        document.fonts.add(ff);
+      }, () => {});
     })).then(() => {
       if (narrowFaces.get(face) !== false) return;
       narrowFaces.set(face, true);
@@ -2310,8 +2312,79 @@
     }, () => {});
     return true;
   };
+  // A face's CJK companion (@webpage.set_cjk_face): the system's CJK faces drawn, within the face's family, for the
+  // CJK marks alone (its unicode-range: Han, kana, bopomofo, CJK punctuation, full-width forms; the Latin quotes and
+  // dashes left to the face itself), each of the nine weights set in the one `step` heavier (a Latin face's 400 beside
+  // a CJK face's 400 reads thin and grey), clamped to 100..900, by the families given (local names, the first the
+  // system has) or else PingFang SC, Noto Sans CJK SC, Source Han Sans SC. With no face of the app's own given (faceAdd)
+  // the face is taken for its CJK alone once any of them is there, the rest of the words in the page's own as before;
+  // where none is, nothing changes. Asked again, what it set before goes first.
+  const CJK_RANGE = 'U+2E80-2FDF, U+3000-303F, U+3040-30FF, U+3100-312F, U+3190-31FF, U+3400-4DBF, U+4E00-9FFF, ' +
+    'U+F900-FAFF, U+FE30-FE4F, U+FF00-FFEF, U+20000-2FA1F';
+  const CJK_FAMILIES = ['PingFang SC', 'Noto Sans CJK SC', 'Source Han Sans SC'];
+  // each weight's names in the families' own files, the nearest first
+  const CJK_WEIGHT_NAMES = {
+    100: ['Thin', 'Ultralight', 'ExtraLight'], 200: ['ExtraLight', 'Ultralight', 'Thin'], 300: ['Light', 'DemiLight'],
+    400: ['Regular', 'Normal'], 500: ['Medium'], 600: ['Semibold', 'SemiBold', 'Bold'], 700: ['Bold', 'Semibold'],
+    800: ['Heavy', 'ExtraBold', 'Black'], 900: ['Black', 'Heavy'],
+  };
+  const cjkSrc = (families, weight) => {
+    const out = [];
+    for (const fam of families) {
+      for (const name of CJK_WEIGHT_NAMES[weight]) {
+        out.push(`local(${JSON.stringify(`${fam} ${name}`)})`);
+        out.push(`local(${JSON.stringify(`${fam.replace(/ /g, '')}-${name}`)})`);
+      }
+      if (weight === 400) out.push(`local(${JSON.stringify(fam)})`);
+    }
+    return out.join(', ');
+  };
+  // each face's CJK files ([src, weight, descriptors], as faceFiles' for narrowFace) and the FontFaces put in the page
+  const cjkFiles = new Map();
+  const cjkLoaded = new Map();
+  const cjkForget = (face) => {
+    cjkFiles.delete(face);
+    for (const ff of cjkLoaded.get(face) || []) document.fonts.delete(ff);
+    cjkLoaded.delete(face);
+  };
+  H.setCjkFace = (face, weightStep, families) => {
+    if (!(face > 0 && face < 16) || typeof FontFace !== 'function') return false;
+    const step = Number.isFinite(weightStep) ? Math.round(weightStep / 100) * 100 : 100;
+    const fams = Array.isArray(families) && families.length ? families.map(String) : CJK_FAMILIES;
+    cjkForget(face);
+    const files = [];
+    for (let w = 100; w <= 900; w += 100) {
+      const drawn = Math.min(900, Math.max(100, w + step));
+      files.push([cjkSrc(fams, drawn), w, { weight: String(w), unicodeRange: CJK_RANGE }]);
+    }
+    cjkFiles.set(face, files);
+    const loaded = [];
+    cjkLoaded.set(face, loaded);
+    // (narrow already asked of the face: its CJK narrow too)
+    const narrow = narrowFaces.has(face);
+    const load = (family, [src, , desc], more) => {
+      const ff = new FontFace(family, src, { ...desc, ...more });
+      return ff.load().then(() => {
+        if (cjkFiles.get(face) !== files) return false;
+        document.fonts.add(ff);
+        loaded.push(ff);
+        return true;
+      }, () => false);
+    };
+    Promise.all([
+      ...files.map((f) => load(`mbface${face}`, f, {})),
+      ...(narrow ? files.map((f) => load(`mbface${face}n`, f, { featureSettings: '"pwid" 1' })) : []),
+    ]).then((took) => {
+      if (cjkFiles.get(face) !== files || !took.some((t) => t)) return;
+      faces.add(face);
+      textChanged();
+      H.requestFrame();
+    });
+    return true;
+  };
   H.faceClear = (face) => {
     faceFiles.delete(face);
+    cjkForget(face);
     narrowFaces.delete(face);
     if (!faces.delete(face)) return;
     for (const ff of [...document.fonts]) {
@@ -2360,6 +2433,12 @@
   // advances as the widest of the ten and is drawn centred in it (rasterize)
   const isDigit = (c) => c.length === 1 && c >= '0' && c <= '9';
   const tabWidth = (f) => Math.max(...'0123456789'.split('').map((d) => width(f, d)));
+  // a cluster that is a CJK unified ideograph (its first code point: the basic block and extension A, the
+  // compatibility ideographs, the supplementary planes' extensions)
+  const han = (c) => {
+    const cp = c.codePointAt(0);
+    return (cp >= 0x3400 && cp <= 0x9FFF) || (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0x20000 && cp <= 0x323AF);
+  };
 
   H.shape = (text, size, weight, style, out) => {
     const f = font(size, weight, style);
@@ -2375,14 +2454,21 @@
     const upTo = style & 8
       ? (w, i) => segs.slice(w, i + 1).map((s) => s.segment).join('\u200C')
       : (w, i) => text.slice(segs[w].index, segs[i].index + segs[i].segment.length);
+    // A Han character after a Han character starts a word of its own: no kerning pair joins two of them, so it
+    // advances by its own width, and a paragraph with no spaces is measured cluster by cluster, not as a prefix
+    // growing to its end at each (500 characters were 125,000 measured, a frame of 70-110 ms). Punctuation beside Han
+    // stays in its word, the spacing the browser trims there trimmed as before.
+    const starts = new Uint8Array(segs.length);
+    for (let i = 0; i < segs.length; i++) {
+      const c = segs[i].segment;
+      starts[i] = i === 0 || blank(segs[i - 1].segment) || (han(c) && han(segs[i - 1].segment)) ? 1 : 0;
+    }
     const xs = new Array(segs.length);
     let word = 0;
     for (let i = 0; i < segs.length; i++) {
       const c = segs[i].segment;
-      if (blank(c)) {
-        word = i + 1;
-        continue;
-      }
+      if (blank(c)) continue;
+      if (starts[i]) word = i;
       xs[i] = width(f, upTo(word, i)) - width(f, c);
     }
     let k = 0;
@@ -2394,11 +2480,11 @@
       if (blank(c)) {
         adv = width(f, c);
       } else {
-        const last = i + 1 >= segs.length || blank(segs[i + 1].segment);
+        if (starts[i]) word = i;
+        const last = i + 1 >= segs.length || blank(segs[i + 1].segment) || starts[i + 1];
         const end = last ? width(f, upTo(word, i)) : xs[i + 1];
         adv = Math.max(0, end - xs[i]);
       }
-      if (blank(c)) word = i + 1;
       if (style & 32 && isDigit(c)) adv = tabWidth(f);
       let key = -1;
       if (c === '\n') adv = 0;
@@ -2573,38 +2659,6 @@
     if (!active && document.activeElement === ta) ta.blur();
   };
 
-  // The input method's keyboard for the field about to type (@hostapi.ime_action, said before setIme: 0 none, 1 a
-  // search's, 2 an address's, 3 a number's, 4 a secret's, 5 an email address's, 6 words taken as typed), as the phones'
-  // hosts ask theirs (ios_app.m's keyboardType, MBView's EditorInfo): the textarea's inputmode, its Enter key's word,
-  // whether the keyboard corrects, spells or capitalises. A keyboard up for another field takes them only as it comes up
-  // again, so the textarea focused is let go and focused again by setIme after (the tap that moved the field still
-  // handled, frameInGesture: iOS keeps its keyboard up).
-  const imeKinds = [
-    {},
-    { inputmode: 'search', enterkeyhint: 'search' },
-    { inputmode: 'url', enterkeyhint: 'go', autocorrect: 'off' },
-    { inputmode: 'numeric', enterkeyhint: 'done', autocorrect: 'off' },
-    { autocorrect: 'off' },
-    { inputmode: 'email', autocorrect: 'off' },
-    { autocorrect: 'off' },
-  ];
-  let imeKind = 0, imeRefocus = false;
-  H.imeAction = (k) => {
-    const kind = imeKinds[k] ? k : 0;
-    if (kind === imeKind) return;
-    imeKind = kind;
-    const want = imeKinds[kind];
-    for (const name of ['inputmode', 'enterkeyhint', 'autocorrect']) {
-      if (want[name]) ta.setAttribute(name, want[name]);
-      else ta.removeAttribute(name);
-    }
-    if (document.activeElement === ta) {
-      imeRefocus = true;
-      ta.blur();
-      imeRefocus = false;
-    }
-  };
-
   // What an edit changed of the textarea's words `was`, to `now` with the caret at `caret`: [from, to, put], the words
   // of `was` from `from` to `to` replaced by `put`. What is after the caret is what it left alone, where `was` ends so
   // (an "a" put in before "aa" is put in there, though "aaa" could be read as it after them); the halves of a surrogate
@@ -2641,23 +2695,26 @@
     // (a touch screen's fingers each by its pointerId, as they come: kinds 10 down, 11 moved, 12 up, 13 called off, what
     // they come to the app's to work out, touches.mbt)
     const touch = (e) => e.pointerType === 'touch';
+    const modsOf = (e) => (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0);
+    const tellModifiers = (mods, force = false) => {
+      if (force || mods !== modifiersSaid) cb.key(0, mods);
+    };
     // (the canvas's, and what takes them in its place while a site is seen)
     takePresses = (el) => {
       el.addEventListener('pointerdown', (e) => {
         e.preventDefault();
+        // A key may have been held before the browser gained focus.
+        tellModifiers(modsOf(e));
         // (a box over a site goes as the app says, the press going on: `under` stays; when the canvas takes the
         // press, it stays too and can capture it itself)
         (el === canvas ? canvas : under || el).setPointerCapture(e.pointerId);
-        if (touch(e)) { ptr(10, e, e.pointerId); frameInGesture(); }
+        if (touch(e)) ptr(10, e, e.pointerId);
         else ptr(0, e, e.button);
         // keep the keyboard on the textarea while an editor has focus
         if (imeActive) ta.focus({ preventScroll: true });
       });
       el.addEventListener('pointermove', (e) => (touch(e) ? ptr(11, e, e.pointerId) : ptr(1, e, 0)));
-      el.addEventListener('pointerup', (e) => {
-        if (touch(e)) { ptr(12, e, e.pointerId); frameInGesture(); }
-        else ptr(2, e, e.button === 2 ? 2 : 0);
-      });
+      el.addEventListener('pointerup', (e) => (touch(e) ? ptr(12, e, e.pointerId) : ptr(2, e, e.button === 2 ? 2 : 0)));
       el.addEventListener('pointercancel', (e) => (touch(e) ? ptr(13, e, e.pointerId) : ptr(3, e, 0)));
       // A move or a capture transfer between the app's own input layers is not leaving the window. Leaving them for
       // a site or the outside is: nothing of the app is hovered there.
@@ -2684,7 +2741,12 @@
     const keymap = { Backspace: 1, Delete: 2, ArrowLeft: 3, ArrowRight: 4, ArrowUp: 5, ArrowDown: 6, Enter: 7, Home: 8, End: 9, PageUp: 15, PageDown: 16, Escape: 17, Tab: 18 };
     // the browser's own shortcuts left to it (reload, close, a new tab or window, the address bar, quit, zoom)
     const browsers = new Set(['r', 'w', 't', 'n', 'l', 'q', 'v']);
-    const modsOf = (e) => (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0);
+    // Modifier-only keys are input too. Other keys keep their normal path, including browser shortcuts.
+    const modifiers = new Set(['Shift', 'Control', 'Alt', 'Meta', 'OS']);
+    const modifierKey = (e) => { if (modifiers.has(e.key)) tellModifiers(modsOf(e), true); };
+    window.addEventListener('keydown', modifierKey, true);
+    window.addEventListener('keyup', modifierKey, true);
+    window.addEventListener('blur', () => tellModifiers(0, true));
     const command = (e) => keysCmd() === 8 ? e.metaKey : e.ctrlKey;
     const browserKey = (e, c) => command(e) && (browsers.has(c) ||
       (!e.altKey && !(e.ctrlKey && e.metaKey) && ['+', '=', '-', '0'].includes(c)));
@@ -2757,7 +2819,7 @@
     // the phones' apps' do (or setIme would take the focus back and the keyboard come up again). (The page sent behind
     // blurs the textarea too, and leaves it the focused element.)
     ta.addEventListener('blur', () => {
-      if (!imeRefocus && imeActive && keyboardOver() > 0 && document.activeElement !== ta) {
+      if (imeActive && keyboardOver() > 0 && document.activeElement !== ta) {
         cb.text(7, '', 0, 0);
         H.requestFrame();
       }
@@ -3530,7 +3592,10 @@
     canvas.addEventListener('webglcontextrestored', contextRestored);
     setupGL();
     setupInput();
-    cb = { frame, pointer, wheel, key, text };
+    setupPage();
+    // Remember what every key told the app, including one received with a modifier already held.
+    modifiersSaid = 0;
+    cb = { frame, pointer, wheel, key: (code, mods) => { modifiersSaid = mods; key(code, mods); }, text };
     window.__mb = cb;
     resize();
     // (the app's first frame once the host knows what it decodes and whether its terminal Wasm is beside it)
@@ -3539,6 +3604,84 @@
       H.requestFrame();
     });
   };
+
+  // ---- the page round the app: the keys held, the system's bars, its title and colour, its history ----
+  // The keys held down that change what a press does (@hostapi.mods_held: shift 1, control 2, alt 4, command 8, as a
+  // key's own are told), as the last input the window had says them; none once it is left (blurred, hidden), where its
+  // keys' going up is never seen.
+  let modsNow = 0;
+  H.modsHeld = () => modsNow;
+  // How far the system reaches in over the canvas (a phone's notch, its home indicator: the page laid out under them,
+  // index.html's viewport-fit=cover), as CSS's env(safe-area-inset-*) says, read off a probe padded by them; said on
+  // the system's channel (@hostapi.system_said's `bars`) as it changes, none said while it is none. The soft keyboard
+  // up, the app is laid out above it already (keyboardOver): nothing under it is the system's. (Said as it is found:
+  // as the page's size is measured for a frame, resize, the app takes it between that frame and the next.)
+  let barsProbe = null, barsSaid = '0,0,0,0', barsSetUp = false;
+  function barsNow() {
+    if (!barsProbe && document.body && document.body.appendChild) {
+      barsProbe = document.createElement('div');
+      const st = barsProbe.style;
+      st.position = 'fixed';
+      st.left = st.top = '0';
+      st.width = st.height = '0';
+      st.visibility = 'hidden';
+      st.pointerEvents = 'none';
+      st.paddingTop = 'env(safe-area-inset-top, 0px)';
+      st.paddingRight = 'env(safe-area-inset-right, 0px)';
+      st.paddingBottom = 'env(safe-area-inset-bottom, 0px)';
+      st.paddingLeft = 'env(safe-area-inset-left, 0px)';
+      document.body.appendChild(barsProbe);
+    }
+    if (!barsProbe || !window.getComputedStyle) return;
+    const cs = window.getComputedStyle(barsProbe);
+    const px = (v) => { const n = parseFloat(v); return n > 0 ? n : 0; };
+    const top = px(cs.paddingTop), right = px(cs.paddingRight), left = px(cs.paddingLeft);
+    const bottom = keyboardOver() > 0 ? 0 : px(cs.paddingBottom);
+    const now = [top, bottom, left, right].join(',');
+    if (now === barsSaid) return;
+    barsSaid = now;
+    H.post('system', JSON.stringify({ bars: { top, bottom, left, right } }));
+  }
+  H.barsNow = barsNow;
+  // The page's history (@webpage.location, history_*: the app's calls `mbui.page.*`, host_js.mbt): where it is (its
+  // path, query and fragment), a place put on or in place of the one it is at, and back; a place the browser went to
+  // itself (its back and forward, a person's swipe) said on @webpage.history_channel as `{"location": …}`.
+  const where = () => location.pathname + location.search + location.hash;
+  H.historyLocation = where;
+  H.historyPush = (to) => { history.pushState(null, '', to); };
+  H.historyReplace = (to) => { history.replaceState(null, '', to); };
+  H.historyBack = () => { history.back(); };
+  // The page's title and the colour of what the browser draws round it (its bar, what shows past the page's edges):
+  // @webpage.set_title, set_theme_color (a CSS colour; "" the page's own again).
+  H.setPageTitle = (t) => { document.title = t; };
+  H.setThemeColor = (c) => {
+    const meta = document.querySelector && document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', c);
+    document.documentElement.style.backgroundColor = c;
+    if (document.body) document.body.style.backgroundColor = c;
+  };
+  function setupPage() {
+    const held = (e) => { modsNow = (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0); };
+    for (const name of ['pointerdown', 'pointermove', 'pointerup', 'keydown', 'keyup', 'wheel']) {
+      window.addEventListener(name, held, { capture: true, passive: true });
+    }
+    const none = () => { modsNow = 0; };
+    window.addEventListener('blur', none);
+    document.addEventListener('visibilitychange', none);
+    // Escape is the app's (a layer closed): kept from the browser, which would take it for its own (leaving its full
+    // screen, its focus), but not from an input method composing, whose Escape calls its words off. The app is still
+    // told it (setupInput's keydown).
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !e.isComposing && e.keyCode !== 229) e.preventDefault();
+    }, { capture: true });
+    // (and as the page's size is measured again: resize)
+    const barsChanged = () => { barsNow(); };
+    window.addEventListener('orientationchange', barsChanged);
+    window.visualViewport?.addEventListener('resize', barsChanged);
+    window.addEventListener('popstate', () => { H.post('history', JSON.stringify({ location: where() })); });
+    barsSetUp = true;
+    barsNow();
+  }
 
   // ---- mbui-render (src/render, scripts/render_web.mjs): no frames, no input ----
   // The canvas the size a window's would be, its text at the list's scale; a frame is drawn into it as any

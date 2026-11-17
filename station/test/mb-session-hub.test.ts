@@ -298,11 +298,12 @@ const PROFILES: Json[] = [
 test("models, profiles and the words of a run changed, as the TypeScript has them", { skip }, async () => {
   const p = await opened();
   const models = ["claude-opus-5-5", "anthropic/claude-opus-5-5", "claude-opus-5-5[1m]", "Claude-Opus-5-5", "gemini-4-hydrogen", "gemini-4-hydrogen-high", "gemini-4-carbon-low",
-    "fusion-claude-opus-5-5-high-sidekick-swe-2", "fusion-claude-opus-5-5-sidekick-swe-2-medium", "swe-2", "gpt-6-astra", "openai/gpt-6.1-sol", "gpt-5", "o4-mini", "deepseek-v4-pro",
+    "fusion-claude-opus-5-5-high-sidekick-swe-2", "fusion-claude-opus-5-5-sidekick-swe-2-medium", "swe-2", "gpt-6-astra", "openai/gpt-6.1-sol", "gpt-6.2-astra", "openai/gpt-6.2-sol", "gpt-5", "o4-mini", "deepseek-v4-pro",
     "qwen3-coder-480b", "llama-3.1-70b", "unknown-model", "claude-fable-5-2-20261101", "glm-4.6", "kimi-k2", "grok-5", "fusion-swe-2-sidekick-claude-sonnet-5-5-high", ""];
   for (const m of models) {
     await both(p, "modelName", modelName, m);
     await both(p, "ultrafastModel", ultrafastModel, m);
+    await both(p, "ultrafastModel", ultrafastModel, m, ["gpt-6.2-astra", "gpt-6.2-sol"]);
     for (const prof of PROFILES) {
       await both(p, "spelling", spelling, prof, m);
       await both(p, "runs", runs, prof, m);
@@ -336,7 +337,7 @@ test("models, profiles and the words of a run changed, as the TypeScript has the
   // run-change.ts, context-cap.ts
   const row = (o: Json) => ({ runtime: "claude", model: "claude-opus-5-5", effort: "high", fast: null, speed: null, profile: "cc", profilePinned: false, context: null, ...o });
   const names = { cc: "Claude A", cx: "Codex" };
-  const rows = [row({}), row({ model: null }), row({ effort: null }), row({ fast: true }), row({ speed: "ultrafast" }), row({ profile: "cx" }), row({ runtime: "codex", model: "gpt-6-astra", profile: "cx" }), row({ profile: "gone" }), row({ runtime: "nope" })];
+  const rows = [row({}), row({ model: null }), row({ effort: null }), row({ fast: true }), row({ speed: "ultrafast" }), row({ tui: true }), row({ profile: "cx" }), row({ runtime: "codex", model: "gpt-6-astra", profile: "cx" }), row({ profile: "gone" }), row({ runtime: "nope" })];
   for (const r of rows) await both(p, "runShown", (x: Json, n: Json) => runChange.runShown(x, (id) => n[id] ?? null), r, names);
   for (const a of rows) {
     for (const b of rows) {
@@ -1192,6 +1193,7 @@ test("a handover and its taking up, runners nobody holds, a profile gone, as hub
   await pair.advance(1_800_000_000_000);
   await pair.call("accept", "cl", msg({ threadTs: "1000.000001", ts: "1000.000001" }));
   await pair.call("accept", "cl", msg({ threadTs: "1100.000001", ts: "1100.000001" }));
+  await pair.call("accept", "cl", msg({ threadTs: "1300.000001", ts: "1300.000001" }));
   await pair.call("accept", "gpt", msg({ threadTs: "1200.000001", ts: "1200.000001", text: "<@UGPT> go" }));
   pair.both((s) => s.setRunning("gpt:C1:1200.000001", true));
   pair.both((s) => s.startTurn("t-1", "gpt:C1:1200.000001", "normal"));
@@ -1199,10 +1201,12 @@ test("a handover and its taking up, runners nobody holds, a profile gone, as hub
     pair.a.states = {
       "cl:C1:1000.000001": { state: "warm", idleSince: pair.now - 1000 },
       "cl:C1:1100.000001": { state: "cold", holds: true },
+      "cl:C1:1300.000001": { state: "running" },
       "gpt:C1:1200.000001": { state: "running" },
     };
   });
-  // A profile gone under its sessions: moved where another runs them.
+  // A profile gone under its sessions (#6948): only the one with a turn under way moved where another runs it; the idle
+  // one's process ended, the cold one left as it is.
   await pair.call("profileGone", "cc");
   pair.compareStores("a profile gone");
   // Handed over: held, every actor's snapshot taken (those cold and holding nothing closed), the drivers let go.
@@ -1303,6 +1307,9 @@ test("how a session runs changed, its usage now, and going on afresh, as lifecyc
   }
   for (let i = 0; i < 22; i++) await pair.call("say", made[1].id, "a@x.com", `message ${i}`);
   await pair.call("toldLongChat", key);
+  await pair.call("configure", key, { tui: true });
+  await pair.call("configure", key, { effort: "high" });
+  await pair.call("configure", key, { tui: false });
   // Changed: going on afresh alone, another model and effort, a profile pinned, back to the pool, another runtime, a
   // most context under what it holds, a speed, refused ones.
   await pair.call("configure", key, { afresh: true });
