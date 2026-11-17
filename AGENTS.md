@@ -38,10 +38,25 @@ chats, each conversation an agent session on a **station** (a machine of theirs)
 
 ## Changes, checks and CI
 
-- One pull request per piece of work, from `origin/main`. Merging to main deploys the beta (`.github/workflows/pipeline.yml`,
-  `scripts/plan.sh`: what each path deploys), so main is always releasable.
-- A bug's fix merges once its newest commit's checks passed; a change to the product or to what people see, when
-  the owner has said so (the user, 2026-10-31).
+### Pull requests and evidence
+
+- Make one pull request per request, from `origin/main`. Split it only when a maintainer asks. External contributions
+  follow the stricter rule: one issue per pull request (the user, 2026-11-17).
+- Squash each task into one commit before its first pull request. After that, append commits without a squash.
+- Use the requester's GitHub account when local `gh` has it. Otherwise use CommaBot and add
+  `Co-authored-by: Name <requester-email>` to the commits (the user, 2026-11-17).
+- End the pull request description with the model or models that completed the work and the test frameworks used.
+- UI changes need before-and-after images. Changes to animation or timing also need a short video.
+  Upload PR evidence to GitHub and link it in the description. Never commit screenshots or other assets made only
+  for the PR (the user, 2026-11-17).
+- Merging to main deploys the beta (`.github/workflows/pipeline.yml`, `scripts/plan.sh`: what each path deploys), so
+  main is always releasable. A bug's fix merges once its newest commit's checks passed; a change to the product or
+  to what people see, when the owner has said so (the user, 2026-10-31).
+
+### Commit and pull request messages
+
+- Use `.agents/skills/ste-writing/SKILL.md` for commit messages and pull request titles and descriptions.
+  Commit subjects use `{type}({scope}): {description}`, for example `feat(server): add mesh routes`.
 - What people will notice of a change is said in its commit message's trailers: `Changelog:` a line for them, in
   Chinese (`修复：…`, `新增：…`, `改进：…`); `Changelog-parts:` where they see it (`station`, `web`, `android`,
   `desktop`, `cloud`); `Fixes: FB-<n>` a bug report it fixes. The apps' changelog and each stable release's notes
@@ -51,6 +66,9 @@ chats, each conversation an agent session on a **station** (a machine of theirs)
   release's notes; one of an experimental feature names where it is turned on (`新增：实验性功能「对话列表看板视图」中，…`).
   The change that opens it to stable writes its line for stable then. A line already written otherwise is said again in
   `docs/changelog-notes.json`.
+
+### Checks and compatibility
+
 - `sh scripts/check.sh full origin/main..HEAD` checks what the range changed (the git hooks run its quick part);
   `STILLFAIL_CHECK_PART` narrows it. Run the part you changed before a PR; the whole of it is CI's.
 - A fix that cannot wait a day for the next stable release (a crash, data lost, people locked out, a release that does

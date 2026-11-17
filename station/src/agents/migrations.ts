@@ -177,6 +177,7 @@ export const NOTES: [number, string][] = [
   [170, "Moving to another station is a test-channel feature of the station's: on a station updated on the stable channel there is no station_move tool and your instructions do not name skill stillfail-move."],
   [171, "Skill stillfail-browser now covers Farview (driven with its agent.exe, not DevTools) as well as Chrome, and `browser {engine}` to switch."],
   [172, "station_task `dir` now brings a repository's Git submodules too: the target checks each out in the mirror at the commit the source has before the command runs (its commit must be pushed, or in the target's own clones); see skill stillfail-jobs."],
+  [173, "relays action enroll (name) now issues a one-use workspace mesh relay enrollment token, valid for 24 hours. Keep it private; it grants forwarding only and is redeemed at the issuing station. list includes registered mesh nodes; revoke (node) asks the issuing station to remove one."],
 ];
 
 /// The last note that replaces every one before it (the instructions rewritten whole): a session behind it hears only

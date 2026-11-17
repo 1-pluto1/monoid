@@ -398,7 +398,7 @@ const PARTS: Record<string, Part> = {
   // The station's iroh and image codecs, a Node addon ( §3); the core on Node (its tests,
   // apps/mbui's e2e peer) uses it too.
   mesh: {
-    ...stationCrate("station/native/mesh", MESH_LIB, "mesh.node", VENDORED),
+    ...stationCrate("station/native/mesh", MESH_LIB, "mesh.node", ["client/shell/src/mesh.rs", "libs/mesh-transport/src", "libs/mesh-transport/Cargo.toml", ...VENDORED]),
     targets: STATION_BINS,
     env: "STILLFAIL_MESH_NATIVE",
   },
@@ -421,7 +421,7 @@ const PARTS: Record<string, Part> = {
   "iroh-wasm": {
     files: () => ["stillfail_iroh_wasm.js", "stillfail_iroh_wasm.d.ts", "stillfail_iroh_wasm_bg.wasm", "stillfail_iroh_wasm_bg.wasm.d.ts"],
     targets: ["wasm32"],
-    inputs: ["client/iroh-wasm", "client/Cargo.toml", "client/Cargo.lock", ...VENDORED],
+    inputs: ["client/iroh-wasm", "libs/mesh-transport/src", "libs/mesh-transport/Cargo.toml", "client/Cargo.toml", "client/Cargo.lock", ...VENDORED],
     recipe: () => ({ script: "client/iroh-wasm/build.sh" }),
     build(_t, out) {
       const target = targetDir(join(ROOT, "client/target"), "iroh-wasm");
@@ -438,7 +438,7 @@ const PARTS: Record<string, Part> = {
     files: (t) => (t === "win32-x64" ? ["stillfail_shell.dll", "stillfail_shell.dll.lib", "tests"] : ["libstillfail_shell.so"]),
     targets: ["android-arm64", "win32-x64", "linux-x64", "linux-arm64"],
     msvc: true,
-    inputs: ["client/shell", "client/Cargo.toml", "client/Cargo.lock", "vendor/libadb", ...VENDORED],
+    inputs: ["client/shell", "libs/mesh-transport/src", "libs/mesh-transport/Cargo.toml", "client/Cargo.toml", "client/Cargo.lock", "vendor/libadb", ...VENDORED],
     recipe: (t) =>
       t === "win32-x64" ? { cargo: SHELL_TESTS, rustflags: SHELL_WIN_RUSTFLAGS, xwin: XWIN }
       : LINUX(t) ? { cargo: shellLinux(t) }
@@ -479,7 +479,7 @@ const PARTS: Record<string, Part> = {
   "shell-station": {
     files: () => ["libstillfail_shell.a"],
     targets: ["linux-x64", "linux-arm64", "win32-x64"],
-    inputs: ["client/shell", "client/Cargo.toml", "client/Cargo.lock", "vendor/libadb", ...VENDORED],
+    inputs: ["client/shell", "libs/mesh-transport/src", "libs/mesh-transport/Cargo.toml", "client/Cargo.toml", "client/Cargo.lock", "vendor/libadb", ...VENDORED],
     recipe: (t) => ({ cargo: shellStation(t) }),
     build(t, out) {
       const target = targetDir(join(ROOT, "client/target"), "shell-station");
@@ -495,7 +495,7 @@ const PARTS: Record<string, Part> = {
   "shell-apple": {
     files: () => ["libstillfail_shell.a", "libstillfail_shell.libs"],
     targets: ["darwin-arm64", "ios-arm64", "ios-sim-arm64"],
-    inputs: ["client/shell", "client/Cargo.toml", "client/Cargo.lock", "vendor/libadb", ...VENDORED],
+    inputs: ["client/shell", "libs/mesh-transport/src", "libs/mesh-transport/Cargo.toml", "client/Cargo.toml", "client/Cargo.lock", "vendor/libadb", ...VENDORED],
     recipe: (t) => ({ cargo: shellApple(t), min: APPLE_MIN[t], c: appleCOldest(t) }),
     build(t, out) {
       const triple = APPLE_TRIPLES[t]!;
