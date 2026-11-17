@@ -2,8 +2,8 @@
 # cache_prune.mbt): the build caches saved each commit, run or content otherwise fill the repository's 10 GB, and GitHub
 # then evicts what is read seldom and needed (WARP, the emulator's images, MoonBit), which the jobs that need them fail
 # without. After main's runs of the workflows that save them went through, and each half hour: a branch's run, or one
-# that failed or was cancelled, started one each (a run every minute, 37% of the repository's runs, 2026-11-17), and a
-# newer one takes the place of one still waiting.
+# that failed or was cancelled, started one each (a run every minute, 37% of the repository's runs, 2026-11-17), its
+# job skipped; a newer prune takes the place of one still running.
 name: cache-prune
 on:
   workflow_run:
@@ -32,6 +32,12 @@ jobs:
       cancel-in-progress: true
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    # (the job's, not the workflow's: a branch's run started one each minute, which took the workflow's group, cancelled
+    # the prune running then, and was itself skipped by the `if` above: none came through for hours and the caches came
+    # to 27 GB, MoonBit's and main's evicted, 2026-11-17. A job its `if` skips takes no group.)
+    concurrency:
+      group: cache-prune
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
         with:
