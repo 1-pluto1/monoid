@@ -1871,8 +1871,9 @@ fn CardHand::up(self : CardHand) -> Unit {
 }
 
 ///|
-/// A draft's card (待派发's): its words, where it is to run, 开始 at its top end; held long (or right clicked), its menu
-/// (立即派发, 删除). Never dragged, wide or narrow: a finger on it scrolls its column.
+/// A draft's card (待派发's): its words, where it is to run, 开始 at its top end; pressed, its words are edited in
+/// place; held long (or right clicked), its menu (立即派发, 删除). Never dragged, wide or narrow: a finger on it scrolls
+/// its column.
 fn draft_card(
   row : @view.View,
   src : Source,
@@ -1884,6 +1885,15 @@ fn draft_card(
   let d = fn() { (own.drafts_by)().get(id) }
   let title = fn() {
     d().map(fn(d) { if d.title == "" { d.files.get(0).map(fn(f) { f.name }).unwrap_or("") } else { d.title } }).unwrap_or("")
+  }
+  let editing = @signals.signal(false)
+  let edit_field = @ui.Field::new()
+  let edit_ws = Ref("")
+  let edit = fn() {
+    edit_ws.val = @signals.untracked(own.ws)
+    // (its own words, not the name of its first file standing in for them)
+    edit_field.set(@signals.untracked(fn() { d().map(fn(d) { d.title }).unwrap_or("") }))
+    editing.set(true)
   }
   let card_at : Ref[@view.View?] = Ref(None)
   // (started from `from` in the window: its chat's card flies in from there, board_chat_card's)
@@ -1933,7 +1943,10 @@ fn draft_card(
     let st = d().map(fn(d) { d.station }).unwrap_or("")
     own.stations_by.get(st)
   }
-  row.box(fn(w) {
+  row.pick(fn() { editing.get() }, at_once=true, fn(w, is_editing) {
+  if is_editing {
+    draft_edit_card(w, src, edit_ws.val, id, edit_field, editing)
+  } else {
   let lifted = lift.node(w)
   w.box(fn(card) {
     card_at.val = Some(card)
@@ -1959,7 +1972,7 @@ fn draft_card(
     card.on_menu(fn(e) { menu(e.wx, e.wy, false) }) |> ignore
     @sf.presses_held_node(
       card,
-      fn() {  },
+      edit,
       @ui.long_press_ms,
       // (held long by a finger: lifted, its menu; a mouse's button held is a press as long as any)
       fn(e) {
@@ -2007,9 +2020,93 @@ fn draft_card(
   })
   |> ignore
   card_corner_key(w, tips, fn() { true }, "play", fn() { board_words("start") }, start)
+  }
   })
-  |> ignore
   ignore(lane)
+}
+
+///|
+/// The draft's words in its card: Enter or 保存 keeps them, Escape or 取消 leaves them as they were. A press outside
+/// keeps what was written before reaching its target, as does the card leaving the virtual list.
+fn draft_edit_card(
+  parent : @view.View,
+  src : Source,
+  ws : String,
+  id : String,
+  field : @ui.Field,
+  editing : @signals.Signal[Bool],
+) -> Unit {
+  let done = Ref(false)
+  let keep = fn() { @sfbase.board_draft_edit(src, ws, id, @signals.untracked(fn() { field.text() })) }
+  let finish = fn(save : Bool) {
+    if !done.val {
+      done.val = true
+      if save { keep() }
+      editing.set(false)
+    }
+  }
+  let valid = fn() { !field.text().trim(chars=" \n\r\t").is_empty() }
+  let foot_in = fn() { @sf.card_corner - @sf.theme().control_h / 2.0 }
+  let save_in = fn() { (@sf.theme().control_h - @sf.button_height()).max(0.0) / 2.0 }
+  parent.box(fn(card) {
+    card.ground(By(fn() { @sf.theme().p.card })).radius(Is(@sf.card_corner)).padding(By(fn() { (foot_in(), card_pad, foot_in(), foot_in()) })).gap(Is(12.0)) |> ignore
+    card.owns(fn() { if !done.val { keep() } }) |> ignore
+    card.on_key(fn(k) {
+      if k.code == @ui.key_escape && k.mods == 0 {
+        finish(false)
+        true
+      } else {
+        false
+      }
+    }) |> ignore
+    let words = card.box(fn(w) {
+      w.padding(By(fn() { (card_pad - foot_in(), 0.0, card_pad - foot_in(), 0.0) })) |> ignore
+    })
+    let typed = @ui.field(
+      words,
+      field,
+      placeholder=board_words("placeholder"),
+      label=board_words("placeholder"),
+      max_lines=5,
+      enter_sends=true,
+      leaves=[@ui.key_escape],
+      submitted=fn(_) { if @signals.untracked(valid) { finish(true) } },
+      size_by=fn() { @sf.theme().t.ui },
+      colors_by=fn() {
+        let p = @sf.theme().p
+        (p.text, p.subtle, p.accent)
+      },
+    )
+    typed.min_height(Is(Some(32.0))) |> ignore
+    // (the cursor in it as it is made, once what made it is done; and again as it comes to take input, the change that
+    // put it in the card's place committed whole (View::takes_input): where the host gives the focus by where it is
+    // (a browser's), or where what was pressed still holds it, as soon as it can have it)
+    @signals.after_flush(fn() { typed.ask_focus() |> ignore })
+    typed.reacts(fn() { typed.takes_input() }, fn(takes) {
+      if takes && !done.val && !@signals.untracked(fn() { typed.focused() }) {
+        typed.ask_focus() |> ignore
+      }
+    })
+    let opened = @signals.untracked(fn() { card.window_downs() })
+    card.reacts(fn() { card.window_downs() }, fn(count) {
+      if count > opened && !done.val {
+        let (x, y) = card.window_down_point()
+        let (left, top, w, h) = card.placed_window_now()
+        if x < left || x >= left + w || y < top || y >= top + h {
+          finish(true)
+        }
+      }
+    }, at_start=false)
+    card.box(fn(foot) {
+      foot.row(Is(true)).gap(Is(6.0)).lines_up(Is(Some(Middle))) |> ignore
+      foot.box(fn(space) { space.grow(Is(1.0)) |> ignore }) |> ignore
+      @sf.button_node(foot, fn() { board_words("cancel") }, fn() { finish(false) }) |> ignore
+      foot.box(fn(k) {
+        k.margin(By(fn() { (0.0, 0.0, save_in(), save_in()) })).shrink(Is(0.0)) |> ignore
+        @sf.button_node(k, fn() { @sf.t("common.save") }, fn() { finish(true) }, tone=Primary, disabled=fn() { !valid() }) |> ignore
+      }) |> ignore
+    }) |> ignore
+  }) |> ignore
 }
 
 ///|
