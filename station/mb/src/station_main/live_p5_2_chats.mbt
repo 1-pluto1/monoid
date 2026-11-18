@@ -579,6 +579,17 @@ fn P52::fs_op(_self : P52, op : String, args : Array[Json]) -> Json raise {
       _ => ""
     }
   }
+  // What to write: a string's UTF-8, or the bytes a route gave (`{"$bytes": base64}`).
+  let data = (i : Int32) => {
+    match args.get(i) {
+      Some(String(x)) => @utf8.encode(x)
+      Some(Object({ "$bytes": String(b), .. })) =>
+        @base64.decode(b) catch {
+          _ => b""
+        }
+      _ => b""
+    }
+  }
   let fail = (e : Error) => {
     match e {
       @drive.FsError(f) => @session_chats.Thrown(f.code, f.message)
@@ -591,11 +602,56 @@ fn P52::fs_op(_self : P52, op : String, args : Array[Json]) -> Json raise {
         @utf8.decode_lossy(@drive.read_all(s(0)) catch { e => raise fail(e) }),
       )
     "writeFile" => {
-      if !write_text_mode(s(0), s(1), 0) {
+      // (node's `flag: "wx"`: refused where the file is there, as the hub's uploads ask it)
+      if args.get(2) is Some(Object({ "flag": String("wx"), .. })) &&
+        attempt(() => @drive.lstat(s(0))) is Ok(_) {
+        raise @session_chats.Thrown(
+          "EEXIST",
+          "EEXIST: file already exists, open '\{s(0)}'",
+        )
+      }
+      if live_write_ffi(live_c(s(0)), data(1), 0) != 0 {
         raise @session_chats.Thrown("EIO", "EIO: i/o error, open '\{s(0)}'")
       }
       Json::null()
     }
+    "appendFile" => {
+      // (the hub's uploads add each part at the file's end, making it with the first)
+      // (made only where it is not there: another failure is the append's, never a part written over)
+      let had = match attempt(() => @drive.stat(s(0))) {
+        Ok(st) => Some(st.size)
+        Err(@drive.FsError(f)) if f.code == "ENOENT" => None
+        Err(e) => raise fail(e)
+      }
+      ignore(
+        @drive.write_part(s(0), {
+          create: had is None,
+          offset: had.unwrap_or(0.0),
+          data: data(1),
+          at_least: None,
+          truncate: None,
+          sync: false,
+        }) catch {
+          e => raise fail(e)
+        },
+      )
+      Json::null()
+    }
+    "access" => {
+      ignore(@drive.stat(s(0)) catch { e => raise fail(e) })
+      Json::null()
+    }
+    "statfs" =>
+      // (statfs's fields: blocks of one byte each, as the disk's sizes say them)
+      match disk_of(s(0)) {
+        Some((free, total)) =>
+          { "blocks": jn(total), "bavail": jn(free), "bsize": jn(1.0) }
+        None =>
+          raise @session_chats.Thrown(
+            "ENOENT",
+            "ENOENT: no such file or directory, statfs '\{s(0)}'",
+          )
+      }
     "rename" => {
       @drive.rename(s(0), s(1)) catch {
         e => raise fail(e)
@@ -613,8 +669,19 @@ fn P52::fs_op(_self : P52, op : String, args : Array[Json]) -> Json raise {
       Json::null()
     }
     "copyFile" => {
-      @drive.copy_file(s(0), s(1)) catch {
-        e => raise fail(e)
+      // (node's copyFile replaces what is there unless its mode says COPYFILE_EXCL (1); the drive's never does)
+      let excl = match args.get(2) {
+        Some(Number(m, ..)) => (m.to_int() & 1) == 1
+        _ => false
+      }
+      if excl {
+        @drive.copy_file(s(0), s(1)) catch {
+          e => raise fail(e)
+        }
+      } else {
+        copy_file_over(s(0), s(1)) catch {
+          e => raise fail(e)
+        }
       }
       Json::null()
     }
@@ -628,9 +695,18 @@ fn P52::fs_op(_self : P52, op : String, args : Array[Json]) -> Json raise {
       Json::null()
     }
     "readdir" =>
-      Json::array(
-        (@drive.names(s(0)) catch { e => raise fail(e) }).map(Json::string),
-      )
+      // (`withFileTypes`: each entry's name and whether it is a folder, as the routes read it)
+      if args.get(1) is Some(Object({ "withFileTypes": True, .. })) {
+        Json::array(
+          (@drive.readdir(s(0)) catch { e => raise fail(e) }).map(d => {
+            ({ "name": Json::string(d.name), "dir": Json::boolean(d.is_dir) } : Json)
+          }),
+        )
+      } else {
+        Json::array(
+          (@drive.names(s(0)) catch { e => raise fail(e) }).map(Json::string),
+        )
+      }
     "readdirTypes" => {
       let names = @drive.names(s(0)) catch { e => raise fail(e) }
       Json::array(
@@ -1488,6 +1564,15 @@ async fn P52::tools_call(
       let title = jtext(row, "title")
       rjs(@session_hub.agent_name(title, s(0)))
     }
+    // (paths.ts `joinPath`: a path given whole stays as it is)
+    "ops/paths.joinPath" =>
+      rjs(
+        if is_windows() {
+          @ops_platform.win_join(s(0), s(1))
+        } else {
+          @ops_platform.unix_join(s(0), s(1))
+        },
+      )
     "os.hostname" => rjs(hostname())
     "ops/version.version" => rjs(self.bus.version)
     "agents.pageOf" =>
