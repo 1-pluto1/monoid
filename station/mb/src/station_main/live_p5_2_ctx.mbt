@@ -599,7 +599,7 @@ fn P52::last_station_said(self : P52, key : String) -> Json raise {
   }
   let entries = jitems(self.store("entriesBefore", [jfield(jfield(latest, "thread"), "id"), Json::null(), ji(1)]))
   match entries.last() {
-    Some(last) if jtext(last, "authorKind") == Some("station") => jfield(last, "text")
+    Some(last) if jtext(last, "authorKind") is Some("station" | "ember" | "stillfail") => jfield(last, "text")
     _ => Json::null()
   }
 }
