@@ -763,7 +763,7 @@ fn pane_aside_at(src : Source, n : @view.View) -> Double {
 /// wide as it is.
 fn pane_fold_held(src : Source, n : @view.View, serial : Int) -> @sfbase.ColumnLaid {
   let ww = n.window().0
-  guard @sfbase.workspace_in_view(src).0 is Some(w) else { return { by: 0.0, across: 0.0, laid: ww } }
+  guard @sfbase.workspace_in_view(src).0 is Some(w) else { return { by: 0.0, across: 0.0, laid: ww, toward: ww, toward_by: 0.0 } }
   let (_, now) = fold_target(src, w, ww)
   let t = fold_drawn_at(n)
   let pane = ww - fold_along(t, now).col
@@ -773,7 +773,7 @@ fn pane_fold_held(src : Source, n : @view.View, serial : Int) -> @sfbase.ColumnL
   match (fold_goes.from, fold_goes.to) {
     (Some(a), Some(b)) if fold_going(t) =>
       laid_toward(pane - beside, ww - a.col - beside, ww - b.col - beside)
-    _ => { by: 0.0, across: 0.0, laid: pane - beside }
+    _ => { by: 0.0, across: 0.0, laid: pane - beside, toward: pane - beside, toward_by: 0.0 }
   }
 }
 
