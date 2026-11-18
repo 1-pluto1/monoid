@@ -51,6 +51,7 @@ import * as marks from "./marks.ts";
 import { lineForViewer, stageFields } from "../chat-stage.ts";
 import { usageView } from "./usage.ts";
 import { usageSummary } from "./usage-summary.ts";
+import { agentRates } from "./agent-rates.ts";
 import { fleetView } from "./fleet.ts";
 import { stationUpdates } from "./station-updates.ts";
 import { chatsCard, usageCard } from "./rail-cards.ts";
@@ -97,7 +98,7 @@ export const WINDOW_UNTOLD = 50;
 /// (`stationsWhole` is the core's own: a scope's stations, each its page with the models it can run, as `stations` was
 /// before its items were rows. choose.ts reads it for a model's choice and its borrowing; no UI asks it, and protocol.ts
 /// does not offer it.)
-const VIEW_TOPICS = new Set(["chats", "chatRow", "chatSearch", "search", "stations", "station", "stationPart", "stationsWhole", "profiles", "profilesWhole", "profilesOverview", "profile", "connects", "connect", "connectCandidates", "chat", "history", "agentCard", "stationNet", "archive", "workspaceMarks", "chatJobs", "chatLetters", "chatThings", "chatOutline", "imageNear", "longJobs", "usage", "fleet", "railCard", "stationUpdates", "settings", "resources", "adminList", "adminItem", "adminOverview", "adminRelays", "workspaceWays"]);
+const VIEW_TOPICS = new Set(["chats", "chatRow", "chatSearch", "search", "stations", "station", "stationPart", "stationsWhole", "profiles", "profilesWhole", "profilesOverview", "profile", "connects", "connect", "connectCandidates", "chat", "history", "agentCard", "stationNet", "archive", "workspaceMarks", "chatJobs", "chatLetters", "chatThings", "chatOutline", "imageNear", "longJobs", "usage", "agentRates", "fleet", "railCard", "stationUpdates", "settings", "resources", "adminList", "adminItem", "adminOverview", "adminRelays", "workspaceWays"]);
 
 /// What a chat row's columns say that the views find rows by (db/account.ts): how urgent it is for its person
 /// (workspace marks), whether it asks something of them, what its agents are doing as its list's row says it.
@@ -1030,6 +1031,8 @@ export class Views implements Owner {
   readonly #chatWindows = new Map<string, number>();
   /// The latest chats' things read (`#things`), by station and thread, with what they were read from.
   readonly #thingsKept = new Map<string, Derived<{ messages: J[]; things: ReturnType<typeof thingsOf>; whole: boolean; title: unknown } | null>>();
+  /// Names of the sessions shown in live rates, recomputed only when the underlying chat or session changes.
+  readonly #rateNames = new Map<string, Derived<{ title: string | null; model: string | null; chat: string | null }>>();
   /// A chat's outline's rows (`outlineRows`), by the message each was made of, and what else it was made with.
   readonly #outlineMade = new WeakMap<object, { by: unknown; offset: number; item: J }>();
   /// A chat's outline's message's day and whether it is the viewer's (`#chatOutline`), by the message, and what else
@@ -1344,6 +1347,10 @@ export class Views implements Owner {
         // (and its accounts, as the profiles page reads them: each subscription's allowance)
         perStation = (s) => [{ topic: "stationUsage", station: s }, { topic: "link", station: s }, { topic: "overview", station: s }];
         break;
+      case "agentRates":
+        scope = view.scope as string;
+        perStation = (s) => [{ topic: "stationRates", station: s }];
+        break;
       case "fleet":
         // (the card shared of the agents at work: views/fleet.ts)
         scope = view.scope as string;
@@ -1565,6 +1572,23 @@ export class Views implements Owner {
       });
       this.#stationsNamed.set(scope, kept);
     }
+    return kept.get();
+  }
+
+  /// Rate events are frequent, while names change rarely. Keep the reads separate from the rate's computation, so an
+  /// update does not query every displayed session again or push the other views' reads out of the chat cache.
+  #rateName(station: string, key: string): { title: string | null; model: string | null; chat: string | null } {
+    const id = JSON.stringify([station, key]);
+    let kept = this.#rateNames.get(id);
+    if (kept === undefined) kept = computed(() => {
+      const chat = this.#core.data.chatNamedOfAgent(station, key);
+      const session = this.#core.data.listedSummary(station, key);
+      const model = str(get(session, "model"));
+      return { title: chat?.title ?? str(get(session, "title")), model: model === null ? null : format.agentLabel(model, null), chat: chat?.id ?? null };
+    });
+    this.#rateNames.delete(id);
+    this.#rateNames.set(id, kept);
+    if (this.#rateNames.size > 64) this.#rateNames.delete(this.#rateNames.keys().next().value!);
     return kept.get();
   }
 
@@ -1987,6 +2011,14 @@ export class Views implements Owner {
         const offset = this.#core.host.utcOffsetMin(now);
         const summary = usageSummary(sources, now, offset, String(get(this.ok({ topic: "workspace", workspace: scope }), "name") ?? ""));
         return { ok: { ...usageView(sources, typeof view.days === "number" ? view.days : 7, now, offset, this.me(scope), members_, { split: view.split, only: view.only, day: view.day }, accounts), ...(summary !== null ? { summary } : {}) } };
+      }
+      case "agentRates": {
+        const stations = this.#stationsOr(view.scope as string);
+        if (stations === undefined || !Array.isArray(stations)) return stations as Value | undefined;
+        return { ok: agentRates(stations.map((s) => ({
+          address: s.address, name: s.name, value: this.ok({ topic: "stationRates", station: s.address }),
+          named: (key: string) => this.#rateName(s.address, key),
+        }))) };
       }
       case "fleet": {
         const scope = view.scope as string;

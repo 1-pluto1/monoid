@@ -87,6 +87,7 @@ export const ASKED: Record<string, Record<string, unknown> & { topic: string }> 
   "history": { topic: "history", station, key },
   "agentCard": { topic: "agentCard", station, key },
   "usage": { topic: "usage", scope: "ws", days: 7 },
+  "agentRates": { topic: "agentRates", scope: "ws" },
   "fleet": { topic: "fleet", scope: "ws" },
   "railCard": { topic: "railCard", scope: "ws", place: "chats" },
   "railCard usage": { topic: "railCard", scope: "ws", place: "usage" },
@@ -247,6 +248,9 @@ function noticesHeard(notices: Notices, rows: [string, J[]][]): void {
 
 type Rig = ReturnType<typeof setup>;
 
+/// Twenty active sessions, as the station's event stream holds them; a later event changes their rates.
+const ratesOf = (added = 0) => ({ online: true, supported: true, items: Array.from({ length: 20 }, (_, i) => ({ key: `live-${i}`, rate: 10 + i + added })) });
+
 /// What the rig is given of the workspace, as the sync first writes it: a station's chat list as one its station makes is
 /// written once read (sync.ts `#made`: whole, each row at its place, rows-made.ts `sharedPlace`); the rest set.
 function given(t: Rig, topic: Topic, value: unknown): void {
@@ -369,6 +373,7 @@ export async function held(long = false, on: { host?: FakeHost; cold?: boolean }
     // (what comes of the network as the sync reads it: the topics no table holds, and each up station's devices)
     const setLive = () => {
       for (const [topic, value] of [...fixture(base, chat), ...more(base)]) if (!holds(topic)) t.set(topic, value);
+      t.set({ topic: "stationRates", station }, ratesOf());
       for (const [i, station] of UP.entries()) devices!.heard(station, "devices", devicesSaid(base, i));
     };
     return { t, base, chat, first: new Map<string, J>(), during: async (_f: () => void, _ms: number) => new Map<string, J[]>(), notices: notices!, devices: devices!, presets: presetViews!, screensAre, setLive, names };
@@ -378,6 +383,7 @@ export async function held(long = false, on: { host?: FakeHost; cold?: boolean }
   // topic nothing watches is not kept: the core's station topics read what is watched).
   for (let round = 0; round < 2; round++) {
     for (const [topic, value] of [...fixture(base, chat), ...more(base)]) given(t, topic, value);
+    t.set({ topic: "stationRates", station }, ratesOf());
     t.data.putItems("entry", OUTLINED.station, String(OUTLINED.thread), outlinedLog(base));
     for (const key of CHAT.keys) t.data.putItems("transcript", CHAT.station, key, key === CHAT.keys[0] ? transcriptOf(base) : []);
     for (const [i, station] of UP.entries()) devices!.heard(station, "devices", devicesSaid(base, i));
@@ -565,6 +571,8 @@ export const CAUSES: Record<string, Cause> = {
       t.store.invalidateAll((topic) => topic.topic === "changelog");
     },
   },
+  // Each cause advances the shared test clock. Append this one so it does not shift the timing of earlier causes.
+  rates: { run: ({ t }) => t.set({ topic: "stationRates", station }, ratesOf(1)) },
 };
 
 /// What goes out to each of `ASKED` as each cause happens, on a rig of its own (the chat's six pages' too where it is
