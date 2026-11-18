@@ -226,6 +226,13 @@ fn pick_params(station : String, of : String) -> Map[String, Json] {
 }
 
 ///|
+/// The core offers models another station could lend, with a filter off each time the panel opens. A station with
+/// no models of its own still opens the panel so those models can be shown and borrowed.
+fn triple_other_stations(v : Json?) -> Bool {
+  field(v, "otherStations") is Some(True) || field(v, "otherStations") is Some(False)
+}
+
+///|
 /// What the panel picked changed (`pick.set`): only what is given.
 fn pick_draft(src : Source, station : String, of : String, patch : Map[String, Json]) -> Unit {
   let p = pick_params(station, of)
@@ -368,7 +375,7 @@ pub fn model_triple(
   guard v is Some(Object(_)) else { return }
   let value = field(v, "value")
   // (a face is drawn only of a control that runs on a model: there are models to pick)
-  let offers = face is Some(_) || items(v, "options").length() > 0
+  let offers = face is Some(_) || items(v, "options").length() > 0 || triple_other_stations(v)
   let vo = field(v, "valueOption")
   let account = field(v, "account")
   let me = station + "\u{1}" + of
@@ -438,9 +445,11 @@ pub fn model_triple(
       let name = if model == "" {
         @sf.t("web-main.model.pick")
       } else {
-        match text(vo, "name") {
-          "" => model
-          n => n
+        // (a model not among those listed here: the name the core knows it by, never its id)
+        match (text(vo, "name"), text(v, "modelText")) {
+          ("", "") => model
+          ("", n) => n
+          (n, _) => n
         }
       }
       // (within the room it has, the most it can say: what matters least left out first, as the web's DROPS: who
@@ -564,7 +573,7 @@ pub fn model_triple_node(parent : @view.View, src : Source, station : String, of
       .min_width(Is(Some(0.0)))
       |> ignore
       @sf.hover_ground_node(b, extra=fn() { opened.get() })
-      let can = fn() { items(v(), "options").length() > 0 && !doing(dkey) }
+      let can = fn() { (items(v(), "options").length() > 0 || triple_other_stations(v())) && !doing(dkey) }
       @sf.presses_node(b, fn() {
         guard @signals.untracked(can) && triple.open != me else { return }
         triple.asked = ""
@@ -605,9 +614,11 @@ pub fn model_triple_node(parent : @view.View, src : Source, station : String, of
           if model == "" {
             @sf.t("web-main.model.pick")
           } else {
-            match text(vo(), "name") {
-              "" => model
-              n => n
+            // (a model not among those listed here, none of this station's: the name the core knows it by, never its id)
+            match (text(vo(), "name"), text(v(), "modelText")) {
+              ("", "") => model
+              ("", n) => n
+              (n, _) => n
             }
           }
         }, fn() { triple_name })
@@ -958,6 +969,7 @@ fn triple_body_node(
       let foot_two_lines = (foot_chips >= 2 && ww < 340.0) || (foot_chips >= 3 && ww < 440.0) || foot_chips >= 4
       let sheet_rest = (if at == "" { 60.0 } else { 72.0 }) +
         (if at == "" && options().length() > 8 { 42.0 } else { 0.0 }) +
+        (if triple_other_stations(vv) { @sf.theme().items.least } else { 0.0 }) +
         (if all_efforts().length() > 0 { 50.0 } else { 0.0 }) +
         (if field(vv, "borrow") is Some(Object(_)) { 30.0 } else { 0.0 }) +
         85.0 +
@@ -1193,6 +1205,10 @@ fn triple_body_node(
       // (a group's head over its rows, whichever way it opened)
       out.append(g.1)
     }
+    // (none of this station's, its other stations' not asked: said so, and where they are, never a blank column)
+    if out.is_empty() && triple_other_stations(v()) && !flag(v(), "otherStations") {
+      out.push("none/here")
+    }
     out
   }
   let first_level = fn(parent : @view.View) {
@@ -1267,6 +1283,12 @@ fn triple_body_node(
           }
           if k.has_prefix("head/") {
             triple_column_head_node(r, @sf.t("web-main.combos.label"))
+          } else if k.has_prefix("none/") {
+            r.box(fn(e) {
+              @sf.style_node(e, fn() { triple_empty })
+              @sf.words_node(e, fn() { @sf.t("web-main.model.noneHere") }, fn() { triple_muted_lines }) |> ignore
+            })
+            |> ignore
           } else if k.has_prefix("apart/") {
             r.box(fn(a) { @sf.style_node(a, fn() { triple_apart }) }) |> ignore
           } else if k.has_prefix("model/") {
@@ -1368,14 +1390,50 @@ fn triple_body_node(
       }
     })
   }
-  // beside what opened it, its title (and its search) over the models (heads_itself)
-  let models_head = fn(parent : @view.View) {
+  let plain_head = fn(parent : @view.View) {
     parent.pick(fn() { options().length() > 8 }, fn(x, finds) {
       if finds {
         @sf.panel_head_node(x, fn() { @sf.t("android-chat.new.model") }, end=fn(e) { triple_find_node(e, contents) }) |> ignore
       } else {
         @sf.panel_head_node(x, fn() { @sf.t("android-chat.new.model") }) |> ignore
       }
+    })
+  }
+  // whose models it lists, where another station could lend some: this station's, or every station's (the core's
+  // `otherStations`), in the title's place, a choice of two
+  let scope_node = fn(parent : @view.View) {
+    // (the small one, as wide as its two words, not the page's: it stands in a title's place)
+    @sf.seg_node(
+      parent,
+      fn() { [@sf.t("web-main.model.here"), @sf.t("web-main.model.everywhere")] },
+      fn() { if flag(v(), "otherStations") { 1 } else { 0 } },
+      fn(i) { pick_draft(src, station, of, { "otherStations": Json::boolean(i == 1) }) },
+      each_own=true,
+    )
+    |> ignore
+  }
+  // beside what opened it, its title (and its search) over the models (heads_itself); the choice of whose models in
+  // the title's place where another station could lend some
+  let models_head = fn(parent : @view.View) {
+    parent.pick(fn() { triple_other_stations(v()) }, fn(y, scoped) {
+      if scoped {
+        // (the choice on the title's line; the search, where there is one, on a line of its own under it, the
+        // column's width: beside the choice it had not the room)
+        y.box(fn(h) {
+          @sf.style_node(h, fn() { triple_scope_head })
+          h.box(fn(c) { @sf.style_node(c, fn() { triple_scope_choice }, in_row=true); scope_node(c) }) |> ignore
+        })
+        |> ignore
+        y.show(fn() { options().length() > 8 }, fn(e) {
+          e.box(fn(f) {
+            @sf.style_node(f, fn() { triple_search })
+            triple_find_node(f, contents)
+          })
+          |> ignore
+        })
+        return
+      }
+      plain_head(y)
     })
   }
   // (beside what opened it no wider than its first level needs, 2026-10-26 用户「没啥内容也这么宽感觉会很奇怪」; wider
@@ -1441,6 +1499,14 @@ fn triple_body_node(
             |> ignore
           })
         }
+        // (whose models it lists, over them, where another station could lend some: models_head's choice)
+        body.show(fn() { triple_other_stations(v()) }, fn(sh) {
+          sh.box(fn(h) {
+            @sf.style_node(h, fn() { triple_scope_head })
+            scope_node(h)
+          })
+          |> ignore
+        })
         models(body)
         // its name and a stop for each level on one row across the sheet, the one it is at said in the thumb (stops):
         // as many levels as a model has on one line in any language, nothing opened over the sheet to pick one
@@ -2856,6 +2922,21 @@ let triple_picked : @ui.TextStyle = @ui.text_style(size=Ui, weight=Medium, color
 let triple_muted : @ui.TextStyle = @ui.text_style(size=Meta, color=Muted, wrap=false)
 
 ///|
+/// What a column says where it has nothing to list, on as many lines as it takes.
+// kept across runs: a value (no field of it changes)
+let triple_muted_lines : @ui.TextStyle = @ui.text_style(size=Meta, color=Muted, w=Full)
+
+///|
+/// The head of the models where whose models they are is a choice (models_head's): the choice at its start, the
+/// search at its end.
+// kept across runs: a value (no field of it changes)
+let triple_scope_head : @ui.Style = @ui.css("row w=Full pb=S1_5 gap=S3 align=ACenter")
+
+///|
+// kept across runs: a value (no field of it changes)
+let triple_scope_choice : @ui.Style = @ui.css("row")
+
+///|
 // kept across runs: a value (no field of it changes)
 let triple_amber : @ui.TextStyle = @ui.text_style(size=Ui, color=WarnInk, wrap=false)
 
@@ -3039,7 +3120,8 @@ let triple_borrow : @ui.Style = @ui.css("w=Full px=S2_5 py=S1_5")
 
 ///|
 // kept across runs: a value (no field of it changes)
-let triple_who_room : @ui.Style = @ui.style(row=true, w=@sf.grow, align=ACenter, gap=S2)
+// Keep the first and last capsules at the panel's side insets when the body is wider than their words.
+let triple_who_room : @ui.Style = @ui.style(row=true, w=@sf.grow, align=ACenter, justify=JBetween, gap=S2)
 
 ///|
 // kept across runs: a value (no field of it changes)

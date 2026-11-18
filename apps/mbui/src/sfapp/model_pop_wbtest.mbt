@@ -14,6 +14,62 @@ fn model_pop(mode : String, font_scale? : Double = 1.0) -> @ui.Tester {
 }
 
 ///|
+test "the station's own and shared models are shown first; other stations are asked for and hidden again on reopening" {
+  for win in corner_windows {
+    for lang in ["zh", "en"] {
+      for scale in [1.0, 1.3] {
+        let bare = fn(f : String) { f.split(" (at ").collect()[0].to_owned() }
+        let held = screen_in("newchat", win, lang, font_scale=scale).audit().map(bare)
+        let t = screen_in("newchat-station-models", win, lang, font_scale=scale)
+        let here = @sf.t("web-main.model.here")
+        let label = @sf.t("web-main.model.everywhere")
+        assert_eq(t.get(Radio, label=here).check, Some(On))
+        assert_eq(t.get(Radio, label~).check, Some(Off))
+        assert_true(t.query(Button, label="Opus 5.5") is Some(_))
+        assert_true(t.query(Button, label="Sonnet 5") is Some(_), msg="already shared here")
+        assert_true(t.query(Button, label="GPT-6") is None)
+        assert_eq(t.audit().map(bare).filter(fn(f) { !held.contains(f) }), [], msg="\{win.0}-\{lang} \{scale}: \{t.audit().join("\n")}")
+        t.click(Radio, label~)
+        t.run_for(squeeze_opening)
+        assert_eq(t.get(Radio, label~).check, Some(On))
+        assert_true(t.query(Button, label="GPT-6") is Some(_))
+        assert_eq(new_fix.model, "claude-opus-5-5", msg="the filter never selects a model")
+        assert_eq(t.audit().map(bare).filter(fn(f) { !held.contains(f) }), [], msg="\{win.0}-\{lang} \{scale}: \{t.audit().join("\n")}")
+        t.click(Button, label="Opus 5.5")
+        t.run_for(squeeze_opening)
+        // The Medium fixture keeps its sidebar over the new chat. Close it before opening the model panel again.
+        if t.query(Button, has="Opus 5.5") is None {
+          t.click(Button, label=@sf.t("web-main.sidebar.close"))
+          t.run_for(squeeze_opening)
+        }
+        t.click(Button, has="Opus 5.5")
+        t.run_for(squeeze_opening)
+        assert_eq(t.get(Radio, label=here).check, Some(On))
+        assert_true(t.query(Button, label="GPT-6") is None)
+      }
+    }
+  }
+}
+
+///|
+test "a model panel with none of this station's says so, and still shows those another station could lend" {
+  for win in [corner_windows[0], corner_windows[5]] {
+    let t = screen_in("newchat-station-empty", win, "zh")
+    // (none of this station's: said so, the way to the others' beside it)
+    assert_eq(t.get(Radio, label="本机").check, Some(On))
+    assert_true(t.find("本机没有可用的模型") is Some(_))
+    assert_true(t.query(Button, label="Opus 5.5") is None && t.query(Button, label="GPT-6") is None)
+    t.click(Radio, label="所有 station")
+    t.run_for(squeeze_opening)
+    assert_true(t.query(Button, label="GPT-6") is Some(_))
+    t.click(Radio, label="本机")
+    t.run_for(squeeze_opening)
+    assert_true(t.query(Button, label="GPT-6") is None)
+    assert_eq(t.get(Radio, label="本机").check, Some(On))
+  }
+}
+
+///|
 test "wide, short names: the model's panel as wide as what it holds, not as wide as it may be" {
   let t = model_pop("newchat-model")
   let (px, _, pw, _) = t.get(@ui.Role::Dialog).rect
