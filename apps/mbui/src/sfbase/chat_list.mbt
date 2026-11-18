@@ -1637,7 +1637,7 @@ pub fn row_keys(
 ) -> (Array[Entry], Array[String]) {
   let info = c.list_info_as(key, follows)
   let following = match info {
-    Some(i) => i.at_end || i.gliding || i.following_row
+    Some(i) => i.at_end || i.gliding
     None => true
   }
   rd.following_row = match info {
@@ -2055,11 +2055,12 @@ pub fn follow_newest(c : @ui.Ctx, rd : Reading, list : Array[Entry], keys : Arra
   let newest = if at >= 0 { keys[at] } else { "" }
   let info = c.list_info_as(key, follows)
   let following = match info {
-    Some(i) => i.at_end || i.gliding || i.following_row
+    Some(i) => i.at_end || i.gliding
     None => false
   }
   let came = rd.placed && rd.newest != "" && newest != rd.newest && following
   let at_end = info is Some(i) && i.at_end
+  let gliding = info is Some(i) && i.gliding
   if came && at >= 0 && own_row(list[at]) && at_end {
     rd.follow_key = ""
     c.list_follow_from(key, -1)
@@ -2074,7 +2075,7 @@ pub fn follow_newest(c : @ui.Ctx, rd : Reading, list : Array[Entry], keys : Arra
       if keys[i] == rd.follow_key {
         // the viewer's own, sent from up the list: glided to as a row followed is (its words flying there), then on
         // to the end from there
-        if own_row(list[i]) && at_end && !came {
+        if own_row(list[i]) && (at_end || !gliding) && !came {
           rd.follow_key = ""
           c.list_to_end(key)
         } else {
