@@ -273,6 +273,8 @@ export const PREF_SHAPES: Record<string, Shape> = {
     ["what", "String", { said: true, doc: "Its row's state line without its lead (待处理 · , 需要你处理：, 出错：): what it asks, what it needs,\nwhy it stopped. (The line whole, `text`, stays the core's: no UI draws it, and 待处理 lists every chat that waits.)" }],
     ["seq", opt("u64"), { doc: "The waiting card's post (`decision.dismiss`), for `wait`; its last message (`chat.read`), for `done`." }],
     ["failure", opt("String"), { doc: "This failure, for `alert`: what to keep as let go (忽略: `prefs.set {failsGone: {<workspace>: [failure]}}`).\nThe same chat failing again is another." }],
+    ["login", opt("String"), { doc: "For `wait`: the login its waiting card is of (a login to finish in the browser), told the person in the app\nonce as it comes while they are elsewhere. Absent for any other card or need." }],
+    ["loginEnds", opt("i64"), { client: opt("I54"), doc: "With `login`, under way: when it runs out of time (ms since 1970), for the app to say how long is left as\nit goes. Absent where the station has not told it." }],
     ["at", "i64"],
   ], { doc: "A chat in 待处理 (`WorkspaceMark.items`)." }),
   NotifyView: struct([

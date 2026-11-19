@@ -46,6 +46,7 @@ import { KINDS as THING_KINDS, OUTLINE_FOUND, isVideo, mediaDays, thingsHaving, 
 import { archive, archiveSearch } from "./archive.ts";
 import { Local, PENDING_PREFIX } from "./local.ts";
 import { askAnswers } from "./vault.ts";
+import * as logins from "../station/machine-logins.ts";
 import { stationsGuard } from "./lock.ts";
 import * as marks from "./marks.ts";
 import { lineForViewer, noTurnBegun, stageFields } from "../chat-stage.ts";
@@ -878,6 +879,9 @@ export type ViewsEnv = {
   resume?: (topic: Topic) => void;
   /// How much of a chat is on the device (station/topics.ts `held`); none where not given.
   held?: (station: string, thread: number) => { held: number; of: number; whole: boolean };
+  /// A login of a station's as its station last told it (station/machine-logins.ts): the program it is to (gh, gcloud)
+  /// and, under way, when it runs out of time; null where it has not been told. What 待处理 says of a login's card.
+  loginOf?: (station: string, id: string) => { name: string; ends: number | null } | null;
   /// How agents' requests about vault items are answered on this device, from the vault as the core holds it
   /// (views/vault.ts askAnswers): each `{answer, lasts?}`, in the order asked.
   vaultAnswers?: (workspace: string, asks: VaultAskOf[]) => J[];
@@ -910,6 +914,12 @@ export function envOf(core: Inner): ViewsEnv {
     data: core.data,
     waits: (topic) => core.stationTopics.waits(topic),
     held: (station, thread) => core.stationTopics.held(station, thread),
+    loginOf: (station, id) => {
+      const l = logins.held(core.stations.link(station)).logins.find((x) => x.id === id);
+      if (!l || typeof l.name !== "string" || l.name === "") return null;
+      const active = l.endedAt === undefined || l.endedAt === null;
+      return { name: l.name, ends: active && typeof l.expiresAt === "number" && l.expiresAt > 0 ? l.expiresAt : null };
+    },
     emailOf: (workspace) => {
       const sub = owner(workspace);
       return sub === null ? null : (core.accounts.list().find((a) => a.sub === sub)?.email ?? null);
@@ -1570,6 +1580,11 @@ export class Views implements Owner {
   /// offline to connecting made both workspaces' marks again, 4-7 ms in Hermes on a Mac Studio at a workspace of real
   /// size (2026-11-11).
   readonly #stationsNamed = new Map<string, Derived<{ address: string; name: string }[]>>();
+  /// A login of a station's, as its station last told it (null: not told): its program, when it runs out of time.
+  loginOf(station: string, id: string): { name: string; ends: number | null } | null {
+    return this.#core.loginOf?.(station, id) ?? null;
+  }
+
   stationsNamed(scope: string): { address: string; name: string }[] {
     let kept = this.#stationsNamed.get(scope);
     if (kept === undefined) {

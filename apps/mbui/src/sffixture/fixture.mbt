@@ -1506,7 +1506,7 @@ pub fn fixture_topic_inner(f : Fixture, name : String, params : Map[String, Json
     "shareIn" => fixture_share_topic(params)
     "imageNear" => fixture_image_near(params)
     // (待处理 open, Maple offline: decide_fixture.mbt)
-    "chats" if f.mode == "home-attention" || f.mode.has_prefix("home-foot") => fixture_chats(f, params).map(fn(v) { listed_chats(fix_with_trouble(v, params)) })
+    "chats" if f.mode.has_prefix("home-attention") || f.mode.has_prefix("home-foot") => fixture_chats(f, params).map(fn(v) { listed_chats(fix_with_trouble(v, params)) })
     "chats" if f.mode == "home-syncing" => fixture_chats(f, params).map(fn(v) { listed_chats(fix_with_syncing(v)) })
     "chats" => fixture_chats(f, params).map(listed_chats)
     // (one chat's whole row, of the same made-up chats: what the list's rows are cut from)
@@ -1533,9 +1533,36 @@ pub fn fixture_topic_inner(f : Fixture, name : String, params : Map[String, Json
     "archive" => @settings.fixture_topic(f.mode, name, params)
     // (the web's demo has none)
     "workspaceMarks" if f.mode == "webdemo" => Some({ "workspaces": { "ws1": {} } })
+    // home-attention-login: and another chat's login card waiting for the viewer, first, in its own words
+    "workspaceMarks" if f.mode == "home-attention-login" => Some(fix_attention_marks(login=true))
     "workspaceMarks" if f.mode == "home-attention" || f.mode.has_prefix("home-shared") =>
       Some(fix_attention_marks())
     "workspaceMarks" if board_mode(f.mode) => Some(board_marks())
+    // chat-login-ask: another chat's login card waiting for the viewer (sfbase's login_asks.mbt: a toast)
+    "workspaceMarks" if f.mode == "chat-login-ask" =>
+      Some({
+        "workspaces": {
+          "ws1": {
+            "wait": 1,
+            "tone": "wait",
+            "items": [
+              {
+                "kind": "wait",
+                "workspace": "ws1",
+                "station": "ws1/st1",
+                "stationName": "Willow",
+                "session": "s-c2",
+                "title": "部署到测试环境",
+                "what": "要你登录 gh",
+                "login": "login-9",
+                "loginEnds": 750000,
+                "at": 0,
+              },
+            ],
+          },
+        },
+        "badgeKinds": { "on": true, "wait": true, "failed": true, "done": true, "message": true, "services": true },
+      })
     "workspaceMarks" =>
       Some({
         "workspaces": {
