@@ -37,7 +37,9 @@ pub fn text_action_node(
 /// (given its node: what it opens goes beside it). `selected`: one of several to choose between (@headless.choice),
 /// read out selected while it says so. `expanded`: what it opens or shuts is open while it says so (a disclosure,
 /// read out expanded). `on`: a toggle button, on while it says so (read out pressed: 全屏, 控制, the keyboard up).
-/// None of them: a button. While `disabled()`, taking no press nor the focus. The node.
+/// None of them: a button, `label_is` its name where it never changes (`label` is it: said once, no binding made for
+/// it, @headless.button's), `in_node` the button `parent` itself (a row a list made: no box of its own). While
+/// `disabled()`, taking no press nor the focus. The node.
 #callsite(autofill(loc))
 pub fn action_box_node(
   parent : @view.View,
@@ -47,7 +49,9 @@ pub fn action_box_node(
   selected? : () -> Bool,
   expanded? : () -> Bool,
   on? : () -> Bool,
-  disabled? : () -> Bool = fn() { false },
+  disabled? : () -> Bool,
+  label_is? : String,
+  in_node? : Bool = false,
   loc~ : SourceLoc,
 ) -> @view.View {
   let drawn = fn(v : @view.View) {
@@ -57,14 +61,14 @@ pub fn action_box_node(
   // (its node, for a toggle's press: what it opens goes beside it)
   let me : Ref[@view.View?] = Ref(None)
   match (selected, expanded, on) {
-    (Some(chosen), _, _) => @headless.choice(made_for=loc, parent, Button, label, chosen, press, disabled~, fn(v, _) { drawn(v) })
-    (None, Some(open), _) => @headless.disclosure(made_for=loc, parent, label, open, press, disabled~, fn(v, _) { drawn(v) })
+    (Some(chosen), _, _) => @headless.choice(made_for=loc, parent, Button, label, chosen, press, disabled?, fn(v, _) { drawn(v) })
+    (None, Some(open), _) => @headless.disclosure(made_for=loc, parent, label, open, press, disabled?, fn(v, _) { drawn(v) })
     (None, None, Some(now)) =>
-      @headless.toggle(made_for=loc, parent, Button, label, now, fn(_) { if me.val is Some(v) { press(v) } }, disabled~, fn(v, _) {
+      @headless.toggle(made_for=loc, parent, Button, label, now, fn(_) { if me.val is Some(v) { press(v) } }, disabled?, fn(v, _) {
         me.val = Some(v)
         drawn(v)
       })
-    (None, None, None) => @headless.button(made_for=loc, parent, label, press, disabled~, fn(v, _) { drawn(v) })
+    (None, None, None) => @headless.button(made_for=loc, parent, label, press, disabled?, label_is?, in_node~, fn(v, _) { drawn(v) })
   }
 }
 
@@ -77,7 +81,8 @@ let text_action_words : @ui.TextStyle = @ui.text_style(size=Meta, color=Link, wr
 /// action_box_node's block that is pressed only while `on()` says so (a step's card with a way to go by): a button
 /// named `label` then (a disclosure, open while `expanded` says, where that is given), `press` done as it is pressed;
 /// else a plain box, nothing to press and read out as what it shows (button_while_node's). Made anew, at once, as `on`
-/// changes: `look` lays out either, given its node.
+/// changes: `look` lays out either, given its node. `in_pick`: the pick's own node is the button (no box of its own
+/// in it: a row of a list, a block of a page laid out in `parent` as it was before it was pressed), a button's alone.
 #callsite(autofill(loc))
 pub fn action_box_while_node(
   parent : @view.View,
@@ -86,7 +91,18 @@ pub fn action_box_while_node(
   press : (@view.View) -> Unit,
   look : (@view.View) -> Unit,
   expanded? : () -> Bool,
+  in_pick? : Bool = false,
   loc~ : SourceLoc,
 ) -> Unit {
-  button_while_node(loc~, parent, on, label, press, fn(v, _) { look(v) }, open?=expanded)
+  if !in_pick || expanded is Some(_) {
+    button_while_node(loc~, parent, on, label, press, fn(v, _) { look(v) }, open?=expanded)
+    return
+  }
+  parent.pick(loc~, on, at_once=true, fn(p, pressed) {
+    if pressed {
+      action_box_node(loc~, p, label, press, look, in_node=true) |> ignore
+    } else {
+      look(p)
+    }
+  })
 }
