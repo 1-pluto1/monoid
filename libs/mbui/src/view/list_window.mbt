@@ -1187,6 +1187,8 @@ fn View::scrolls_window_ids(
         s.keys_changed()
       }
       let laid_once = @signals.untracked(fn() { s.seen.get() is Some(_) })
+      let gate = self.tree.transition_gate(self.at)
+      let keys_diff = keys_other(was, ks, p)
       if came_by_data.val.length() > 0 {
         came_by_data.val = Map([])
       }
@@ -1196,7 +1198,9 @@ fn View::scrolls_window_ids(
         // once, now, whether it comes. Not before it was first laid out: what it is made with is there at once)
         if laid_once && !at_once && !laid_at.contains(k) && @signals.untracked(fn() { comes(k) }) {
           if !flips {
-            came_by_data.val[k] = true
+            if gate {
+              came_by_data.val[k] = true
+            }
           } else if !answering_now() {
             flip_came[k] = true
           }
@@ -1220,6 +1224,7 @@ fn View::scrolls_window_ids(
       }
       if laid_once &&
         !at_once &&
+        gate &&
         p < was.length() &&
         p < ks.length() &&
         !answering_now() &&
@@ -1268,6 +1273,7 @@ fn View::scrolls_window_ids(
       for e in showed_at {
         let (k, j, off) = e
         guard !at_once &&
+          gate &&
           !laid_at.contains(k) &&
           !gone_quiet.contains(k) &&
           @signals.untracked(fn() { goes(k) }) else {
@@ -1278,6 +1284,9 @@ fn View::scrolls_window_ids(
           b = b + 1
         }
         gone_from.val[k] = (off, if b < was.length() { Some(was[b]) } else { None })
+      }
+      if !flips && laid_once && !at_once && !gate && keys_diff && !self.tree.nowhere_at(self.at) {
+        self.tree.answer_mark(self.at)
       }
       // (one come at its foot by this change, seen, at its foot: the stretch from the last key there before that stays held
       // as long as it was; not where a key its page lets go, not said to leave its room, is gone at or under that one,
@@ -2807,6 +2816,12 @@ fn View::scrolls_window_ids(
   }, fn(now) {
     let (out, _) = now
     guard s.seen.untracked() is Some((_, vh)) && vh > 0.0 else { return }
+    // (laid out nowhere (a page under the one on top): none of its blocks made or let go while it is; its fill lays
+    // out what shows when it is shown again, nowhere_changed_test.mbt)
+    if self.tree.nowhere_at(self.at) {
+      laid_again()
+      return
+    }
     // A reach measurement can tell a new offset in its final round. Settle it after leaving the room.
     if self.tree.rooming == self.at {
       if out is Some(_) || made_rev.val != laid_rev.val {
@@ -4450,11 +4465,12 @@ fn View::scrolls_window_ids(
                 }
               }
               None =>
-                if was.contains(k) {
+                if was.contains(k) || !came_keys.val.contains(k) {
                   ()
                 } else {
-                  // (come by this change: from none tall where it comes, under the one before it as that was drawn,
-                  // else over the one after it)
+                  // (come by this change, its page saying it comes (`comes` -> `came_keys`): from none tall where it
+                  // comes, under the one before it as that was drawn, else over the one after it; keys brought in by
+                  // paging or catch-up in the same change stay full height and ride their neighbours' offset below)
                   let mut y = ay
                   let mut j = i - 1
                   let mut found = false
