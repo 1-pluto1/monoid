@@ -492,6 +492,7 @@ pub fn ScreenServiceProbe::empty() -> Self
 pub(all) struct Socket {
   destroy : () -> Unit
   on_close : (() -> Unit) -> Unit
+  pipe : async (@json.Json) -> Unit
 }
 
 pub(all) struct Viewer {
