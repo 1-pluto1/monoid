@@ -219,6 +219,91 @@ async fn P52::machine_ask(self : P52, what : String, args : Json) -> Json {
       let at = self.locator().locate(jtext(args, "key").unwrap_or("")) catch { _ => Json::null() }
       Json::array(jitems(jfield(at, "paths")).filter_map(p => match jfield(p, "path") { String(_) as s => Some(s); _ => None }))
     }
+    // (lifecycle.ts `deleteSession`: exclusive transcript files under `<data>`, raw and `.zst`, non-symlink)
+    "transcripts.exclusive" => {
+      let key = jtext(args, "key").unwrap_or("")
+      let allowed : Array[(String, String)] = jitems(jfield(args, "sources")).filter_map(s =>
+        match (jtext(s, "runtime"), jtext(s, "id")) {
+          (Some(rt), Some(id)) => Some((rt, id))
+          _ => None
+        },
+      )
+      if allowed.length() == 0 {
+        return Json::array([])
+      }
+      let storage = self.storage()
+      let sfs = storage.fs
+      guard sfs.realpath(self.data) is Some(root) else { return Json::array([]) }
+      let at = self.locator().locate(key) catch { _ => Json::null() }
+      let rt0 = jtext(at, "runtime").unwrap_or("")
+      let logical : Array[String] = []
+      let claude_dirs : Array[String] = []
+      for each in jitems(jfield(at, "paths")) {
+        let (p, rt) = match each {
+          String(s) => (s, rt0)
+          e => (jtext(e, "path").unwrap_or(""), jtext(e, "runtime").unwrap_or(rt0))
+        }
+        if p == "" {
+          continue
+        }
+        let base = sfs.basename(p)
+        let logical_base = if base.has_suffix(".zst") { base[:base.length() - 4].to_owned() } else { base }
+        let matches = allowed.iter().any(pair => {
+          if pair.0 != rt {
+            return false
+          }
+          let id = pair.1
+          if rt == "claude" {
+            logical_base == id + ".jsonl"
+          } else if rt == "codex" {
+            logical_base == id + ".jsonl" || logical_base.has_suffix("-" + id + ".jsonl")
+          } else {
+            logical_base == id + ".jsonl"
+          }
+        })
+        if !matches {
+          continue
+        }
+        guard sfs.realpath(sfs.dirname(p)) is Some(parent) else { continue }
+        if !p53_within(root, parent) {
+          continue
+        }
+        let main_path = sfs.join([parent, logical_base])
+        if !logical.contains(main_path) {
+          logical.push(main_path)
+        }
+        if rt == "claude" {
+          let stem = if logical_base.has_suffix(".jsonl") { logical_base[:logical_base.length() - 6].to_owned() } else { logical_base }
+          let sub_dir = sfs.join([parent, stem])
+          sfs.jsonl_files(sub_dir, logical) catch { _ => () }
+          if !claude_dirs.contains(sub_dir) {
+            claude_dirs.push(sub_dir)
+          }
+        }
+      }
+      let out : Array[Json] = []
+      for f in logical {
+        for cand in [f, f + ".zst"] {
+          if sfs.lkind(cand) != Some("file") {
+            continue
+          }
+          match sfs.realpath(cand) {
+            Some(rc) if p53_within(root, rc) => out.push(Json::string(cand))
+            _ => ()
+          }
+        }
+      }
+      for dir in claude_dirs {
+        if sfs.lkind(dir) != Some("dir") {
+          continue
+        }
+        match sfs.realpath(dir) {
+          Some(rd) if rd != root && p53_within(root, rd) => out.push(Json::string(dir))
+          _ => ()
+        }
+      }
+      Json::array(out)
+    }
     "marks.forget" => {
       let paths = jitems(args).filter_map(p => match p { String(s) => Some(s); _ => None })
       @ops_platform.forget_marks(fs, @ops_platform.transcript_marks_dir(self.data), paths) catch {
