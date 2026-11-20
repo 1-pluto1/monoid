@@ -48,11 +48,11 @@ test "the bar chooses the page by a tap and by the arrow keys, and goes while th
   t.tab(back=true)
   t.key(@ui.key_code_right)
   t.run_for(settled)
-  let opened = (chosen_page(t), t.all(Dialog, label="Dialog Title").length(), t.all(Radio).length())
+  let opened = (chosen_page(t), t.all(Dialog, label="Publish ui.monoid").length(), t.all(Radio).length())
   // (the dialog closed by Escape: the bar back, the overview chosen, as what is shown)
   t.key(@ui.key_escape)
   t.run_for(settled)
-  let closed = (chosen_page(t), t.all(Dialog, label="Dialog Title").length())
+  let closed = (chosen_page(t), t.all(Dialog, label="Publish ui.monoid").length())
   assert_eq(
     (first, tapped, opened, closed),
     (("Overview", ["Light", "Dark"]), "Interactive", ("", 1, 0), ("Overview", 0)),
@@ -133,14 +133,38 @@ fn chosen_at() -> Array[String] raise {
 }
 
 ///|
+test "the bottom dock switches between Optics, Deck and Loupe, and Publish opens and closes the dialog" {
+  let t = gallery_case("overview", chrome=false)
+  let (dx, dy) = middle_of(t, Tab, "Deck")
+  t.tap(dx, dy)
+  t.run_for(settled)
+  let on_deck = (t.all(Button, label="Build Native").length(), t.all(Slider, label="Backdrop Luminance").length())
+  let (lx, ly) = middle_of(t, Tab, "Loupe")
+  t.tap(lx, ly)
+  t.run_for(settled)
+  let on_loupe = t.all(Group, label="Optical Loupe").length()
+  let (ox, oy) = middle_of(t, Tab, "Optics")
+  t.tap(ox, oy)
+  t.run_for(settled)
+  let (px, py) = middle_of(t, Button, "Publish")
+  t.tap(px, py)
+  t.run_for(settled)
+  let dialog_shown = t.all(Dialog, label="Publish ui.monoid").length()
+  t.key(@ui.key_escape)
+  t.run_for(settled)
+  let dialog_closed = t.all(Dialog, label="Publish ui.monoid").length()
+  assert_eq((on_deck, on_loupe, dialog_shown, dialog_closed), ((1, 1), 1, 1, 0))
+}
+
+///|
 test "a run of choices is drawn the same at 60, 120, 24 and 7 frames a second" {
   inspect(chosen_at().join("\n"), content=(
-    #|Overview false 15 432.5,12,415
-    #|Interactive false 18 432.5,12,415
-    #|Interactive true 18 432.5,12,415
-    #|Overview true 15 432.5,12,415
-    #|Overview false 15 432.5,12,415
-    #| false 15 
-    #|Overview false 15 432.5,12,415
+    #|Overview false 6 432.5,12,415
+    #|Interactive false 9 432.5,12,415
+    #|Interactive true 9 432.5,12,415
+    #|Overview true 6 432.5,12,415
+    #|Overview false 6 432.5,12,415
+    #| false 6 
+    #|Overview false 6 432.5,12,415
   ))
 }
