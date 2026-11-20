@@ -565,6 +565,7 @@ let dock_line : Double = 1.0
 /// colour: dock_edge_node), whether what is in it is drawn, how tall its top row is (the brand's, where the block's
 /// move has got), where that move has got between open and the floating bar (the band's), whether the
 /// block is the closed bar, whether on the tape; the block's ground and its shadow (blur, fall, colour).
+#derive(Eq)
 priv struct SideAt {
   box : (Double, Double, Double, Double)
   /// how wide what the sidebar holds is laid out: `box`'s, but on a move between where it is shown and where it is not
@@ -1038,6 +1039,18 @@ fn land(src : Source, w : Workspace) -> Unit {
     return
   }
   guard land_page(w.id, @sfbase.read_now(src)) is Some(page) else { return }
+  wide.landed.set(w.id)
+  app.nav.push(page)
+}
+
+///|
+/// Same-frame landing when returning to the chats place: pushes only an already-known Chat so the
+/// stack does not flash an empty Home or push an unanswered NewChat ahead of pane_opens.
+fn land_chat(src : Source, w : Workspace) -> Unit {
+  if app.nav.depth() != 1 || app.nav.top() != Home || @sfbase.board_on_of(src, w.id) {
+    return
+  }
+  guard land_page(w.id, @sfbase.read_now(src)) is Some(Chat(_) as page) else { return }
   wide.landed.set(w.id)
   app.nav.push(page)
 }
