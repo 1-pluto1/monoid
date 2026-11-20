@@ -815,6 +815,8 @@ let real_size_known : Map[String, (Int, Int, Int)] = {
   "wide settings-profile-login": (742, 581, 124),
   "wide settings-profile-login-failed": (1353, 890, 89),
   "wide settings-profile-quota-failed": (742, 581, 124),
+  "phone settings-profile-verify": (661, 450, 77),
+  "wide settings-profile-verify": (765, 587, 124),
   "wide settings-profile-unshareable": (683, 533, 102),
   "wide settings-profile-blocked": (742, 581, 124),
   "wide settings-profile-signin": (742, 581, 124),
