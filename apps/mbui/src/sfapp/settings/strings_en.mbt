@@ -2091,4 +2091,6 @@ let en : Map[String, String] = {
   "web-pages.remote.openTerminal": "Terminal",
   "web-pages.remote.openBrowser": "Browser",
   "web-pages.remote.openDesktop": "Desktop",
+  "android-settings.vault.ask.saveSharedNamed": "Saves to shared vault “{name}”",
+  "android-settings.vault.ask.saveShared": "Saves to Workspace vault (shared)",
 }

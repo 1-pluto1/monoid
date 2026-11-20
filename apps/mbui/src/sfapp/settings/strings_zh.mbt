@@ -2052,4 +2052,6 @@ let zh : Map[String, String] = {
   "web-pages.remote.openTerminal": "终端",
   "web-pages.remote.openBrowser": "浏览器",
   "web-pages.remote.openDesktop": "桌面",
+  "android-settings.vault.ask.saveSharedNamed": "将存入团队共享密钥库「{name}」",
+  "android-settings.vault.ask.saveShared": "将存入 Workspace 密钥库（团队共享）",
 }
