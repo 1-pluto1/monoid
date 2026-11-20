@@ -134,6 +134,12 @@ export async function overview(d: OverviewDeps, viewer: Viewer, lang: Lang): Pro
       ? [...new Set<string>(c.bind.profiles.filter((x: unknown): x is string => typeof x === "string" && x.trim() !== "").map((x: string) => x.trim()))]
       : [];
     const singleProfile = nonEmpty(c.bind?.profile) ?? (bindProfiles.length === 1 ? bindProfiles[0]! : null);
+    const startsOnAuto = c.autoStation === true;
+    const startsOn = startsOnAuto ? null : nonEmpty(c.station);
+    const rawStartsOnStations: string[] = !startsOnAuto && Array.isArray(c.stations)
+      ? [...new Set<string>(c.stations.filter((x: unknown): x is string => typeof x === "string" && x.trim() !== "").map((x: string) => x.trim()))]
+      : [];
+    const startsOnStations = startsOnAuto ? null : rawStartsOnStations.length > 0 ? rawStartsOnStations : startsOn !== null ? [startsOn] : null;
     const shown = {
       id: c.id,
       // What it is known by (its bot's name on its platform, and its workspace there), as its kind says: its id till then.
@@ -157,9 +163,11 @@ export async function overview(d: OverviewDeps, viewer: Viewer, lang: Lang): Pro
       createdBy: c.createdBy?.id ? c.createdBy : null,
       sessions: sessionsOf(c.id),
       session: mode === "single-session" ? d.store.binding(c.id) : null,
-      // The station of its workspace its new conversations run on (null: this one), and that it can be moved to
+      // The station(s) of its workspace its new conversations run on (null: this one), and that it can be moved to
       // another (connects/workspace.ts; a station from before says neither).
-      startsOn: nonEmpty(c.station),
+      startsOn,
+      startsOnStations,
+      ...(startsOnAuto ? { startsOnAuto: true } : {}),
       moves: true,
     };
     const own = d.connectKinds?.get(kind);
