@@ -4474,6 +4474,7 @@ fn view_event_said(said : () -> Unit, f : () -> Unit, what? : String = "event", 
   // the event has run. An event inside a frame leaves its handovers for the frame's end instead.
   if event_depth.val == 0 && !frame_running.val {
     frame_afters_run()
+    glyphs_ahead()
   }
   if journaled {
     journal_event(what, start)
