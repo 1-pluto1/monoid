@@ -355,3 +355,153 @@ test "dialog_node: releasing modal on first exit frame lets clicks pass through 
   t.draw()
   assert_eq(under_clicks.val, 1, msg="click during dialog exit should pass through immediately")
 }
+
+///|
+test "dropdown_node and status_node keep exact heights at 1.0x and grow cleanly at 2.0x font scale with zero new audit faults" {
+  let t = floating_case(fn(p, layer) {
+    p.box(fn(b) {
+      b.width(Is(Some(280.0))) |> ignore
+      dropdown_node(b, layer, ["Light", "Dark", "System"], @signals.signal(1), label="Appearance") |> ignore
+    })
+    |> ignore
+    status_node(p, @signals.signal(InProgress)) |> ignore
+  })
+  t.run_for(floating_ms)
+  let dd_h1 = t.get(Button, label="Appearance: Dark").rect.3
+  let st_chosen_h1 = t.get(Radio, label="In progress").rect.3
+  let st_other_h1 = t.get(Radio, label="Done").rect.3
+  assert_eq((dd_h1, st_chosen_h1, st_other_h1), (40.0, 24.0, 24.0))
+  // (Comma's dropdown trigger (14/12) and status pill (4/8) have intentional asymmetric horizontal padding; check no other faults)
+  let faults1 = t.audit().filter(fn(f) { !f.has_prefix("rule 4:") })
+  assert_eq(faults1, [])
+  t.set_font_scale(2.0)
+  t.draw()
+  t.run_for(floating_ms)
+  let dd_h2 = t.get(Button, label="Appearance: Dark").rect.3
+  let st_chosen_h2 = t.get(Radio, label="In progress").rect.3
+  assert_true(dd_h2 > 40.0 && st_chosen_h2 > 24.0, msg="2.0x heights: dropdown=\{dd_h2}, status=\{st_chosen_h2}")
+  // (at 2.0x the chosen status pill grows with text while unchosen dot radios stay 24x24 circles, triggering the row-height rule)
+  let faults2 = t.audit().filter(fn(f) { !f.has_prefix("rule 4:") && !f.has_prefix("height:") })
+  assert_eq(faults2, [])
+}
+
+///|
+test "dialog_node footer wraps in reverse at 2.0x font scale without overflowing the dialog" {
+  let t = floating_case(fn(p, layer) {
+    button_node(p, fn() { "Open" }, fn() {  }, hierarchy=Destructive) |> ignore
+    dialog_node(
+      layer,
+      @signals.signal(true),
+      fn() { "Delete this project?" },
+      description=fn() { "It cannot be undone." },
+      width=300.0,
+      actions=fn(f) {
+        button_node(f, fn() { "Cancel" }, fn() {  }, hierarchy=SecondaryGray, size=Sm) |> ignore
+        button_node(f, fn() { "Delete this project" }, fn() {  }, hierarchy=Destructive, size=Sm) |> ignore
+      },
+    )
+  })
+  t.set_font_scale(2.0)
+  t.draw()
+  t.run_for(floating_ms)
+  let (dx, _, dw, _) = t.get(Dialog, label="Delete this project?").rect
+  let (cx, cy, cw, _) = t.get(Button, label="Cancel").rect
+  let (px, py, pw, _) = t.get(Button, label="Delete this project").rect
+  assert_true(cy > py, msg="wrap_reverse puts earlier line below wrapped line: cancel_y=\{cy}, primary_y=\{py}")
+  assert_true(cx + cw <= dx + dw && px + pw <= dx + dw, msg="buttons stay within dialog right edge")
+  let faults = []
+  for f in t.audit() {
+    if !comma_contrast_known.iter().any(fn(k) { f.contains(k) && f.contains("under 4.5") }) {
+      faults.push(f)
+    }
+  }
+  assert_eq(faults, [])
+}
+
+///|
+test "dialog_node hides from the semantics tree immediately on close before exit animation finishes" {
+  let open = @signals.signal(false)
+  let t = floating_case(fn(p, layer) {
+    button_node(p, fn() { "Open" }, fn() { open.set(true) }) |> ignore
+    dialog_node(layer, open, fn() { "Confirm hide" }, actions=fn(f) {
+      button_node(f, fn() { "Cancel" }, fn() { open.set(false) }, hierarchy=SecondaryGray, size=Sm) |> ignore
+    })
+  })
+  t.act(Button, Activate, label="Open")
+  t.run_for(floating_ms)
+  assert_eq(t.all(Dialog, label="Confirm hide").length(), 1)
+  open.set(false)
+  t.draw()
+  let at_once = t.all(Dialog, label="Confirm hide").length()
+  t.run_for(ms_dialog_exit / 2.0)
+  let mid_exit = t.all(Dialog, label="Confirm hide").length()
+  assert_eq((at_once, mid_exit), (0, 0))
+}
+
+///|
+test "radio_group_node and check_group_node align controls with first-line labels at 1.0x and 2.0x with zero audit faults" {
+  let t = floating_case(fn(p, _) {
+    p.box(fn(r) {
+      r.row(Is(true)).gap(Is(24.0)).lines_up(Is(Some(Start))) |> ignore
+      r.box(fn(b) {
+        b.width(Is(Some(240.0))) |> ignore
+        radio_group_node(
+          b,
+          [("Basic plan", "Up to 10 users."), ("Business plan", "Up to 20 users.")],
+          @signals.signal(0),
+          label="Plan",
+        )
+        |> ignore
+      })
+      |> ignore
+      r.box(fn(b) {
+        b.width(Is(Some(240.0))) |> ignore
+        check_group_node(
+          b,
+          [("Email", "Weekly digest."), ("Push", "")],
+          @signals.signal([true, false]),
+          label="Notify",
+        )
+        |> ignore
+      })
+      |> ignore
+    })
+    |> ignore
+  })
+  fn check_aligned(scale : Double) -> Unit raise {
+    let words = t.words()
+    let pairs : Array[(@view.Role, String)] = [
+      (Radio, "Basic plan"),
+      (Radio, "Business plan"),
+      (Checkbox, "Email"),
+      (Checkbox, "Push"),
+    ]
+    for p in pairs {
+      let (role, name) = p
+      let (_, cy, _, ch) = t.get(role, label=name).rect
+      let ctrl_mid = cy + ch / 2.0
+      let mut label_mid : Double? = None
+      for w in words {
+        if w.0 == name {
+          label_mid = Some(w.2 + w.4 / 2.0)
+          break
+        }
+      }
+      match label_mid {
+        Some(lm) =>
+          assert_true(
+            (ctrl_mid - lm).abs() < 1.0,
+            msg="scale=\{scale} \{name}: ctrl_mid=\{ctrl_mid} vs label_mid=\{lm}",
+          )
+        None => assert_true(false, msg="label \{name} not found in words")
+      }
+    }
+    assert_eq(t.audit(), [])
+  }
+  t.run_for(floating_ms)
+  check_aligned(1.0)
+  t.set_font_scale(2.0)
+  t.draw()
+  t.run_for(floating_ms)
+  check_aligned(2.0)
+}
