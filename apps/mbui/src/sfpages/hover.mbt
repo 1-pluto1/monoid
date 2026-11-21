@@ -1116,14 +1116,8 @@ pub fn usage_tiles_node(
             m(r)
           })
           |> ignore
-        // (a roomy one's on one line in a row of its own, as long as it is: never broken off a character at a time in a
-        // narrow tile at large words, as the sheet's had it)
-        None if roomy =>
-          b.box(fn(r) {
-            @sf.style_node(r, fn() { usage_roomy_name_row })
-            @sf.words_node(r, name, name_look) |> ignore
-          })
-          |> ignore
+        // (a roomy one's name wraps cleanly at word boundaries when large words outgrow a narrow tile)
+        None if roomy => @sf.words_node(b, name, fn() { usage_roomy_name_wrap }) |> ignore
         None => @sf.words_node(b, name, name_look) |> ignore
       }
     }
@@ -1132,6 +1126,7 @@ pub fn usage_tiles_node(
     if roomy {
       // (as tall as the row's tallest: the tiles of a row level at their feet)
       t.by_room(fn(b, given) {
+        b.grow(Is(1.0)) |> ignore
         made(b, fn() { dmax(0.0, given.width() - 2.0 * @sf.text_in) })
       })
       .grow(Is(1.0))
@@ -1200,6 +1195,9 @@ pub fn usage_tiles_node(
             |> ignore
           None =>
             t.pick(at_once=true, unknown, fn(k, unknown_now) {
+              if roomy {
+                k.grow(Is(1.0)) |> ignore
+              }
               let shown = tile(k, figure, fn() { @sf.t("web-main.chat.agentCard.context") }, level, None, None)
               if !unknown_now {
                 @sf.tip_node(tips, shown, fn() { text(ctx(), "text") }) |> ignore
@@ -1232,9 +1230,9 @@ fn usage_figure_fit(v : @view.View, figure : String, room : Double) -> Double {
 ///|
 /// The roomy figures' row: 8 apart; each tile 9 over, 8 under, 16 in at either side, a row's corner, on the ink at 5%;
 /// its figure on a line as tall as the largest's (26), each figure's own 1.3 its size; its name 12 on 16, muted,
-/// on one line (usage_roomy_name_row).
+/// wrapping cleanly when narrow (usage_roomy_name_wrap).
 // kept across runs: a value (no field of it changes)
-let usage_tiles_roomy : @ui.Style = @ui.css("row w=Full gap=S2")
+let usage_tiles_roomy : @ui.Style = @ui.css("row w=Full gap=S2 align=AStretch")
 
 ///|
 // kept across runs: a value (no field of it changes)
@@ -1244,7 +1242,7 @@ let usage_tile_roomy : @ui.Style = @ui.css("pb=S2").then(
 
 ///|
 // kept across runs: a value (no field of it changes)
-let usage_roomy_name_row : @ui.Style = @ui.css("row gap=S0_5 align=ACenter")
+let usage_roomy_name_wrap : @ui.TextStyle = @ui.text_style(size=Caption, leading=L4, color=Muted, wrap=true)
 
 ///|
 let usage_roomy_over : Double = 9.0
