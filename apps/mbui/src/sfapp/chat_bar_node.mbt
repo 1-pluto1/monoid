@@ -602,26 +602,32 @@ fn bar_middle_node(
       if v.agents.length() > 0 {
         had_empty_agents.val = false
       }
-      for i, ag in v.agents {
-        let key = ag.key
-        // each opens its card, said as the agent (with the station it runs on, the first's): its name said once
-        let label = match station {
-          Some(s) if i == 0 => ag.who + " · " + s.name
-          _ => ag.who
-        }
-        @sf.action_box_node(mid, fn() { label }, label_is=label, fn(_) { open_agent(src, r, key) }, fn(k) {
-          slides(k)
+      mid.each(
+        at_once=true,
+        fn() { v.agents.mapi(fn(i, ag) { (i, ag) }) },
+        fn(p) { p.1.key },
+        fn(slot, p) {
+          let (i, ag) = p.untracked()
+          let key = ag.key
+          // each opens its card, said as the agent (with the station it runs on, the first's): its name said once
+          let label = match station {
+            Some(s) if i == 0 => ag.who + " · " + s.name
+            _ => ag.who
+          }
+          slides(slot)
           if fade_agents {
-            k.alpha(By(@motion.presence_in(k, @motion.tween(140.0, ease=Out)))) |> ignore
+            slot.alpha(By(@motion.presence_in(slot, @motion.tween(140.0, ease=Out)))) |> ignore
           }
-          if i == 0 {
-            agent_station_node(k, ag, badge_of(key), station, via, stint)
-          } else {
-            model_mark_node(k, ag, badge_of(key), mark_side())
-          }
-        })
-        |> ignore
-      }
+          @sf.action_box_node(slot, fn() { label }, label_is=label, fn(_) { open_agent(src, r, key) }, fn(k) {
+            if i == 0 {
+              agent_station_node(k, ag, badge_of(key), station, via, stint)
+            } else {
+              model_mark_node(k, ag, badge_of(key), mark_side())
+            }
+          })
+          |> ignore
+        },
+      )
     })
     |> ignore
   })
@@ -1048,63 +1054,61 @@ fn agent_station_node(
   let m = mark_side()
   match station {
     None => model_mark_node(v, a, badge, m)
-    Some(s) =>
-      v.box(fn(o) {
-        o.box(fn(tile) {
-          tile
-          .row(Is(true))
-          .height(Is(Some(m)))
-          .radius(Is(6.0))
-          .ground(By(fn() { mark_ground().0 }))
-          .edge(By(fn() { (mark_ground().1, @sf.theme().p.line) }))
-          .lines_up(Is(Some(Middle)))
+    Some(s) => {
+      v.box(fn(tile) {
+        tile
+        .row(Is(true))
+        .height(Is(Some(m)))
+        .radius(Is(6.0))
+        .ground(By(fn() { mark_ground().0 }))
+        .edge(By(fn() { (mark_ground().1, @sf.theme().p.line) }))
+        .lines_up(Is(Some(Middle)))
+        |> ignore
+        tile.box(fn(mk) {
+          mk.width(Is(Some(m))).height(Is(Some(m))).row(Is(true)).lines_up(Is(Some(Middle))).lies_along(Is(Middle))
           |> ignore
-          tile.box(fn(mk) {
-            mk.width(Is(Some(m))).height(Is(Some(m))).row(Is(true)).lines_up(Is(Some(Middle))).lies_along(Is(Middle))
-            |> ignore
-            @sf.maker_mark_node(mk, a.maker, a.runtime, mark_logo(m)) |> ignore
-          })
-          |> ignore
-          // the station's part: its mark, or its name kept short
-          let (most, inside, said_line) = station_part_type()
-          tile.box(fn(sp) {
-            sp.max_width(Is(Some(most))).padding(Is((inside, 0.0, inside, 0.0))).row(Is(true)).lines_up(Is(Some(Middle)))
-            |> ignore
-            if @sf.has_station_mark(s.emoji, s.icon) {
-              @sf.station_mark_node(sp, fn() { s.emoji }, fn() { s.icon }, mark_station(), fn() { @sf.theme().p.muted }, stint)
-            } else {
-              sp.box(fn(t) {
-                t
-                .words(Is(s.name))
-                .words_look(By(fn() {
-                  { size: @sf.theme().t.caption, weight: 400, line: said_line, wrap: false, tracking: @view.letters_own, balance: false, max_lines: 0 }
-                }))
-                .ink(By(fn() { @sf.theme().p.muted }))
-                .cuts(Is(true))
-                .min_width(Is(Some(0.0)))
-                |> ignore
-              })
-              |> ignore
-            }
-          })
-          |> ignore
+          @sf.maker_mark_node(mk, a.maker, a.runtime, mark_logo(m)) |> ignore
         })
         |> ignore
-        // the agent's state on the maker's corner, how the station is reached on the tile's: each 3 past it
-        o.box(fn(over) {
-          over.over(Is(true)) |> ignore
-          badge_slot_node(over, badge, m)
-          over.show(at_once=true, fn() { via() != "" }, fn(d) {
-            d.over(Is(true)).lines_up(Is(Some(End))) |> ignore
-            d.box(fn(at) {
-              at.offset(Is((3.0, m - 7.0))) |> ignore
-              via_dot_in(at, via, 10.0, 2.0)
+        // the station's part: its mark, or its name kept short
+        let (most, inside, said_line) = station_part_type()
+        tile.box(fn(sp) {
+          sp.max_width(Is(Some(most))).padding(Is((inside, 0.0, inside, 0.0))).row(Is(true)).lines_up(Is(Some(Middle)))
+          |> ignore
+          if @sf.has_station_mark(s.emoji, s.icon) {
+            @sf.station_mark_node(sp, fn() { s.emoji }, fn() { s.icon }, mark_station(), fn() { @sf.theme().p.muted }, stint)
+          } else {
+            sp.box(fn(t) {
+              t
+              .words(Is(s.name))
+              .words_look(By(fn() {
+                { size: @sf.theme().t.caption, weight: 400, line: said_line, wrap: false, tracking: @view.letters_own, balance: false, max_lines: 0 }
+              }))
+              .ink(By(fn() { @sf.theme().p.muted }))
+              .cuts(Is(true))
+              .min_width(Is(Some(0.0)))
+              |> ignore
             })
             |> ignore
-          })
+          }
         })
         |> ignore
       })
       |> ignore
+      // the agent's state on the maker's corner, how the station is reached on the tile's: each 3 past it
+      v.box(fn(over) {
+        over.over(Is(true)) |> ignore
+        badge_slot_node(over, badge, m)
+        over.show(at_once=true, fn() { via() != "" }, fn(d) {
+          d.over(Is(true)).lines_up(Is(Some(End))) |> ignore
+          d.box(fn(at) {
+            at.offset(Is((3.0, m - 7.0))) |> ignore
+            via_dot_in(at, via, 10.0, 2.0)
+          })
+          |> ignore
+        })
+      })
+      |> ignore
+    }
   }
 }

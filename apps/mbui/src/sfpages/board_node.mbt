@@ -693,6 +693,7 @@ fn board_wide(
       // there, its edge reaching out over the board)
       p.show(fn() { shown.get() is Some(_) }, fn(s) {
         s
+        // det-ok(layout-drawn-while): split viewport between board (fixed laid_w columns) and beside chat (fixed beside_w inner) reshapes smoothly with no card or chat reflow
         .width(By(fn() { Some(beside_w() * opened.shown_on(s)) }))
         .shrink(Is(0.0))
         .min_height(Is(Some(0.0)))
