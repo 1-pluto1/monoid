@@ -120,19 +120,22 @@ pub fn liquid_menu_node(
   menu_label? : () -> String = fn() { "Menu" },
   placement? : @headless.Placement = BelowStart,
   min_width? : Double = 212.0,
+  anchor_size? : (Double, Double) = (40.0, 40.0),
+  trigger_face? : (@view.View) -> Unit,
   loc~ : SourceLoc,
 ) -> @view.View {
   let pop = @headless.Popover::new(open, set_open)
   let cleaned = fn() { ovl_clean_menu_entries(entries()) }
   let (side, along) = ovl_beside_of(placement)
   let trigger = pop.trigger(parent, trigger_label, trigger_look, made_for=loc)
+  let handoff = ovl_setup_trigger_handoff(trigger, open, side, anchor_size, trigger_face)
   pop.layer(
     host,
     menu_label,
-    leave=@motion.pop_out_ms,
+    leave=ovl_morph_leave_ms,
     made_for=loc,
     fn(v, opener) {
-      let (look, live) = @motion.overlay_presence(v, enter=@motion.pop_in, exit=@motion.pop_out)
+      let live = fn() { !v.leaving() }
       match opener {
         Some(op) => v.beside(op.id(), side~, along~, offset=ovl_float_gap, padding=ovl_float_pad) |> ignore
         None => ()
@@ -149,157 +152,155 @@ pub fn liquid_menu_node(
         roving=true,
         made_for=loc,
         fn(panel, menu) {
-          panel
-          .min_width(Is(Some(min_width)))
-          .padding(Is((ovl_menu_pad, ovl_menu_pad, ovl_menu_pad, ovl_menu_pad)))
-          .gap(Is(ovl_menu_item_gap_y))
-          .radius(Is(ovl_menu_radius))
-          .shadow(Is(shadow_default))
-          .glass(By(fn() { Some(ovl_panel_glass()) }))
-          .alpha(By(fn() { look().alpha }))
-          .scale(By(fn() { look().sx }), about=FromBeside)
-          |> ignore
-          let has_lead = fn() { ovl_menu_has_lead(cleaned()) }
-          let list = cleaned()
-          for idx, entry in list {
-            let _ = ovl_menu_entry_kind(entry)
-            let _ = idx
-            match entry {
-              Separator =>
-                panel.box(fn(sep) {
-                  sep.padding(Is((ovl_menu_sep_px, ovl_menu_sep_py, ovl_menu_sep_px, ovl_menu_sep_py))) |> ignore
-                  sep.box(fn(line) {
-                    line
-                    .height(Is(Some(ovl_hairline_h)))
-                    .ground(By(ovl_hairline))
-                    .says(Is(Some(@view.said(Separator))))
+          panel.min_width(Is(Some(min_width))) |> ignore
+          ovl_attach_liquid_morph(v, panel, side, along, ovl_menu_radius, handoff, fn(content_box) {
+            content_box
+            .padding(Is((ovl_menu_pad, ovl_menu_pad, ovl_menu_pad, ovl_menu_pad)))
+            .gap(Is(ovl_menu_item_gap_y))
+            |> ignore
+            let has_lead = fn() { ovl_menu_has_lead(cleaned()) }
+            let list = cleaned()
+            for idx, entry in list {
+              let _ = ovl_menu_entry_kind(entry)
+              let _ = idx
+              match entry {
+                Separator =>
+                  content_box.box(fn(sep) {
+                    sep.padding(Is((ovl_menu_sep_px, ovl_menu_sep_py, ovl_menu_sep_px, ovl_menu_sep_py))) |> ignore
+                    sep.box(fn(line) {
+                      line
+                      .height(Is(Some(ovl_hairline_h)))
+                      .ground(By(ovl_hairline))
+                      .says(Is(Some(@view.said(Separator))))
+                      |> ignore
+                    })
                     |> ignore
                   })
                   |> ignore
-                })
-                |> ignore
-              Item(label~, shortcut~, icon~, destructive~, disabled~, on_select~) =>
-                menu.item(
-                  panel,
-                  fn() { label },
-                  fn(_) {
-                    if !disabled {
-                      set_open(false)
-                      on_select()
-                    }
-                  },
-                  disabled=fn() { disabled },
-                  made_for=loc,
-                  fn(r, item) {
-                    let ink = fn() {
-                      if destructive {
-                        ovl_destructive()
-                      } else {
-                        colors().content
+                Item(label~, shortcut~, icon~, destructive~, disabled~, on_select~) =>
+                  menu.item(
+                    content_box,
+                    fn() { label },
+                    fn(_) {
+                      if !disabled {
+                        set_open(false)
+                        on_select()
                       }
-                    }
-                    r
-                    .row(Is(true))
-                    .lines_up(Is(Some(Middle)))
-                    .min_height(Is(Some(ovl_menu_item_h)))
-                    .padding(Is((ovl_menu_item_px, ovl_menu_item_py, ovl_menu_item_px, ovl_menu_item_py)))
-                    .gap(Is(ovl_menu_item_gap))
-                    .radius(Is(ovl_menu_item_radius))
-                    .alpha(By(fn() { if item.disabled() { ovl_disabled_alpha } else { 1.0 } }))
-                    |> ignore
-                    ovl_attach_row_ground(
-                      r,
-                      fn() { item.hovered() || (item.focused() && item.focus_shown()) },
-                      fn() { item.pressed() },
-                      disabled=fn() { item.disabled() },
-                    )
-                    ovl_focus_ring(r, fn() { item.focus_shown() }, ovl_menu_item_radius)
-                    r.show(has_lead, fn(col) {
-                      col
-                      .width(Is(Some(ovl_menu_check_w)))
-                      .height(Is(Some(ovl_menu_icon_size)))
+                    },
+                    disabled=fn() { disabled },
+                    made_for=loc,
+                    fn(r, item) {
+                      let ink = fn() {
+                        if destructive {
+                          ovl_destructive()
+                        } else {
+                          colors().content
+                        }
+                      }
+                      r
+                      .row(Is(true))
                       .lines_up(Is(Some(Middle)))
-                      .lies_along(Is(Middle))
+                      .min_height(Is(Some(ovl_menu_item_h)))
+                      .padding(Is((ovl_menu_item_px, ovl_menu_item_py, ovl_menu_item_px, ovl_menu_item_py)))
+                      .gap(Is(ovl_menu_item_gap))
+                      .radius(Is(ovl_menu_item_radius))
+                      .alpha(By(fn() { if item.disabled() { ovl_disabled_alpha } else { 1.0 } }))
                       |> ignore
-                      match icon {
-                        Some(draw_icon) => draw_icon(col, ink)
-                        None => ()
-                      }
-                    })
-                    r.box(fn(w) {
-                      w.grow(Is(1.0)).words(Is(label), look=words_at(ovl_type_body)).ink(By(ink)) |> ignore
-                    })
-                    |> ignore
-                    if shortcut != "" {
-                      r.box(fn(sc) {
-                        sc.words(Is(shortcut), look=words_at(ovl_type_meta)).ink(By(ovl_muted_ink)) |> ignore
+                      ovl_attach_row_ground(
+                        r,
+                        fn() { item.hovered() || (item.focused() && item.focus_shown()) },
+                        fn() { item.pressed() },
+                        disabled=fn() { item.disabled() },
+                      )
+                      ovl_focus_ring(r, fn() { item.focus_shown() }, ovl_menu_item_radius)
+                      r.show(has_lead, fn(col) {
+                        col
+                        .width(Is(Some(ovl_menu_check_w)))
+                        .height(Is(Some(ovl_menu_icon_size)))
+                        .lines_up(Is(Some(Middle)))
+                        .lies_along(Is(Middle))
+                        |> ignore
+                        match icon {
+                          Some(draw_icon) => draw_icon(col, ink)
+                          None => ()
+                        }
+                      })
+                      r.box(fn(w) {
+                        w.grow(Is(1.0)).words(Is(label), look=words_at(ovl_type_body)).ink(By(ink)) |> ignore
                       })
                       |> ignore
-                    }
-                  },
-                )
-                |> ignore
-              Check(label~, shortcut~, checked~, disabled~, on_toggle~) =>
-                menu.check_item(
-                  panel,
-                  fn() { label },
-                  checked,
-                  fn(_) {
-                    if !disabled {
-                      on_toggle()
-                    }
-                  },
-                  disabled=fn() { disabled },
-                  made_for=loc,
-                  fn(r, item) {
-                    r
-                    .row(Is(true))
-                    .lines_up(Is(Some(Middle)))
-                    .min_height(Is(Some(ovl_menu_item_h)))
-                    .padding(Is((ovl_menu_item_px, ovl_menu_item_py, ovl_menu_item_px, ovl_menu_item_py)))
-                    .gap(Is(ovl_menu_item_gap))
-                    .radius(Is(ovl_menu_item_radius))
-                    .alpha(By(fn() { if item.disabled() { ovl_disabled_alpha } else { 1.0 } }))
-                    |> ignore
-                    ovl_attach_row_ground(
-                      r,
-                      fn() { item.hovered() || (item.focused() && item.focus_shown()) },
-                      fn() { item.pressed() },
-                      disabled=fn() { item.disabled() },
-                    )
-                    ovl_focus_ring(r, fn() { item.focus_shown() }, ovl_menu_item_radius)
-                    r.box(fn(col) {
-                      col
-                      .width(Is(Some(ovl_menu_check_w)))
-                      .height(Is(Some(ovl_menu_icon_size)))
+                      if shortcut != "" {
+                        r.box(fn(sc) {
+                          sc.words(Is(shortcut), look=words_at(ovl_type_meta)).ink(By(ovl_muted_ink)) |> ignore
+                        })
+                        |> ignore
+                      }
+                    },
+                  )
+                  |> ignore
+                Check(label~, shortcut~, checked~, disabled~, on_toggle~) =>
+                  menu.check_item(
+                    content_box,
+                    fn() { label },
+                    checked,
+                    fn(_) {
+                      if !disabled {
+                        on_toggle()
+                      }
+                    },
+                    disabled=fn() { disabled },
+                    made_for=loc,
+                    fn(r, item) {
+                      r
+                      .row(Is(true))
                       .lines_up(Is(Some(Middle)))
-                      .lies_along(Is(Middle))
+                      .min_height(Is(Some(ovl_menu_item_h)))
+                      .padding(Is((ovl_menu_item_px, ovl_menu_item_py, ovl_menu_item_px, ovl_menu_item_py)))
+                      .gap(Is(ovl_menu_item_gap))
+                      .radius(Is(ovl_menu_item_radius))
+                      .alpha(By(fn() { if item.disabled() { ovl_disabled_alpha } else { 1.0 } }))
                       |> ignore
-                      col.show(fn() { item.checked() }, fn(chk) {
-                        chk
-                        .width(Is(Some(ovl_menu_icon_size)))
+                      ovl_attach_row_ground(
+                        r,
+                        fn() { item.hovered() || (item.focused() && item.focus_shown()) },
+                        fn() { item.pressed() },
+                        disabled=fn() { item.disabled() },
+                      )
+                      ovl_focus_ring(r, fn() { item.focus_shown() }, ovl_menu_item_radius)
+                      r.box(fn(col) {
+                        col
+                        .width(Is(Some(ovl_menu_check_w)))
                         .height(Is(Some(ovl_menu_icon_size)))
-                        .shapes(By(fn() { ovl_check_shapes(ovl_menu_icon_size, colors().content) }))
+                        .lines_up(Is(Some(Middle)))
+                        .lies_along(Is(Middle))
+                        |> ignore
+                        col.show(fn() { item.checked() }, fn(chk) {
+                          chk
+                          .width(Is(Some(ovl_menu_icon_size)))
+                          .height(Is(Some(ovl_menu_icon_size)))
+                          .shapes(By(fn() { ovl_check_shapes(ovl_menu_icon_size, colors().content) }))
+                          |> ignore
+                        })
+                      })
+                      |> ignore
+                      r.box(fn(w) {
+                        w.grow(Is(1.0)).words(Is(label), look=words_at(ovl_type_body)).ink(By(fn() { colors().content }))
                         |> ignore
                       })
-                    })
-                    |> ignore
-                    r.box(fn(w) {
-                      w.grow(Is(1.0)).words(Is(label), look=words_at(ovl_type_body)).ink(By(fn() { colors().content }))
                       |> ignore
-                    })
-                    |> ignore
-                    if shortcut != "" {
-                      r.box(fn(sc) {
-                        sc.words(Is(shortcut), look=words_at(ovl_type_meta)).ink(By(ovl_muted_ink)) |> ignore
-                      })
-                      |> ignore
-                    }
-                  },
-                )
-                |> ignore
+                      if shortcut != "" {
+                        r.box(fn(sc) {
+                          sc.words(Is(shortcut), look=words_at(ovl_type_meta)).ink(By(ovl_muted_ink)) |> ignore
+                        })
+                        |> ignore
+                      }
+                    },
+                  )
+                  |> ignore
+              }
             }
-          }
+          })
+          |> ignore
         },
       )
       |> ignore
@@ -353,6 +354,42 @@ pub fn liquid_select_node(
       placeholder
     }
   }
+  let open_fn = fn() { open.get() }
+  let chev_way = @motion.NodeWay::new(if @signals.untracked(open_fn) { ovl_turn_half } else { 0.0 })
+  let draw_select_face = fn(box : @view.View) {
+    box
+    .lies_along(Is(Between))
+    .padding(Is((ovl_select_px, 0.0, ovl_select_px, 0.0)))
+    .gap(Is(ovl_select_gap))
+    |> ignore
+    box.box(fn(w) {
+      w
+      .grow(Is(1.0))
+      .words(By(current_text), look=words_at(ovl_type_body))
+      .ink(
+        By(fn() {
+          let opts = options()
+          let i = selected()
+          if i >= 0 && i < opts.length() {
+            colors().content
+          } else {
+            ovl_muted_ink()
+          }
+        }),
+      )
+      |> ignore
+    })
+    |> ignore
+    box.box(fn(chev) {
+      chev
+      .width(Is(Some(ovl_select_chevron)))
+      .height(Is(Some(ovl_select_chevron)))
+      .turn(By(fn() { chev_way.shown(chev) }))
+      .shapes(By(fn() { ovl_chevron_down_shapes(ovl_select_chevron, ovl_muted_ink()) }))
+      |> ignore
+    })
+    |> ignore
+  }
   let trigger = pop.trigger(
     parent,
     fn() {
@@ -368,64 +405,53 @@ pub fn liquid_select_node(
     made_for=loc,
     fn(t, disc) {
       let press_way = @motion.NodeWay::new(0.0)
-      let chev_way = @motion.NodeWay::new(if @signals.untracked(fn() { open.get() }) { ovl_turn_half } else { 0.0 })
       t.reacts(at_start=false, fn() { !disc.disabled() && disc.pressed() }, fn(on) {
         press_way.go(t, if on { 1.0 } else { 0.0 }, @motion.snappy_damped)
       })
-      t.reacts(at_start=false, fn() { open.get() }, fn(is_open) {
+      t.reacts(at_start=false, open_fn, fn(is_open) {
         chev_way.go(t, if is_open { ovl_turn_half } else { 0.0 }, @motion.snappy_damped)
       })
       t
       .row(Is(true))
       .lines_up(Is(Some(Middle)))
-      .lies_along(Is(Between))
       .width(Is(Some(width)))
       .height(Is(Some(ovl_select_h)))
-      .padding(Is((ovl_select_px, 0.0, ovl_select_px, 0.0)))
-      .gap(Is(ovl_select_gap))
       .radius(Is(ovl_select_radius))
       .shadow(Is(shadow_default))
-      .glass(By(fn() { Some(ovl_capsule_glass()) }))
+      .glass(By(fn() { Some(ovl_morph_bridge_glass(merge=0.0)) }))
       .scale(By(fn() { 1.0 - 0.02 * clamp(press_way.shown(t), 0.0, 1.0) }))
-      .alpha(By(fn() { if disc.disabled() { ovl_disabled_alpha } else { 1.0 } }))
       |> ignore
       ovl_focus_ring(t, fn() { disc.focus_shown() }, ovl_select_radius)
-      t.box(fn(w) {
-        w
-        .grow(Is(1.0))
-        .words(By(current_text), look=words_at(ovl_type_body))
-        .ink(
-          By(fn() {
-            let opts = options()
-            let i = selected()
-            if i >= 0 && i < opts.length() {
-              colors().content
-            } else {
-              ovl_muted_ink()
-            }
-          }),
-        )
-        |> ignore
-      })
-      |> ignore
-      t.box(fn(chev) {
-        chev
-        .width(Is(Some(ovl_select_chevron)))
-        .height(Is(Some(ovl_select_chevron)))
-        .turn(By(fn() { chev_way.shown(chev) }))
-        .shapes(By(fn() { ovl_chevron_down_shapes(ovl_select_chevron, ovl_muted_ink()) }))
-        |> ignore
-      })
-      |> ignore
+      draw_select_face(t)
     },
   )
+  let handoff = ovl_setup_trigger_handoff(
+    trigger,
+    open_fn,
+    Bottom,
+    (width, ovl_select_h),
+    Some(draw_select_face),
+    attach_recoil=false,
+  )
+  trigger.alpha(
+    By(fn() {
+      if disabled() {
+        ovl_disabled_alpha
+      } else if handoff.is_bridging(trigger) {
+        0.0
+      } else {
+        1.0
+      }
+    }),
+  )
+  |> ignore
   pop.layer(
     host,
     label,
-    leave=@motion.pop_out_ms,
+    leave=ovl_morph_leave_ms,
     made_for=loc,
     fn(v, opener) {
-      let (look, live) = @motion.overlay_presence(v, enter=@motion.pop_in, exit=@motion.pop_out)
+      let live = fn() { !v.leaving() }
       match opener {
         Some(op) => v.beside(op.id(), side=Bottom, along=Start, offset=ovl_float_gap, padding=ovl_float_pad) |> ignore
         None => ()
@@ -442,84 +468,82 @@ pub fn liquid_select_node(
         roving=true,
         made_for=loc,
         fn(panel, menu) {
-          panel
-          .min_width(Is(Some(width)))
-          .padding(Is((ovl_menu_pad, ovl_menu_pad, ovl_menu_pad, ovl_menu_pad)))
-          .gap(Is(ovl_menu_item_gap_y))
-          .radius(Is(ovl_menu_radius))
-          .shadow(Is(shadow_default))
-          .glass(By(fn() { Some(ovl_panel_glass()) }))
-          .alpha(By(fn() { look().alpha }))
-          .scale(By(fn() { look().sx }), about=FromBeside)
-          |> ignore
-          let opts = options()
-          for idx, opt in opts {
-            let opt_idx = idx
-            let opt_val = opt
-            menu.radio_item(
-              panel,
-              fn() { opt_val.label },
-              fn() { selected() == opt_idx },
-              fn(_) {
-                if !opt_val.disabled {
-                  on_select(opt_idx)
-                  open.set(false)
-                }
-              },
-              disabled=fn() { opt_val.disabled },
-              made_for=loc,
-              fn(r, item) {
-                r
-                .row(Is(true))
-                .lines_up(Is(Some(Middle)))
-                .min_height(Is(Some(ovl_menu_item_h)))
-                .padding(Is((ovl_menu_item_px, ovl_menu_item_py, ovl_menu_item_px, ovl_menu_item_py)))
-                .gap(Is(ovl_menu_item_gap))
-                .radius(Is(ovl_menu_item_radius))
-                .alpha(By(fn() { if item.disabled() { ovl_disabled_alpha } else { 1.0 } }))
-                |> ignore
-                ovl_attach_row_ground(
-                  r,
-                  fn() { item.hovered() || (item.focused() && item.focus_shown()) },
-                  fn() { item.pressed() },
-                  selected=fn() { item.checked() },
-                  disabled=fn() { item.disabled() },
-                )
-                ovl_focus_ring(r, fn() { item.focus_shown() }, ovl_menu_item_radius)
-                r.box(fn(col) {
-                  col
-                  .width(Is(Some(ovl_menu_check_w)))
-                  .height(Is(Some(ovl_menu_icon_size)))
+          panel.min_width(Is(Some(width))) |> ignore
+          ovl_attach_liquid_morph(v, panel, Bottom, Start, ovl_menu_radius, handoff, fn(content_box) {
+            content_box
+            .padding(Is((ovl_menu_pad, ovl_menu_pad, ovl_menu_pad, ovl_menu_pad)))
+            .gap(Is(ovl_menu_item_gap_y))
+            |> ignore
+            let opts = options()
+            for idx, opt in opts {
+              let opt_idx = idx
+              let opt_val = opt
+              menu.radio_item(
+                content_box,
+                fn() { opt_val.label },
+                fn() { selected() == opt_idx },
+                fn(_) {
+                  if !opt_val.disabled {
+                    on_select(opt_idx)
+                    open.set(false)
+                  }
+                },
+                disabled=fn() { opt_val.disabled },
+                made_for=loc,
+                fn(r, item) {
+                  r
+                  .row(Is(true))
                   .lines_up(Is(Some(Middle)))
-                  .lies_along(Is(Middle))
+                  .min_height(Is(Some(ovl_menu_item_h)))
+                  .padding(Is((ovl_menu_item_px, ovl_menu_item_py, ovl_menu_item_px, ovl_menu_item_py)))
+                  .gap(Is(ovl_menu_item_gap))
+                  .radius(Is(ovl_menu_item_radius))
+                  .alpha(By(fn() { if item.disabled() { ovl_disabled_alpha } else { 1.0 } }))
                   |> ignore
-                  col.show(fn() { item.checked() }, fn(chk) {
-                    chk
-                    .width(Is(Some(ovl_menu_icon_size)))
+                  ovl_attach_row_ground(
+                    r,
+                    fn() { item.hovered() || (item.focused() && item.focus_shown()) },
+                    fn() { item.pressed() },
+                    selected=fn() { item.checked() },
+                    disabled=fn() { item.disabled() },
+                  )
+                  ovl_focus_ring(r, fn() { item.focus_shown() }, ovl_menu_item_radius)
+                  r.box(fn(col) {
+                    col
+                    .width(Is(Some(ovl_menu_check_w)))
                     .height(Is(Some(ovl_menu_icon_size)))
-                    .shapes(By(fn() { ovl_check_shapes(ovl_menu_icon_size, ovl_accent_ink()) }))
+                    .lines_up(Is(Some(Middle)))
+                    .lies_along(Is(Middle))
                     |> ignore
-                  })
-                })
-                |> ignore
-                r.box(fn(col) {
-                  col.grow(Is(1.0)).gap(Is(ovl_text_gap)) |> ignore
-                  col.box(fn(w) {
-                    w.words(Is(opt_val.label), look=words_at(ovl_type_body)).ink(By(fn() { colors().content })) |> ignore
+                    col.show(fn() { item.checked() }, fn(chk) {
+                      chk
+                      .width(Is(Some(ovl_menu_icon_size)))
+                      .height(Is(Some(ovl_menu_icon_size)))
+                      .shapes(By(fn() { ovl_check_shapes(ovl_menu_icon_size, ovl_accent_ink()) }))
+                      |> ignore
+                    })
                   })
                   |> ignore
-                  if opt_val.detail != "" {
-                    col.box(fn(d) {
-                      d.words(Is(opt_val.detail), look=words_at(ovl_type_meta)).ink(By(ovl_muted_ink)) |> ignore
+                  r.box(fn(col) {
+                    col.grow(Is(1.0)).gap(Is(ovl_text_gap)) |> ignore
+                    col.box(fn(w) {
+                      w.words(Is(opt_val.label), look=words_at(ovl_type_body)).ink(By(fn() { colors().content })) |> ignore
                     })
                     |> ignore
-                  }
-                })
-                |> ignore
-              },
-            )
-            |> ignore
-          }
+                    if opt_val.detail != "" {
+                      col.box(fn(d) {
+                        d.words(Is(opt_val.detail), look=words_at(ovl_type_meta)).ink(By(ovl_muted_ink)) |> ignore
+                      })
+                      |> ignore
+                    }
+                  })
+                  |> ignore
+                },
+              )
+              |> ignore
+            }
+          })
+          |> ignore
         },
       )
       |> ignore
