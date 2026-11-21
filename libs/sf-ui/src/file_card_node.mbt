@@ -51,10 +51,20 @@ pub fn file_card_node(
         menu_presses_node(card, fn() { if open() { on_press(Open) } }, fn(x, y, _) { if open() { menu_at(x, y) } })
       None => card_presses_node(card, fn() { on_press(Open) }, open)
     }
-    // (its mark, 24, concentric with its round start; going up, the ring in its place: how far, or turning while that
-    // is not known or every byte is gone and its station is still to say so)
+    // (its mark, 24, on the first line's middle: with mb = meta line height in an ACenter capsule, its centre is
+    // (H - L_meta)/2, identical to the first line's centre (H - (L_name + L_meta))/2 + L_name/2 at every font scale
+    // with zero extra nodes or bindings; going up, the ring in its place)
     card.box(fn(m) {
-      style_node(m, fn() { card_mark }, in_row=true)
+      style_node(
+        m,
+        fn() {
+          m.words_redone() |> ignore
+          let th = @ui.tree_theme()
+          let meta_h = th.leading(L4).unwrap_or(th.text_size(Caption).1)
+          card_mark.then(@ui.style(mb=room(node_sp(m, meta_h))))
+        },
+        in_row=true,
+      )
       let mark = fn(mark : @view.View) {
         icon_node(mark, "file", card_mark_size, By(fn() { if failed() { theme().p.red } else { theme().p.muted } }), name_now=fn() {
           file_mark(name())
