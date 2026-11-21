@@ -616,6 +616,21 @@ fn allowance_node(v : @view.View, quota : () -> Json?) -> Unit {
 }
 
 ///|
+/// `value`'s words in `w` with `tag` after them on their line where it says one (an account's tier: the meta's size,
+/// subtle, 8 after, as a profile row's title_after), the words cut short before the tag gives way.
+fn tagged_words_node(w : @view.View, value : () -> String, look : () -> @ui.TextStyle, tag : () -> String) -> Unit {
+  w.box(fn(line) {
+    line.row(Is(true)).lines_up(Is(Some(Middle))).min_width(Is(Some(0.0))) |> ignore
+    @sf.words_node(line, value, look).cuts(Is(true)).min_width(Is(Some(0.0))).allow_ellipsis(Is(true)) |> ignore
+    line.show(fn() { tag() != "" }, fn(a) {
+      a.margin(Is((8.0, 0.0, 0.0, 0.0))) |> ignore
+      @sf.row_tag_node(a, tag)
+    })
+  })
+  |> ignore
+}
+
+///|
 /// A chat's name in its sheet's head (info_title_row's, as nodes) in `h`, as `title` says it now, two lines at most, its
 /// ✎ right after it where it can be renamed (`open`; the chat's thread `thread`): the first line of what its panel holds
 /// (open_info), clear of an untitled dialog's close button.
@@ -767,6 +782,7 @@ fn agent_node(v : @view.View, src : Source, r : ChatRef, key : String, close : (
         _ => field(a(), "profile")
       }
     }
+    let plan = fn() { text(account(), "planText") }
     @sf.quiet_card_node(
       col,
       fn(list) {
@@ -868,8 +884,9 @@ fn agent_node(v : @view.View, src : Source, r : ChatRef, key : String, close : (
             }
           },
           label_w,
+          tag=plan,
           under=fn(w) { allowance_node(w, fn() { field(account(), "quota") }) },
-          said=fn() { @sf.quota_chips_said(field(account(), "quota")) },
+          said=fn() { @settings.join([plan(), @sf.quota_chips_said(field(account(), "quota"))], " ") },
           fn() {
             close()
             @sfpages.open_triple_panel(src, r.station, "session:" + key, Unanchored, saved=@sf.t("web-pages.chat.pickSaved"), accounts=true)
@@ -957,6 +974,7 @@ fn agent_row_node(
   label_w : () -> Double,
   under? : (@view.View) -> Unit,
   said? : () -> String = fn() { "" },
+  tag? : () -> String,
   trailing? : (@view.View) -> Unit,
   press : () -> Unit,
 ) -> @view.View {
@@ -974,7 +992,10 @@ fn agent_row_node(
     @sf.row_label_node(row, label, label_w)
     row.box(fn(w) {
       @sf.style_node(w, fn() { agent_row_body_style }, in_row=true)
-      @sf.words_node(w, value, fn() { agent_row_value }) |> ignore
+      match tag {
+        Some(t) => tagged_words_node(w, value, fn() { agent_row_value }, t)
+        None => @sf.words_node(w, value, fn() { agent_row_value }) |> ignore
+      }
       match under {
         Some(f) => f(w)
         None => ()

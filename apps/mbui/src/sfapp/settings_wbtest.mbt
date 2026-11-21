@@ -525,6 +525,17 @@ test "an account on several stations shows its subscription tier" {
 }
 
 ///|
+test "Google subscription tiers appear beside the account names with four quota windows" {
+  for w in [360.0, 1280.0] {
+    let list = settings_tester("profiles:ws1/st1", shows="settings-profiles-google", w~, h=1300.0)
+    assert_true(list.find("Ultra 5x") is Some(_), msg="station profiles at \{w}")
+    assert_true(list.find("Enterprise Ultra") is Some(_), msg="station profiles at \{w}")
+    assert_true(list.find("lin@gmail.example") is Some(_), msg="account name at \{w}")
+    assert_true(list.find("Claude / GPT") is Some(_), msg="grouped quota at \{w}")
+  }
+}
+
+///|
 test "profiles on a phone: an allowance of three windows said one way for all, each chip whole (OpenCode Go's)" {
   let t = settings_tester("profiles", shows="settings-profiles-monthly")
   // (on one line 5 小时剩余 62%, 本周剩余 19% and 每月剩余 97% were cut to 5 小时剩…, 本周剩余…, 每月剩余…, 2026-10-31)
