@@ -85,6 +85,9 @@ priv struct SettingsFixture {
   models_added : Array[String]
   /// Whether the example API key is enabled.
   mut key_enabled : Bool
+  /// Claude 主账号's configured maxConcurrentSessions (null = unlimited) and new-account protection flag.
+  mut cc_max_sessions : Json
+  mut cc_protection : Bool
   /// A copy of Maple's Claude subscription among Willow's profiles (settings-profile-copy), and whether Willow uses it.
   mut copy_shown : Bool
   mut copy_enabled : Bool
@@ -228,6 +231,8 @@ let fx : SettingsFixture = {
   fable_used: false,
   models_added: [],
   key_enabled: true,
+  cc_max_sessions: Json::number(8.0),
+  cc_protection: true,
   copy_shown: false,
   copy_enabled: true,
   pairing: false,
@@ -544,6 +549,8 @@ fn fixture_reset() -> Unit {
   fx.fable_used = false
   fx.models_added.clear()
   fx.key_enabled = true
+  fx.cc_max_sessions = Json::number(8.0)
+  fx.cc_protection = true
   fx.copy_shown = false
   fx.copy_enabled = true
   fx.version = 0
@@ -1492,6 +1499,8 @@ fn fx_profiles() -> Array[Json] {
       ("share", obj([("id", str("sh1")), ("role", str("host")), ("host", str("st1")), ("users", ["st2"])])),
       ("fast", Json::boolean(false)),
       ("backgroundOnMessage", Json::boolean(true)),
+      ("maxConcurrentSessions", fx.cc_max_sessions),
+      ("newAccountProtection", Json::boolean(fx.cc_protection)),
       ("workspaces", ["ws2"]),
       ("loginCommand", str("claude setup-token")),
       (
@@ -2024,6 +2033,7 @@ fn fx_cx_more() -> Array[(String, Json)] {
   let left = 2 - fx.resets_used
   [
     ("shareable", Json::boolean(!fx.profile_unshareable)),
+    ("maxConcurrentSessions", Json::null()),
     ("modelsText", str("\{ids.length()} 个模型")),
     ("models", Json::array(ids.map(str))),
     ("named", Json::array(fx.models_added.map(str))),
@@ -4442,6 +4452,16 @@ pub fn fixture_call(name : String, params : Json) -> Result[Json, Json]? {
     "profile.put" if text(p, "id") == "cx" && field(field(p, "input"), "models") is Some(Array(_)) => {
       let named = items(field(p, "input"), "models").filter_map(fn(m) { if m is String(m) { Some(m) } else { None } })
       fx.models_added.retain(fn(m) { named.contains(m) })
+      fx_changed()
+      Some(Ok(obj([])))
+    }
+    "profile.put" if text(p, "id") == "cc" &&
+      (field(field(p, "input"), "maxConcurrentSessions") is Some(_) || field(field(p, "input"), "newAccountProtection") is Some(_)) => {
+      match field(field(p, "input"), "maxConcurrentSessions") {
+        Some(v) => fx.cc_max_sessions = v
+        None => ()
+      }
+      fx.cc_protection = false
       fx_changed()
       Some(Ok(obj([])))
     }
