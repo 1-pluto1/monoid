@@ -37,7 +37,7 @@ function account(p: J): string | null {
 export const GROUPS = ["claude", "chatgpt", "grok", "kimi", "opencode", "cursor", "devin", "agy", "key", "service"] as const;
 
 export function group(p: J): (typeof GROUPS)[number] {
-  if (p.access?.kind === "service") return "service";
+  if (p.access?.kind === "service") return (p.access?.service ?? p.service) === "colab" ? "agy" : "service";
   if (p.access?.login === true) return p.access?.provider === "kimi-code" ? "kimi" : "opencode";
   if (p.access?.kind !== "subscription") return "key";
   return p.runtime === "codex" ? "chatgpt" : p.runtime === "grok" ? "grok" : p.runtime === "cursor" ? "cursor" : p.runtime === "devin" ? "devin" : p.runtime === "agy" ? "agy" : "claude";

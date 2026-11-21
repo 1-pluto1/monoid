@@ -466,3 +466,69 @@ test("service profiles decorate without agent runtime, dedup by (service, email)
   assert.equal(anon.title, "GPU 1");
   assert.ok(view.items.some((i: any) => i.group === "agy" && i.members.length === 1), "agy subscription must not merge with service profile");
 });
+
+test("colab service profile groups under Google without merging with Antigravity CLI or entering Gemini overview pool", () => {
+  const colab = shownProfile({
+    id: "colab-1",
+    name: "lin@example.com",
+    email: "lin@example.com",
+    runtime: null,
+    service: "colab",
+    runtimes: [],
+    access: { kind: "service", key: "", service: "colab" },
+    models: [],
+    env: [],
+    check: { state: "ok", detail: "已登录，lin@example.com", models: null, checkedAt: 1000 },
+    quota: {
+      state: "ok",
+      windows: [],
+      credits: { hasCredits: true, unlimited: false, balance: "2500.00 CU" },
+      detail: "1 台运行中 · 10.05 CU/h",
+      checkedAt: 1000,
+    },
+  });
+  const agy = shownProfile({
+    id: "agy-1",
+    name: "lin@example.com",
+    email: "lin@example.com",
+    runtime: "agy",
+    runtimes: ["agy"],
+    access: { kind: "subscription", key: "" },
+    models: [],
+    env: [],
+    check: { state: "ok", detail: "已登录", models: [], checkedAt: 1000 },
+    quota: { state: "ok", windows: [], checkedAt: 1000 },
+  });
+  assert.equal(colab.group, "agy");
+  assert.equal(colab.groupTitle, "Google");
+  assert.equal(agy.group, "agy");
+  assert.equal(agy.groupTitle, "Google");
+  assert.equal(colab.providerName, "Google Colab");
+  assert.equal(colab.providerMark, "colab");
+  assert.equal(colab.signInProvider, "Google Colab");
+  assert.equal(colab.usesText, "Google Colab GPU 算力");
+
+  const expired = shownProfile({
+    id: "colab-2",
+    name: "expired@example.com",
+    email: "expired@example.com",
+    runtime: null,
+    service: "colab",
+    runtimes: [],
+    access: { kind: "service", key: "", service: "colab" },
+    models: [],
+    env: [],
+    check: { state: "login", detail: "未登录", models: null, checkedAt: 1000 },
+  });
+  assert.equal(expired.trouble?.action, "login");
+
+  // Same email for Antigravity CLI and Colab stay separate rows under Google.
+  const view = workspaceProfiles([station(A, "office", true, [agy, colab, expired])]);
+  const googleRows = view.items.filter((i: any) => i.group === "agy");
+  assert.equal(googleRows.length, 3);
+  assert.ok(googleRows.every((i: any) => i.groupTitle === "Google"));
+
+  // Neither ok nor expired (needsFix) Colab profiles enter the Gemini overview pool.
+  const ov = profilesOverview(view.items, () => null, 1_900_000_000_000, 480);
+  assert.equal(ov.pools.find((p) => p.title === "Gemini"), undefined);
+});

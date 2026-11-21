@@ -258,7 +258,7 @@ fn profile_keys(core : Core, here : () -> Here, o : () -> Json?, p : () -> Json?
   let kind = text(access, "kind")
   let copy = profile_copy(pv)
   let machine = flag(pv, "machine")
-  let signs_in = kind == "subscription" || flag(access, "login")
+  let signs_in = kind == "subscription" || kind == "service" || flag(access, "login")
   let asked = sign_asked(pv)
   let out : Array[String] = []
   if !copy && signs_in && !machine && asked {
@@ -1026,6 +1026,8 @@ pub fn login_steps_node(
           @sf.words_node(st, fn() {
             if provider() == "Devin" {
               @sf.t("web-pages.profiles.step1Devin", args=[("name", @sf.product())])
+            } else if provider() == "Google Colab" {
+              @sf.t("web-pages.profiles.step1Colab", args=[("name", @sf.product())])
             } else if provider() == "Google" {
               @sf.t("web-pages.profiles.step1Google", args=[("name", @sf.product())])
             } else {
@@ -1261,6 +1263,11 @@ fn profile_quota_node(
   let windows = fn() { windows_now.get() }
   let credits_now = @signals.computed(fn(_) { text(quota(), "creditsText") }, same=fn(a, b) { a == b })
   let credits = fn() { credits_now.get() }
+  let credits_note_now = @signals.computed(
+    fn(_) { if windows().length() == 0 { opt_text(quota(), "detail").unwrap_or("") } else { "" } },
+    same=fn(a, b) { a == b },
+  )
+  let credits_note = fn() { credits_note_now.get() }
   let refreshing = fn() {
     is_doing(core, ["profile.quota"], on) ||
     (is_doing(core, ["profile.check"], on) && text(quota(), "state") != "unsupported")
@@ -1275,9 +1282,7 @@ fn profile_quota_node(
           let st = text(Some(q), "state")
           if st == "ok" && windows().length() > 0 {
             2
-          } else if st == "ok" &&
-            opt_text(Some(q), "detail").unwrap_or("") == "" &&
-            (credits() != "" || items(Some(q), "resets").length() > 0) {
+          } else if st == "ok" && (credits() != "" || items(Some(q), "resets").length() > 0) {
             3
           } else {
             1
@@ -1386,7 +1391,14 @@ fn profile_quota_node(
           }
         })
         g.show(at_once=true, fn() { credits() != "" }, fn(x) {
-          @sf.link_row_node(x, fn() { @sf.t("android-settings.quota.credits") }, fn() {  }, value=credits, goes=false)
+          @sf.link_row_node(
+            x,
+            fn() { @sf.t("android-settings.quota.credits") },
+            fn() {  },
+            note=credits_note,
+            value=credits,
+            goes=false,
+          )
         })
         // Each kind of reset it holds, a row each: how many are left at its end, where they are seen at once (the user,
         // 2026-11-10), what one gives back and till when under its name; the row pressed asks first, then uses one.
@@ -2141,23 +2153,33 @@ fn profile_settings_node(
                 busy~,
               )
             })
-            g.show(at_once=true, fn() { profile_max_sessions(p()) }, fn(cap_row) {
+            let max_sessions_shown = @signals.computed(fn(_) { profile_max_sessions(p()) })
+            let max_sessions_protection = @signals.computed(fn(_) { profile_in_protection(p()) })
+            let max_sessions_cap = @signals.computed(fn(_) {
+              match field(p(), "maxConcurrentSessions") {
+                Some(Number(n, ..)) if n >= 1.0 => n.to_int()
+                _ => 0
+              }
+            })
+            g.show(at_once=true, fn() { max_sessions_shown.get() }, fn(cap_row) {
               cap_row.pick(at_once=true, fn() { !busy() }, fn(r, goes) {
                 @sf.link_row_node(
                   r,
                   fn() { @sf.t("web-pages.profiles.maxConcurrentSessions") },
                   fn() { ask_max_sessions(core, address, id, p) },
                   note=fn() {
-                    if profile_in_protection(p()) {
+                    if max_sessions_protection.get() {
                       @sf.t("web-pages.profiles.maxConcurrentSessionsProtectionNote")
                     } else {
                       @sf.t("web-pages.profiles.maxConcurrentSessionsNote")
                     }
                   },
                   value=fn() {
-                    match field(p(), "maxConcurrentSessions") {
-                      Some(Number(n, ..)) if n >= 1.0 => n.to_int().to_string()
-                      _ => @sf.t("web-pages.profiles.maxConcurrentSessionsUnlimited")
+                    let cap = max_sessions_cap.get()
+                    if cap >= 1 {
+                      cap.to_string()
+                    } else {
+                      @sf.t("web-pages.profiles.maxConcurrentSessionsUnlimited")
                     }
                   },
                   goes~,
