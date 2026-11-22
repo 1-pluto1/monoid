@@ -630,6 +630,72 @@ fn Admin::copies_routes(self : Admin) -> Array[Route] {
       }
       ok(jobj([("ok", jbool(true))]), status=202)
     }),
+    route("GET", "^\\/copies\\/history$", async fn(r, _) {
+      let limit : Int32 = match r.param("limit") {
+        Some(s) if s.length() > 0 => {
+          let mut n : Int32 = 0
+          let mut ok_num = true
+          for i in 0..<s.length() {
+            let c = s.unsafe_charcode_at(i)
+            if c >= '0' && c <= '9' {
+              if n < 1000 {
+                n = n * 10 + (c - '0')
+              }
+            } else {
+              ok_num = false
+              break
+            }
+          }
+          if !ok_num {
+            30
+          } else if n < 1 {
+            1
+          } else if n > 50 {
+            50
+          } else {
+            n
+          }
+        }
+        _ => 30
+      }
+      ok(
+        jobj([
+          ("records", self.backend.ask("copies.history", [ws(r), jint(limit)])),
+        ]),
+      ) catch {
+        e => error(500, message_of(e))
+      }
+    }),
+    route("GET", "^\\/copies\\/settings$", async fn(r, _) {
+      if !manages_station(r.viewer) {
+        return error(403, "only the workspace's owners and admins manage backup settings")
+      }
+      ok(self.backend.ask("copies.settings", [ws(r)])) catch {
+        e => error(500, message_of(e))
+      }
+    }),
+    route("PUT", "^\\/copies\\/settings$", async fn(r, _) {
+      if !manages_station(r.viewer) {
+        return error(403, "only the workspace's owners and admins manage backup settings")
+      }
+      guard copies_body(r) is Some(Obj(_) as b) else {
+        return error(400, "invalid JSON")
+      }
+      ok(self.backend.ask("copies.setSettings", [ws(r), b])) catch {
+        e => error(400, message_of(e))
+      }
+    }),
+    route("POST", "^\\/copies\\/s3\\/test$", async fn(r, _) {
+      if !manages_station(r.viewer) {
+        return error(403, "only the workspace's owners and admins test backup targets")
+      }
+      guard copies_body(r) is Some(Obj(_) as b) else {
+        return error(400, "invalid JSON")
+      }
+      ok(self.backend.ask("copies.testS3", [b])) catch {
+        e => error(400, message_of(e))
+      }
+    }),
     route("POST", "^\\/copies\\/restore$", async fn(r, _) {
       if !manages_station(r.viewer) {
         return error(
@@ -638,10 +704,15 @@ fn Admin::copies_routes(self : Admin) -> Array[Route] {
       }
       let b = copies_body(r)
       let from = field_of(b, "from")
+      let from_val = match (field_of(from, "station"), field_of(from, "s3")) {
+        (Some(Str(st)), _) if st != "" => Some(jobj([("station", js(st))]))
+        (_, Some(Str(s3))) if s3 != "" => Some(jobj([("s3", js(s3))]))
+        _ => None
+      }
       guard field_of(b, "station") is Some(Str(station)) &&
         field_of(b, "gen") is Some(Str(gen)) &&
-        field_of(from, "station") is Some(Str(from_station)) else {
-        return error(400, "station, gen and from: {station} are needed")
+        from_val is Some(fv) else {
+        return error(400, "station, gen and from: {station} or {s3} are needed")
       }
       // (it goes on as the copy is brought; how far it is, the station's settings show)
       self.later(async fn() {
@@ -649,7 +720,7 @@ fn Admin::copies_routes(self : Admin) -> Array[Route] {
           ws(r),
           js(station),
           js(gen),
-          jobj([("station", js(from_station))]),
+          fv,
         ])
       })
       ok(jobj([("restoring", jbool(true))]), status=202)
