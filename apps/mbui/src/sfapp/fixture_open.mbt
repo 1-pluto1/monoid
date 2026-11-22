@@ -654,7 +654,7 @@ pub fn open_mode(mode : String) -> Unit {
       n.d_runtime = n.runtime
     }
     if mode == "newchat-tui-model" { @sffixture.new_fix.claude_mode = true }
-    if mode == "newchat-ultrafast-model" {
+    if mode == "newchat-ultrafast-model" || mode.has_prefix("newchat-speed-") {
       let n = @sffixture.new_fix
       n.crowded = true
       n.ultrafast = true
@@ -662,6 +662,8 @@ pub fn open_mode(mode : String) -> Unit {
       n.runtime = "codex"
       n.d_model = n.model
       n.d_runtime = n.runtime
+      if mode == "newchat-speed-fast" { n.speed = "fast" }
+      if mode == "newchat-speed-ultrafast" { n.speed = "ultrafast" }
     }
     // (with models starred: under 喜欢 in its model's panel)
     if mode.has_suffix("-liked") {
