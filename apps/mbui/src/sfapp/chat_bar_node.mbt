@@ -211,14 +211,16 @@ fn chat_bar_of(b : @view.View, src : Source, r : ChatRef, stint : () -> Int) -> 
       }
     }
   })
-  // (soft GPU bottom-fade scrim behind floating liquid glass pills: protects title legibility while dissolving
-  // scrolled messages smoothly at the bar's bottom edge without a hard clip or glass-on-glass nesting)
+  // (UIScrollEdgeEffect.soft's place, not home_top_bar_node's full bar_h fade: the title is bare words, so the ground
+  // stays solid behind it and fades across the bar's foot, 16pt past it, messages gone before they reach the title
+  // while the pills' lower half shows them through; no blur yet, which the soft edge also has)
   narrow_bar_scrim_node(
     g,
     fn(s) {
       status_top_now(s.window_w()) + bar_h + state.open_way.shown(s) * state.row2_h.get() + state.crumb_h.get()
     },
-    fn(s) { if state.open_way.shown(s) > 0.0 || state.crumb_h.get() > 0.0 { 6.0 } else { 18.0 } },
+    fn(s) { if state.open_way.shown(s) > 0.0 || state.crumb_h.get() > 0.0 { 22.0 } else { 28.0 } },
+    past=16.0,
   )
   g.reacts(can_toggle, fn(ok) {
     if !ok && state.manual_expanded.get() {
