@@ -2711,18 +2711,33 @@ pub fn Tree::cycle_read(self : Tree) -> Bool {
 }
 
 ///|
+fn Tree::pointer_on(self : Tree) -> Bool {
+  self.pointer_xy.0 >= 0.0 && self.pointer_xy.1 >= 0.0
+}
+
+///|
 /// The clock set to `ms` (a frame's time).
 pub fn Tree::at(self : Tree, ms : Double) -> Unit {
   // (what the changes of the moment it was at owe, settled as of it before the clock goes on: Tree::withins_owed_now)
   if ms > self.clock.untracked() && !self.advancing && self.committing == 0 {
-    self.withins_owed_now()
+    if self.pointer_on() {
+      self.withins_owed_now()
+    } else {
+      self.withins_owed = false
+      self.hand_now()
+    }
   }
   self.frame_ms = ms
   self.clock_to(ms)
   self.beat_set(ms)
   // (and what the clock set so told left owed, settled as the host's setting it ends, as an event's is)
   if !self.advancing && self.committing == 0 {
-    self.withins_owed_now()
+    if self.pointer_on() {
+      self.withins_owed_now()
+    } else {
+      self.withins_owed = false
+      self.hand_now()
+    }
   }
 }
 
@@ -2731,12 +2746,15 @@ pub fn Tree::at(self : Tree, ms : Double) -> Unit {
 /// follows whether it is at or past a moment told so, as it comes to be so or not (View::drawn_past), each still read
 /// by what reads it and its node living, the rest let go; told of what was followed as this began, what is followed
 /// anew meanwhile kept for the next.
-fn Tree::clock_to(self : Tree, ms : Double) -> Unit {
+fn Tree::clock_to(self : Tree, ms : Double, beat? : Bool = false) -> Unit {
   // (the moment and whether it is past each followed, told as one: no reader sees the one without the other)
   @signals.start_batch()
   let ticking_was = self.ticking
   self.ticking = true
   self.clock.set(ms)
+  if beat {
+    self.beat.set(ms)
+  }
   if self.drawn_marks.length() > 0 {
     let keep = []
     for m in self.drawn_marks {
@@ -6847,8 +6865,7 @@ pub fn Tree::placed_against_laid(self : Tree, id : NodeId) -> (Bool, Double, Dou
 /// The clock set to `ms` and what is bound to it worked out there (what follows a way: View::drawn_while), as the
 /// layout at that moment asks (Tree::measured_now, View::grows_now); untracked, its caller's.
 fn Tree::bound_at(self : Tree, ms : Double) -> Unit {
-  self.clock_to(ms)
-  self.beat.set(ms)
+  self.clock_to(ms, beat=true)
   self.pull()
   self.draining += 1
   let mut i = 0
@@ -6929,8 +6946,7 @@ fn Tree::measured_now(self : Tree) -> Unit {
   })
   if shown != at {
     @signals.untracked(fn() {
-      self.clock_to(shown)
-      self.beat.set(shown)
+      self.clock_to(shown, beat=true)
     })
   }
   self.standing = was_standing
@@ -8738,16 +8754,14 @@ fn Tree::laid_now(self : Tree, via? : Int = 2) -> Bool {
   let was_standing = self.standing
   self.standing = true
   @signals.untracked(fn() {
-    self.clock_to(at)
-    self.beat.set(at)
+    self.clock_to(at, beat=true)
     self.pull()
     self.pass_via = via
     self.laid_out(at)
   })
   if shown != at {
     @signals.untracked(fn() {
-      self.clock_to(shown)
-      self.beat.set(shown)
+      self.clock_to(shown, beat=true)
     })
   }
   self.standing = was_standing
@@ -12470,8 +12484,7 @@ fn Tree::settle_layout_at(self : Tree, at : Double) -> Unit {
   let passes_was = self.work.passes
   let shown = self.clock.untracked()
   @signals.untracked(fn() {
-    self.clock_to(at)
-    self.beat.set(at)
+    self.clock_to(at, beat=true)
     self.pull()
     self.due = true
     self.pass_via = 3
@@ -12479,8 +12492,7 @@ fn Tree::settle_layout_at(self : Tree, at : Double) -> Unit {
   })
   if shown != at {
     @signals.untracked(fn() {
-      self.clock_to(shown)
-      self.beat.set(shown)
+      self.clock_to(shown, beat=true)
     })
   }
   self.standing = false
@@ -16539,6 +16551,9 @@ fn Tree::pointer_now(self : Tree, x : Double, y : Double) -> Unit {
   self.pointer_again = false
   self.pointer_xy = p
   self.withins_told() |> ignore
+  if p.0 < 0.0 {
+    self.withins_owed = false
+  }
   for at in self.besides_at {
     match self.nodes[at].beside {
       Some(b) if b.at_pointer && self.nodes[at].live => self.place_marked_at(at)
