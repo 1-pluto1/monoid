@@ -1884,10 +1884,6 @@
           return;
         }
         dirtyTold = true; dirtyWhole = false; dirty = [];
-        for (let i = 0; i < AD_MAX; i++) {
-          const s = adSlots[i];
-          if (s.active && s.settleLeft > 0) dirty.push([s.cx - s.hx - 4, s.cy - s.hy - 4, s.hx * 2 + 8, s.hy * 2 + 8]);
-        }
         presentCached(true);
       });
     });
@@ -2114,6 +2110,57 @@
       gb: [x0 - 2, y0 - 2, x1 + 2, y1 + 2],
       shape: mShape, rad: mRad, edge,
     };
+  }
+
+  // Host-added adaptive settle regions must include every capture they touch, including other captures they then reach.
+  function closeAdaptiveParts(parts, count) {
+    const grabs = [], wasCut = cutOn;
+    cutOn = false;
+    for (let start = 0; start < count;) {
+      const tid = f32[start * INST + 20];
+      let end = start + 1;
+      while (end < count && f32[end * INST + 20] === tid) end++;
+      if (tid < 0) {
+        const m = grabOf(start, end, count);
+        if (m) grabs.push([Math.max(0, m.px0 - 1), Math.max(0, m.pb0 - 1),
+          Math.min(canvas.width, m.px0 + m.w + 1), Math.min(canvas.height, m.pb0 + m.h + 1)]);
+      }
+      start = end;
+    }
+    cutOn = wasCut;
+    let changed;
+    do {
+      changed = false;
+      for (const p of parts) {
+        let x0 = p[0], y0 = p[1], x1 = x0 + p[2], y1 = y0 + p[3];
+        for (const g of grabs) {
+          if (x0 >= g[2] || x1 <= g[0] || y0 >= g[3] || y1 <= g[1]) continue;
+          if (x0 > g[0] || y0 > g[1] || x1 < g[2] || y1 < g[3]) {
+            x0 = Math.min(x0, g[0]); y0 = Math.min(y0, g[1]);
+            x1 = Math.max(x1, g[2]); y1 = Math.max(y1, g[3]);
+            changed = true;
+          }
+        }
+        p[0] = x0; p[1] = y0; p[2] = x1 - x0; p[3] = y1 - y0;
+      }
+      for (let i = 0; i < parts.length; i++) {
+        const a = parts[i];
+        let ax0 = a[0], ay0 = a[1], ax1 = ax0 + a[2], ay1 = ay0 + a[3];
+        for (let j = i + 1; j < parts.length;) {
+          const b = parts[j];
+          const bx0 = b[0], by0 = b[1], bx1 = bx0 + b[2], by1 = by0 + b[3];
+          if (ax0 <= bx1 && bx0 <= ax1 && ay0 <= by1 && by0 <= ay1) {
+            ax0 = Math.min(ax0, bx0); ay0 = Math.min(ay0, by0);
+            ax1 = Math.max(ax1, bx1); ay1 = Math.max(ay1, by1);
+            a[0] = ax0; a[1] = ay0; a[2] = ax1 - ax0; a[3] = ay1 - ay0;
+            parts.splice(j, 1);
+            changed = true;
+          } else {
+            j++;
+          }
+        }
+      }
+    } while (changed);
   }
 
   function grabLevels(m) {
@@ -2735,7 +2782,8 @@
     adCurDt = adNextDt();
     adFrameSerial++;
     const whole = !dirtyTold || dirtyWhole || missing;
-    if (!whole && adSettling) {
+    const adaptiveDamage = !whole && adSettling;
+    if (adaptiveDamage) {
       for (let i = 0; i < AD_MAX; i++) {
         const s = adSlots[i];
         if (s.active && s.settleLeft > 0) dirty.push([s.cx - s.hx - 4, s.cy - s.hy - 4, s.hx * 2 + 8, s.hy * 2 + 8]);
@@ -2771,6 +2819,7 @@
       return;
     }
     const parts = takeParts(cvOk);
+    if (parts && adaptiveDamage) closeAdaptiveParts(parts, n);
     target = cv.fb;
     // the frame's instances and its shapes' pieces uploaded once, whether drawn whole or a part at a time (each part
     // uploaded them all again: a list scrolled spent a fifth of its frames in bufferData)
