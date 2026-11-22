@@ -229,10 +229,16 @@ test "a station's page in three parts: 概览 what runs on it, 进程 what still
 test "a new station's backup to restore is a row of its 设置, 恢复到这台 its one button" {
   for (w, platform) in page_cases {
     let at = "\{w} platform \{platform}"
+    // legacy station without backup field: quiet backup status stays hidden
+    let legacy = setting_tester(Station("ws1/st1"), w, platform~, mode="settings-station-copies-alone", h=2400.0)
+    legacy.run_for(@ui.move_most_ms)
+    assert_true(legacy.find("再加一台 station 就会自动备份") is None, msg="quiet legacy backup status not shown: \{at}")
+    assert_true(legacy.find("恢复到这台") is None, msg="nothing to press: \{at}")
+    // station with backup settings (no restore offers): quiet backup status stays in the dedicated 备份 tab, not Station 设置
     let t = setting_tester(Station("ws1/st1"), w, platform~, mode="settings-station-copies", h=2400.0)
     t.run_for(@ui.move_most_ms)
-    assert_true(t.find("已备份到 Cedar 和 Aspen · 2 分钟前") is None, msg="quiet backup status not shown: \{at}")
-    assert_true(t.find("恢复到这台") is None, msg="nothing to press: \{at}")
+    assert_true(t.find("已备份到 Cedar 和 Aspen · 2 分钟前") is None, msg="quiet backup status moved to 备份 tab: \{at}")
+    assert_true(t.find("允许替其他 Station 存备份") is None, msg="config not shown in Station 设置: \{at}")
     // a new station: the backup of a station no longer there in 设置, 恢复到这台 its one button
     let r = setting_tester(Station("ws1/st1"), w, platform~, mode="settings-station-restore-offer", h=2400.0)
     r.run_for(@ui.move_most_ms)
@@ -250,6 +256,267 @@ test "a new station's backup to restore is a row of its 设置, 恢复到这台 
     assert_true(r.find("恢复到这台") is None, msg="not on the overview: \{at}")
     assert_true(r.find("Old Mac 的 128 个聊天") is None, msg="not on the overview: \{at}")
   }
+}
+
+///|
+test "backup tab and per-station backup page: sidebar row, unified apply with shared generated key, per-station flat config, S3 form, restore from S3, offline/non-admin read-only, audit clean" {
+  // 1. Settings list has 备份 right between 归档 and 用量
+  let nav = setting_tester(Home, 390.0, platform=2, h=1800.0)
+  nav.run_for(@ui.move_most_ms)
+  let arch_y = nav.find("归档").unwrap().1
+  let back_y = nav.find("备份").unwrap().1
+  let usage_y = nav.find("用量").unwrap().1
+  assert_true(arch_y < back_y && back_y < usage_y, msg="备份 between 归档 and 用量: \{arch_y} < \{back_y} < \{usage_y}")
+  assert_eq(nav.audit(), [], msg="audit settings home")
+  // 2. Top-level Backup tab: unified settings + sequential multi-station apply sharing generatedKeys + station row navigation
+  for (w, platform) in [(390.0, 2), (1280.0, 0)] {
+    let at = "\{w} platform \{platform}"
+    let calls : Array[(String, Json)] = []
+    let t = setting_tester(Backup, w, platform~, mode="settings-backup", h=2600.0, over=fn(s) {
+      {
+        ..s,
+        call: fn(name, params, done) {
+          if name == "copies.setSettings" {
+            calls.push((name, params))
+            // First station generates an encryption key + id for the new S3 target when s3 is sent
+            if calls.length() == 1 && field(Some(params), "s3") is Some(Array(_)) {
+              done(
+                Ok(
+                  @settings.obj([
+                    (
+                      "generatedKeys",
+                      @settings.obj([("r2abc123", Json::string("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"))]),
+                    ),
+                  ]),
+                ),
+              )
+            } else {
+              done(Ok(@settings.obj([])))
+            }
+            return
+          }
+          (s.call)(name, params, done)
+        },
+      }
+    })
+    t.run_for(@ui.move_most_ms)
+    assert_true(t.find("统一设置") is Some(_), msg="unified heading: \{at}")
+    assert_true(t.find("各 Station") is Some(_), msg="stations heading: \{at}")
+    assert_true(t.find("应用到全部在线 Station") is Some(_), msg="apply button: \{at}")
+    assert_true(t.find("Willow") is Some(_), msg="station Willow: \{at}")
+    assert_true(t.find("Maple") is Some(_), msg="station Maple: \{at}")
+    assert_true(t.find("手动互备：Cedar · Cloudflare R2 · 接收互备") is Some(_), msg="Willow settingsSummary: \{at}")
+    assert_true(t.find("自动互备（2 台） · 接收互备") is Some(_), msg="Maple settingsSummary: \{at}")
+    assert_eq(t.audit(), [], msg="audit backup tab \{at}: \{Repr(t.audit())}")
+    assert_eq(t.squeeze_faults(), [], msg="squeeze backup tab \{at}: \{Repr(t.squeeze_faults())}")
+    // Bug A: clicking 应用到全部在线 Station without touching S3 must NOT send `s3` field
+    t.click(Button, label="应用到全部在线 Station")
+    t.run_for(@ui.move_most_ms)
+    assert_eq(calls.length(), 2, msg="two online stations updated (mode only): \{at}")
+    assert_eq(text(Some(calls[0].1), "station"), "ws1/st1", msg="first station: \{at}")
+    assert_eq(text(Some(calls[1].1), "station"), "ws1/st2", msg="second station: \{at}")
+    assert_true(field(Some(calls[0].1), "s3") is None, msg="no s3 sent when untouched (st1): \{at}")
+    assert_true(field(Some(calls[1].1), "s3") is None, msg="no s3 sent when untouched (st2): \{at}")
+    // Bug B: adding a new R2 target marks s3 dirty and propagates BOTH generated id and encryptionKey from first succeeding station to rest
+    calls.clear()
+    t.tap_text("添加")
+    t.run_for(@ui.move_most_ms)
+    t.click(TextField, label="名称")
+    t.type_text("R2 Extra")
+    t.click(TextField, label="Bucket")
+    t.type_text("extra-bkt")
+    t.click(TextField, label="Endpoint URL")
+    t.type_text("https://extra.r2.cloudflarestorage.com")
+    t.click(TextField, label="Access Key ID")
+    t.type_text("AKEXTRA")
+    t.click(TextField, label="Secret Access Key")
+    t.type_text("SKEXTRA")
+    t.run_for(@ui.move_most_ms)
+    t.click(Button, label="保存")
+    t.run_for(@ui.move_most_ms)
+    t.click(Button, label="应用到全部在线 Station")
+    t.run_for(@ui.move_most_ms)
+    assert_eq(calls.length(), 2, msg="two online stations updated (with new s3): \{at}")
+    let second_s3 = items(Some(calls[1].1), "s3")
+    assert_eq(second_s3.length(), 2, msg="second station s3 count: \{at}")
+    let propagated = second_s3.iter().find_first(fn(x) { text(Some(x), "name") == "R2 Extra" })
+    assert_true(propagated is Some(_), msg="new target present on second station: \{at}")
+    assert_eq(text(propagated, "id"), "r2abc123", msg="generated id propagated to second station: \{at}")
+    assert_eq(
+      text(propagated, "encryptionKey"),
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      msg="shared generated key propagated to second station: \{at}",
+    )
+    // Recovery key dialog popped once
+    assert_true(t.find("保存端到端加密恢复密钥") is Some(_), msg="generated key dialog: \{at}")
+    t.click(Button, label="我已保存")
+    t.run_for(@ui.move_most_ms)
+    // Clicking a station row navigates to StationBackup(address)
+    let willow_rows = t.words().filter(fn(x) { x.0 == "Willow" })
+    assert_true(willow_rows.length() >= 1, msg="Willow row visible: \{at}")
+    let last_w = willow_rows[willow_rows.length() - 1]
+    t.tap(last_w.1 + last_w.3 / 2.0, last_w.2 + last_w.4 / 2.0)
+    t.run_for(@ui.move_most_ms)
+    assert_true(app.nav.top() == Setting(StationBackup("ws1/st1")), msg="navigated to StationBackup: \{at}")
+  }
+  // 3. Per-station StationBackup page: flat config, acceptOthers, S3 form, 1.3x scale, English + 320px narrow
+  for (w, platform) in [(390.0, 2), (1280.0, 0)] {
+    let at = "\{w} platform \{platform}"
+    let calls : Array[(String, Json)] = []
+    let t = setting_tester(StationBackup("ws1/st1"), w, platform~, mode="settings-backup-station", h=2600.0, over=fn(s) {
+      {
+        ..s,
+        call: fn(name, params, done) {
+          if name.has_prefix("copies.") {
+            calls.push((name, params))
+            if name == "copies.testS3" {
+              done(Ok(@settings.obj([("ok", Json::boolean(true))])))
+              return
+            }
+            if name == "copies.setSettings" {
+              done(
+                Ok(
+                  @settings.obj([
+                    (
+                      "generatedKeys",
+                      @settings.obj([("r2-new", Json::string("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"))]),
+                    ),
+                  ]),
+                ),
+              )
+              return
+            }
+          }
+          (s.call)(name, params, done)
+        },
+      }
+    })
+    t.run_for(@ui.move_most_ms)
+    assert_true(t.find("已备份到 Cedar 和 Cloudflare R2 · 2 分钟前") is Some(_), msg="summary: \{at}")
+    assert_true(t.find("备份记录") is Some(_), msg="history heading: \{at}")
+    assert_true(t.find("同步成功 · R2 / S3 · 42 个聊天 · 3 批 · 18.4 MB") is Some(_), msg="history R2 ok: \{at}")
+    assert_true(t.find("同步成功 · Station · 42 个聊天 · 2 批 · 18.4 MB") is Some(_), msg="history Cedar ok: \{at}")
+    assert_true(t.find("AWS S3") is Some(_), msg="history AWS S3 target: \{at}")
+    assert_true(t.find("同步失败 · R2 / S3 · 无法连接") is Some(_), msg="history AWS S3 fail: \{at}")
+    assert_true(t.find("备份方式") is Some(_), msg="mode label: \{at}")
+    assert_true(t.find("Cedar") is Some(_), msg="peer Cedar: \{at}")
+    assert_true(t.find("不接收他人备份") is Some(_), msg="peer Aspen declined: \{at}")
+    assert_true(t.find("当前离线") is Some(_), msg="peer Birch offline: \{at}")
+    assert_true(t.find("允许替其他 Station 存备份") is Some(_), msg="acceptOthers switch: \{at}")
+    assert_true(t.find("R2 / S3 对象存储") is Some(_), msg="s3 heading: \{at}")
+    assert_true(t.find("Cloudflare R2") is Some(_), msg="s3 target name: \{at}")
+    assert_true(t.find("stillfail-backups") is Some(_), msg="s3 bucket: \{at}")
+    assert_true(t.find("密钥指纹 ab12cd34") is Some(_), msg="s3 key fingerprint: \{at}")
+    assert_eq(t.audit(), [], msg="audit station backup \{at}: \{Repr(t.audit())}")
+    assert_eq(t.squeeze_faults(), [], msg="squeeze station backup \{at}: \{Repr(t.squeeze_faults())}")
+    // 1.3x font scale check
+    t.set_font_scale(1.3)
+    t.run_for(@ui.move_most_ms)
+    assert_eq(t.squeeze_faults(), [], msg="squeeze 1.3x \{at}: \{Repr(t.squeeze_faults())}")
+    t.set_font_scale(1.0)
+    t.run_for(@ui.move_most_ms)
+    // Clicking 刷新 triggers copies.history again
+    let hist_before = calls.filter(fn(c) { c.0 == "copies.history" }).length()
+    t.tap_text("刷新")
+    t.run_for(@ui.move_most_ms)
+    let hist_after = calls.filter(fn(c) { c.0 == "copies.history" }).length()
+    assert_eq(hist_after, hist_before + 1, msg="refresh triggers copies.history: \{at}")
+    // Toggle acceptOthers switch -> copies.setSettings for ws1/st1 only
+    t.click(Switch, label="允许替其他 Station 存备份")
+    t.run_for(@ui.move_most_ms)
+    assert_true(
+      calls.iter().any(fn(c) { c.0 == "copies.setSettings" && text(Some(c.1), "station") == "ws1/st1" && !flag(Some(c.1), "acceptOthers") }),
+      msg="acceptOthers call: \{at}",
+    )
+    // Click 添加 to open S3 add form dialog/sheet directly and audit it
+    t.tap_text("添加")
+    t.run_for(@ui.move_most_ms)
+    assert_true(t.find("添加 R2 / S3 对象存储") is Some(_), msg="s3 form title: \{at}")
+    assert_true(t.find("测试连接") is Some(_), msg="test button: \{at}")
+    assert_eq(t.audit(), [], msg="audit form \{at}: \{Repr(t.audit())}")
+    assert_eq(t.squeeze_faults(), [], msg="squeeze form \{at}: \{Repr(t.squeeze_faults())}")
+    t.click(Button, label="取消")
+    t.run_for(@ui.move_most_ms)
+    // English + 320px narrow check
+    @sf.set_language(Some("en"))
+    t.run_for(@ui.move_most_ms)
+    assert_true(t.find("R2 / S3 storage") is Some(_), msg="en s3 heading: \{at}")
+    assert_eq(t.audit(), [], msg="en audit \{at}: \{Repr(t.audit())}")
+    assert_eq(t.squeeze_faults(), [], msg="en squeeze \{at}: \{Repr(t.squeeze_faults())}")
+    @sf.set_language(None)
+  }
+  // 4. 320px narrow Backup & StationBackup clean
+  let n320 = setting_tester(StationBackup("ws1/st1"), 320.0, platform=2, mode="settings-backup-station", h=2600.0)
+  n320.run_for(@ui.move_most_ms)
+  assert_true(n320.find("备份记录") is Some(_), msg="320px history heading")
+  assert_eq(n320.audit(), [], msg="320px audit: \{Repr(n320.audit())}")
+  assert_eq(n320.squeeze_faults(), [], msg="320px squeeze: \{Repr(n320.squeeze_faults())}")
+  // 4b. Empty history and error history states
+  let empty_h = setting_tester(StationBackup("ws1/st1"), 390.0, platform=2, mode="settings-backup-station", h=2400.0, over=fn(s) {
+    {
+      ..s,
+      call: fn(name, params, done) {
+        if name == "copies.history" {
+          done(Ok(@settings.obj([("records", Json::array([]))])))
+          return
+        }
+        (s.call)(name, params, done)
+      },
+    }
+  })
+  empty_h.run_for(@ui.move_most_ms)
+  assert_true(empty_h.find("暂无备份记录") is Some(_), msg="empty history message")
+  assert_eq(empty_h.audit(), [], msg="empty history audit")
+  let err_h = setting_tester(StationBackup("ws1/st1"), 390.0, platform=2, mode="settings-backup-station", h=2400.0, over=fn(s) {
+    {
+      ..s,
+      call: fn(name, params, done) {
+        if name == "copies.history" {
+          done(Err(@settings.obj([("code", Json::string("not_found")), ("message", Json::string("404 Not Found"))])))
+          return
+        }
+        (s.call)(name, params, done)
+      },
+    }
+  })
+  err_h.run_for(@ui.move_most_ms)
+  assert_true(err_h.find("当前 Station 版本暂不支持查看备份记录") is Some(_), msg="unsupported history message")
+  assert_eq(err_h.audit(), [], msg="error history audit")
+  // 5. Offline station hides write controls
+  let off = setting_tester(StationBackup("ws1/st1"), 390.0, platform=2, mode="settings-station-away", h=1600.0)
+  off.run_for(@ui.move_most_ms)
+  assert_true(off.find("Station 当前离线，上线后可修改备份配置。") is Some(_), msg="offline notice")
+  assert_true(off.find("备份方式") is None, msg="no write controls when offline")
+  assert_eq(off.audit(), [], msg="offline audit")
+  // 6. Restore from S3 on StationBackup passes fromS3 (not fromStation)
+  let restore_calls : Array[(String, Json)] = []
+  let r = setting_tester(StationBackup("ws1/st1"), 390.0, platform=2, mode="settings-backup-restore-s3", h=2400.0, over=fn(s) {
+    {
+      ..s,
+      call: fn(name, params, done) {
+        if name == "copies.restore" {
+          restore_calls.push((name, params))
+          done(Ok(@settings.obj([])))
+          return
+        }
+        (s.call)(name, params, done)
+      },
+    }
+  })
+  r.run_for(@ui.move_most_ms)
+  assert_true(r.find("Old Mac 的 128 个聊天 · 来自 Cloudflare R2") is Some(_), msg="s3 offer line")
+  assert_eq(r.audit(), [], msg="audit restore s3")
+  assert_eq(r.squeeze_faults(), [], msg="squeeze restore s3")
+  r.click(Button, label="恢复到这台")
+  r.run_for(@ui.move_most_ms)
+  let btns = r.words().filter(fn(w) { w.0 == "恢复到这台" })
+  assert_true(btns.length() >= 1)
+  let last = btns[btns.length() - 1]
+  r.tap(last.1 + last.3 / 2.0, last.2 + last.4 / 2.0)
+  r.run_for(@ui.move_most_ms)
+  assert_eq(restore_calls.length(), 1)
+  assert_eq(text(Some(restore_calls[0].1), "fromS3"), "r2-1")
+  assert_eq(text(Some(restore_calls[0].1), "fromStation"), "")
 }
 
 ///|
