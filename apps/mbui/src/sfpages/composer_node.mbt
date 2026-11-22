@@ -521,6 +521,20 @@ fn composer_node_of(
 let composer_seam_fade : Double = 18.0
 
 ///|
+/// While the soft keyboard is up (someone writing in it on a phone), what the chat holds fades out behind the composer
+/// too, so a picture or a busy message passing under its glass does not drown what is being written: the page's own
+/// ground, as good as solid at the foot and clear `composer_backdrop_fade` above the seam under the composer. It comes
+/// and goes with the keyboard (`composer_backdrop_in_ms`, `composer_backdrop_out_ms`), and is not there with keyboard
+/// and mouse, where the glass stays open as it was made to be.
+let composer_backdrop_fade : Double = 220.0
+
+///|
+let composer_backdrop_in_ms : Double = 220.0
+
+///|
+let composer_backdrop_out_ms : Double = 200.0
+
+///|
 fn composer_foot_scrim_node(
   foot : @view.View,
   roomy : () -> Bool,
@@ -566,6 +580,49 @@ fn composer_foot_scrim_node(
       |> ignore
     })
     |> ignore
+    // (the keyboard's fade: composer_backdrop_fade's, eased in as it comes up and out as it goes; nothing of it with
+    // keyboard and mouse, where no keyboard comes up)
+    if !@sf.soft_keyboard() {
+      return
+    }
+    let typing = @motion.NodeWay::new(if @signals.untracked(fn() { scrim.keyboard_inset() }) > 0.0 { 1.0 } else { 0.0 })
+    scrim.reacts(fn() { scrim.keyboard_inset() > 0.0 }, fn(up) {
+      if up {
+        typing.go_ms(scrim, 1.0, composer_backdrop_in_ms)
+      } else {
+        typing.go_ms(scrim, 0.0, composer_backdrop_out_ms, ease=Leave)
+      }
+    })
+    // (made only while the keyboard is up, and as it fades out once it goes: nothing more on a chat opened without it)
+    scrim.show(fn() { scrim.keyboard_inset() > 0.0 }, leave=composer_backdrop_out_ms, fn(lift) {
+      lift
+      .over(Is(true))
+      .width_share(Is(1.0))
+      .height_share(Is(1.0))
+      .lies_along(Is(End))
+      .points(Is(false))
+      .alpha(By(fn() { typing.shown(lift) }))
+      |> ignore
+      lift.box(fn(band) {
+        band
+        .width_share(Is(1.0))
+        .height(By(fn() { Some(seam_h() + 6.0 + composer_backdrop_fade) }))
+        .fades(Is((0.0, composer_backdrop_fade, 0.0, 0.0)))
+        .points(Is(false))
+        |> ignore
+        band.box(fn(fill) {
+          fill
+          .width_share(Is(1.0))
+          .height_share(Is(1.0))
+          .points(Is(false))
+          .ground(By(fn() { @sf.theme().p.bg }))
+          .alpha(Is(254.0 / 255.0))
+          |> ignore
+        })
+        |> ignore
+      })
+      |> ignore
+    })
   })
   |> ignore
 }
