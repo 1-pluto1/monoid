@@ -1,8 +1,9 @@
-// A slider as nodes (value_slider_node): read out a slider with its value; a press along it goes there, the keys step
-// it; held, its value over it in a bubble, gone as it is let go; at rest nothing of the bubble, nothing reading the clock.
+// Unified iOS 26 value slider (`value_slider_node` delegating to `@glass.liquid_slider_node`):
+// semantic readout & keyboard stepping, flush 40x24 capsule geometry, 6->10pt elastic track thickening,
+// lazy 1.5x (~60x36pt) clear liquid glass lens with zero relayout (`laid == 0`), and unclipped value bubble in `tips`.
 
 ///|
-/// Moments the tests here look at: held long enough for its drop and bubble to be whole, past every way.
+/// Moments the tests here look at: held long enough for the lens and bubble to reach peak, and past every spring.
 let slider_held_ms : Double = 400.0
 
 ///|
@@ -48,8 +49,8 @@ test "a slider held: there where it is pressed, its value over it while held, no
   let v = @signals.signal(40.0)
   let t = slider_case(v)
   let words_rest = t.words().length()
-  // (pressed three quarters along: its knob's middle runs from half a knob in to as far from its end)
-  let x = 20.0 + 10.0 + 0.75 * (300.0 - 20.0)
+  // (pressed three quarters along: flush 40pt capsule thumb middle runs from 20pt in to 20pt from its end)
+  let x = 20.0 + 20.0 + 0.75 * (300.0 - 40.0)
   t.press_at(x, 60.0 + 14.0)
   t.run_for(slider_held_ms)
   let held_v = v.get()
@@ -64,7 +65,7 @@ test "a slider written as it says: read out so, and so in its bubble while held"
   let v = @signals.signal(40.0)
   let t = slider_case(v, format=fn(n) { "\{n}%" })
   let said = t.semantics().filter(fn(n) { n.role == Slider }).map(fn(n) { n.value })
-  let x = 20.0 + 10.0 + 0.75 * (300.0 - 20.0)
+  let x = 20.0 + 20.0 + 0.75 * (300.0 - 40.0)
   t.press_at(x, 60.0 + 14.0)
   t.run_for(slider_held_ms)
   let bubble = t.words().map(fn(w) { w.0 })
@@ -74,7 +75,7 @@ test "a slider written as it says: read out so, and so in its bubble while held"
 }
 
 ///|
-test "a slider given the tips' layer: its bubble there, over the knob above the slider, whatever clips what holds it; gone as it is let go" {
+test "a slider given the tips' layer: its bubble there, over the thumb above the slider, whatever clips what holds it; gone as it is let go" {
   let v = @signals.signal(40.0)
   let t = @ui.Tester::new(fn(_c) {  }, w=390.0, h=300.0)
   t.check_looks(false)
@@ -94,7 +95,7 @@ test "a slider given the tips' layer: its bubble there, over the knob above the 
     layer.val = Some(root.box(fn(l) { l.over(Is(true)) |> ignore }))
   })
   t.draw()
-  let x = 20.0 + 10.0 + 0.75 * (300.0 - 20.0)
+  let x = 20.0 + 20.0 + 0.75 * (300.0 - 40.0)
   t.press_at(x, 60.0 + 14.0)
   t.run_for(slider_held_ms)
   let bubble = t.words().filter(fn(w) { w.0 == "7" || w.0 == "5" || w.0 == "%" })
@@ -132,8 +133,8 @@ test "value_slider_node: lazy clear liquid glass lens on press, zero relayout du
     )
     t.draw()
     assert_eq(t.drawn_glass().length(), 0, msg="mode=\{mode}: rest must draw 0 glass")
-    let x0 = 20.0 + 10.0 + 0.4 * (300.0 - 20.0)
-    let x1 = 20.0 + 10.0 + 0.75 * (300.0 - 20.0)
+    let x0 = 20.0 + 20.0 + 0.4 * (300.0 - 40.0)
+    let x1 = 20.0 + 20.0 + 0.75 * (300.0 - 40.0)
     let y = 60.0 + 14.0
     t.press_at(x0, y)
     t.run_for(part_whole_ms)
@@ -155,4 +156,81 @@ test "value_slider_node: lazy clear liquid glass lens on press, zero relayout du
     assert_eq(t.drawn_glass().length(), 0, msg="mode=\{mode}: settled must return to 0 glass")
     @ui.set_glass_solid(None)
   }
+}
+
+///|
+test "value_slider_node: unified iOS 26 6pt -> 10pt elastic track thickening and ~60x36pt clear pill lens with laid == 0" {
+  let v = @signals.signal(40.0)
+  let t = @ui.Tester::new(fn(_c) {  }, w=390.0, h=300.0, platform=0)
+  t.check_looks(false)
+  @ui.set_view_app(
+    fn(root) {
+      root.box(fn(b) {
+        b.padding(Is((20.0, 60.0, 20.0, 0.0))).lines_up(Is(Some(Start))) |> ignore
+        b.box(fn(s) {
+          s.width(Is(Some(300.0))) |> ignore
+          value_slider_node(s, fn() { "音量" }, fn() { v.get() }, fn(x) { v.set(x) }, bubble=false) |> ignore
+        })
+        |> ignore
+      })
+      |> ignore
+    },
+    theme=ui_theme_now,
+  )
+  t.draw()
+  let track_col = theme().p.line_strong
+  let accent_col = theme().p.accent
+  let track_rect = fn() raise {
+    let rs = t.drawn_rects().filter(fn(r) { r.4 == track_col && r.2 > 200.0 })
+    assert_eq(rs.length(), 1, msg="expected 1 value_slider background track rect")
+    rs[0]
+  }
+  let fill_rect = fn() raise {
+    let rs = t.drawn_rects().filter(fn(r) { r.4 == accent_col && r.2 > 20.0 })
+    assert_eq(rs.length(), 1, msg="expected 1 value_slider active fill rect")
+    rs[0]
+  }
+  let rest_tr = track_rect()
+  let rest_fl = fill_rect()
+  assert_true((rest_tr.3 - 6.0).abs() < 0.05, msg="rest track height must be 6pt, got \{rest_tr.3}")
+  assert_true((rest_fl.3 - 6.0).abs() < 0.05, msg="rest fill height must be 6pt, got \{rest_fl.3}")
+  let rest_cy = rest_tr.1 + rest_tr.3 / 2.0
+
+  // Press and hold: track & fill thicken from 6pt to ~10pt centered at rest_cy, lens is ~60x36pt horizontal liquid pill.
+  let x0 = 20.0 + 20.0 + 0.4 * (300.0 - 40.0)
+  let x1 = 20.0 + 20.0 + 0.72 * (300.0 - 40.0)
+  let y = 60.0 + 14.0
+  t.press_at(x0, y)
+  t.run_for(slider_held_ms)
+  let held_tr = track_rect()
+  let held_fl = fill_rect()
+  assert_true(held_tr.3 >= 9.5 && held_tr.3 <= 10.6, msg="held track height must thicken to ~10pt, got \{held_tr.3}")
+  assert_true(held_fl.3 >= 9.5 && held_fl.3 <= 10.6, msg="held fill height must thicken to ~10pt, got \{held_fl.3}")
+  let held_cy = held_tr.1 + held_tr.3 / 2.0
+  assert_true((held_cy - rest_cy).abs() < 0.1, msg="thickened track must stay centered (\{held_cy} vs \{rest_cy})")
+
+  let lenses = t.drawn_instances().filter(fn(i) { i[5] == 6.0 })
+  assert_eq(lenses.length(), 1, msg="held must draw 1 clear liquid glass lens")
+  let lw = lenses[0][2]
+  let lh = lenses[0][3]
+  assert_true(
+    lw >= 57.0 && lw <= 63.0 && lh >= 34.0 && lh <= 38.0,
+    msg="held lens must be unified iOS 26 liquid pill (~60x36pt), got \{lw}x\{lh}",
+  )
+
+  // Dragging must not trigger relayout.
+  t.tree_frames_from_now()
+  t.move_to(x1, y)
+  t.run_for(part_whole_ms / 2.0)
+  for f in t.tree_frames() {
+    assert_eq(f.laid, 0, msg="value_slider_node drag must not relayout: \{Repr(f)}")
+  }
+
+  // Release and settle: track & fill return to 6pt.
+  t.release(x1, y)
+  t.run_for(slider_past_ms)
+  let done_tr = track_rect()
+  let done_fl = fill_rect()
+  assert_true((done_tr.3 - 6.0).abs() < 0.05, msg="settled track height must return to 6pt, got \{done_tr.3}")
+  assert_true((done_fl.3 - 6.0).abs() < 0.05, msg="settled fill height must return to 6pt, got \{done_fl.3}")
 }
