@@ -502,8 +502,12 @@ if part ts; then
   if touches '^station/mb/|^scripts/mb-station\.ts$'; then
     step "the station in MoonBit: errors shown, raw shell sockets and main-thread disk waits only fall, no bare fork, no monotonic wall, no shared .tmp, no reparsed JSON, no raw shell fetch, no SHA-256, SHA-1, CRC-32, base64, civil calendar or flate/adler of its own" node scripts/mb-station.ts
   fi
-  # Every RPC and tell that reader/ makes of the station is answered in station_main and Node's mb-actor.ts.
-  if touches '^station/(src|mb)/|^station/test/mb-station-contracts\.test\.ts$'; then
+  # Every RPC and tell the shipped reader/ makes of Node is answered in Node's mb-actor.ts (station/AGENTS.md).
+  if touches '^station/(src|mb)/|^station/test/mb-reader-contracts\.test\.ts$'; then
+    step "reader ↔ Node contracts" node --test station/test/mb-reader-contracts.test.ts
+  fi
+  # The frozen station_main stays wired in itself; station/src/ changes do not touch it (station/AGENTS.md).
+  if touches '^station/mb/|^station/test/mb-station-contracts\.test\.ts$'; then
     step "station MoonBit contracts" node --test station/test/mb-station-contracts.test.ts
   fi
   # Core tests also run for Rust-only client changes. A fresh CI checkout needs both
@@ -518,13 +522,6 @@ if part ts; then
     step "mbui budgets only fall" node scripts/mbui-budgets.ts "$range"
   fi
   if touches '^scripts/mbui-budgets\.ts$|^test/mbui-budgets\.test\.ts$'; then step "mbui budgets test" node --test test/mbui-budgets.test.ts; fi
-  # Changes to station/src/ production code also update station/mb/ or explain why (`Station-parity: <why>`).
-  if { [ "$mode" = push ] || [ "$mode" = full ]; } && touches '^station/src/|^scripts/station-parity\.ts$'; then
-    step "station dual-track parity" node scripts/station-parity.ts "$range"
-  fi
-  if touches '^scripts/station-parity\.ts$|^test/station-parity\.test\.ts$'; then
-    step "station parity test" node --test test/station-parity.test.ts
-  fi
   # The stable channel's release notes (scripts/changelog.ts): each one read as CI will.
   if touches '^docs/releases/|^scripts/changelog\.ts$'; then step "release notes" sh -c 'node scripts/changelog.ts --stable > /dev/null'; fi
   # Root tests also import the core's Markdown reader. Wait for its packages on a cold checkout, as the web does.
@@ -610,7 +607,7 @@ if [ $full = 1 ]; then
   if part ts && touches "$ts_cloud"; then remembered "tests: cloud" "cloud client/i18n shared/lock.ts shared/log-keep.ts shared/rules-runtime.ts client/core-ts/src/lock-form.ts rules/js" after cloud sh -c 'cd cloud && pnpm test'; fi
   # The station: it and its tests run whenever it, one of its native parts or the words it says changed (station_paths:
   # scripts/plan.sh reads it from this line for CI's check-station).
-  station_paths='^station/|^shared/|^vendor/|^client/i18n/|^client/core-ts/src/features\.ts$|^client/shell/|^libs/mesh-transport/|^libs/ui/src/effect/|^libs/base/(src/|moon\.mod$)|^rules/(js|src)/|^pion/rules/js/|^rules/moon\.mod$|^scripts/native\.ts$|^scripts/station-slice\.sh$'
+  station_paths='^station/|^shared/|^vendor/|^client/i18n/|^client/core-ts/src/features\.ts$|^client/shell/|^libs/mesh-transport/|^libs/ui/src/effect/|^libs/base/(src/|moon\.mod$)|^rules/(js|src)/|^pion/rules/js/|^rules/moon\.mod$|^scripts/native\.ts$|^scripts/station-slice\.sh$|^scripts/check\.sh$'
   # Its tests' native parts, prebuilt (mesh addon, runner, the reader in MoonBit, and for darwin-arm64 and linux-x64
   # the Rust station's archive command, the launcher, which runs the whole station in mb-live-station.test.ts, and the
   # tests' MoonBit program with every package's harness, reader-harness: the mb-*.test.ts files').
