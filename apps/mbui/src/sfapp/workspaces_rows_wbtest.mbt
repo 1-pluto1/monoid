@@ -202,7 +202,8 @@ test "the workspaces: the one in use changed while they are up is the one checke
     t.run_for(@ui.move_most_ms)
     let was = (ws_at(t, "星火工作室", at), ws_at(t, "个人", at))
     assert_true(ws_selected(t, "星火工作室") && !ws_selected(t, "个人"), msg=at)
-    app.picked.set("ws2")
+    // (switched as a press switches it: a cause, what it changes making its way)
+    @view.transition(fn() { app.picked.set("ws2") })
     t.frame()
     t.run_for(@ui.move_most_ms)
     assert_eq((ws_at(t, "星火工作室", at), ws_at(t, "个人", at)), was, msg=at)
@@ -398,13 +399,13 @@ fn ws_softs(t : @ui.Tester) -> (Double, Double) {
 }
 
 ///|
-/// The lines 1 high drawn across the workspaces' panel: their tops.
+/// The lines (rule_w high) drawn across the workspaces' panel: their tops.
 fn ws_rules(t : @ui.Tester) -> Array[Double] {
   guard ws_panel(t) is Some(p) else { return [] }
   let (sx, sy, sw, sh) = p.rect
   t
   .drawn_rects()
-  .filter(fn(r) { r.3 == 1.0 && r.2 > sw / 2.0 && r.0 >= sx && r.0 < sx + sw && r.1 >= sy && r.1 < sy + sh })
+  .filter(fn(r) { r.3 == @sf.rule_w && r.2 > sw / 2.0 && r.0 >= sx && r.0 < sx + sw && r.1 >= sy && r.1 < sy + sh })
   .map(fn(r) { r.1 })
 }
 
