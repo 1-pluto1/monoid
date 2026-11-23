@@ -2500,11 +2500,23 @@ async fn Actors::on_event(self : Actors, a : Actor, generation : Int, event : Js
       let why = str_of(event.value("why")).unwrap_or("")
       ignore(
         self.enqueue(a, async fn() {
-          if !self.is_current(a, generation) || a.tools_lost is Some(_) {
+          if !self.is_current(a, generation) {
+            return
+          }
+          // (lost again after it reached them since: this loss is the one its turn's end goes by; lost again with
+          // nothing reached between, said once)
+          let now = self.tools_heard(a)
+          let again = match (a.tools_lost, a.tools_lost_heard, now) {
+            (None, _, _) => true
+            (Some(_), Some(before), Some(n)) => n > before
+            _ => false
+          }
+          if !again {
             return
           }
           self.log(a, "warn", "the agent cannot reach the station's tools", fields={ "why": jstr(why) })
           a.tools_lost = Some(why)
+          a.tools_lost_heard = now
         }),
       )
     }
@@ -2789,8 +2801,18 @@ async fn Actors::on_turn_ended(self : Actors, a : Actor, generation : Int, outco
       _ => ()
     }
   }
-  let lost = a.tools_lost
+  // (one call that failed as unreachable, then others that reached them: a kept connection closed under a call,
+  // ECONNRESET, is not a process that lost the station's tools; ended, it took its background tasks with it, mm2
+  // 2026-11-23)
+  let lost = match (a.tools_lost, a.tools_lost_heard) {
+    (Some(_), Some(before)) if !unheard_tools && self.tools_heard(a) is Some(now) && now > before => {
+      self.log(a, "info", "the agent reached the station's tools again after a call failed; its process is kept")
+      None
+    }
+    (lost, _) => lost
+  }
   a.tools_lost = None
+  a.tools_lost_heard = None
   if lost is Some(why) {
     let agent = a.agent
     self.set_agent(a, None)
@@ -3106,6 +3128,15 @@ async fn Actors::on_turn_ended(self : Actors, a : Actor, generation : Int, outco
     return
   }
   self.continue_undeclared_end(a, lost is Some(_), unheard_tools, recorded, warm)
+}
+
+///|
+/// How many requests the station's tools have heard on the session's token (`node.toolsHeard`), where it says.
+async fn Actors::tools_heard(self : Actors, a : Actor) -> Double? {
+  match (try { Ok(self.rpc(a.key, "node.toolsHeard", [])) } catch { e => Err(e) }) {
+    Ok(Number(n, ..)) => Some(n)
+    _ => None
+  }
 }
 
 ///|
