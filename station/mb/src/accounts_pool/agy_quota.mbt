@@ -401,7 +401,7 @@ let agy_production_url : String = "https://cloudcode-pa.googleapis.com"
 let agy_quota_summary : String = "/v1internal:retrieveUserQuotaSummary"
 
 ///|
-let agy_user_agent : String = "antigravity/1.5.12"
+let agy_user_agent : String = "antigravity/cli/1.5.15"
 
 ///|
 let agy_timeout_ms : Int = 30_000
@@ -568,6 +568,19 @@ fn agy_base(ctx : Ctx, fallback : String) -> String {
 }
 
 ///|
+fn agy_production_base(ctx : Ctx) -> String {
+  let raw_base = match ctx.url("agyQuotaProduction") {
+    Some(u) if trim_js(u) != "" => trim_js(u)
+    _ =>
+      match ctx.url("agyQuota") {
+        Some(u) if trim_js(u) != "" => trim_js(u)
+        _ => agy_production_url
+      }
+  }
+  strip_trailing_slashes(raw_base)
+}
+
+///|
 priv struct AgyQuotaProject {
   token : String
   tier : JV
@@ -616,17 +629,34 @@ fn is_gemini_weekly(window : JV) -> Bool {
 }
 
 ///|
-async fn agy_gemini_weekly(ctx : Ctx, base : String, project : AgyQuotaProject) -> JV? {
-  let (windows, _) = agy_allowance(
-    ctx,
-    agy_post(ctx, base, agy_quota_summary, project.token, project.payload),
-  )
+fn find_gemini_weekly(ctx : Ctx, body : JV?) -> JV? {
+  let (windows, _) = agy_allowance(ctx, body)
   for window in windows {
     if is_gemini_weekly(window) {
       return Some(window)
     }
   }
   None
+}
+
+///|
+fn should_fallback_gemini_weekly(
+  daily_summary : JV?,
+  windows : Array[JV],
+  base : String,
+  production : String,
+) -> Bool {
+  daily_summary is Some(Obj(_)) &&
+  base != production &&
+  !windows.iter().any(is_gemini_weekly)
+}
+
+///|
+async fn agy_gemini_weekly(ctx : Ctx, base : String, project : AgyQuotaProject) -> JV? {
+  find_gemini_weekly(
+    ctx,
+    agy_post(ctx, base, agy_quota_summary, project.token, project.payload),
+  )
 }
 
 ///|
@@ -639,8 +669,9 @@ async fn agy_direct_quota(ctx : Ctx, home : String, lang : String) -> JV? {
   let extra = agy_model_windows(ctx, models).filter(w => !windows.iter().any(reported =>
     reported.get("scope") == w.get("scope") && reported.get("minutes") == w.get("minutes")
   ))
-  let production = agy_base(ctx, agy_production_url)
-  if base != production && !windows.iter().any(is_gemini_weekly) {
+  let production = agy_production_base(ctx)
+  // Only fall back to production when daily answered cleanly and omitted the weekly window.
+  if should_fallback_gemini_weekly(summary, windows, base, production) {
     match agy_gemini_weekly(ctx, production, project) {
       Some(weekly) => windows.insert(0, weekly)
       None => ()
@@ -844,10 +875,22 @@ pub async fn agy_quota(
   if jget(parsed, "status") == Some(Str("SUCCESS")) {
     let (windows, scoped) = agy_allowance(ctx, parsed)
     if direct && windows.length() > 0 && !windows.iter().any(is_gemini_weekly) {
-      let base = agy_base(ctx, agy_cloud_code_url)
-      if agy_quota_project(ctx, home, base) is Some(project) {
-        match agy_gemini_weekly(ctx, agy_base(ctx, agy_production_url), project) {
-          Some(weekly) => windows.insert(0, weekly)
+      let daily = agy_base(ctx, agy_cloud_code_url)
+      let production = agy_production_base(ctx)
+      if agy_quota_project(ctx, home, daily) is Some(project) {
+        // Only fall back to production when daily answered cleanly and omitted the weekly window.
+        let summary = agy_post(ctx, daily, agy_quota_summary, project.token, project.payload)
+        let weekly = match find_gemini_weekly(ctx, summary) {
+          Some(w) => Some(w)
+          None =>
+            if should_fallback_gemini_weekly(summary, windows, daily, production) {
+              agy_gemini_weekly(ctx, production, project)
+            } else {
+              None
+            }
+        }
+        match weekly {
+          Some(w) => windows.insert(0, w)
           None => ()
         }
       }
