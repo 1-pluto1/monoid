@@ -60,6 +60,41 @@ const HOST_MS = 10_000;
 /// changes with every model call, some seconds apart while agents work, and each telling has a page showing usage read
 /// again what changed (every client from before it, all of it: some 200 KB).
 const USAGE_EVERY_MS = 60_000;
+/// Background overview changes (process state, profile checks, backup progress, decision checks) coalesce so bursts
+/// emit one full overview at most this often; direct `overviewChanged()` calls remain immediate.
+const OVERVIEW_SOON_MS = 10_000;
+/// Low-disk warning threshold matching client/core-ts/src/views/models.ts (`<= 10 GiB` or `<= 10%` of totalBytes).
+const LOW_DISK_BYTES = 10 * 1024 * 1024 * 1024;
+/// Bucket size for free-disk bytes while in the low-disk warning zone so displayed space updates without per-write churn.
+const LOW_DISK_STEP = 128 * 1024 * 1024;
+
+/// Comparable snapshot of an overview for `overviewTold` deduplication: omits volatile machine telemetry and process
+/// RSS drift, and normalizes ample free-disk bytes while preserving low-disk warning transitions. The emitted event
+/// still carries the exact overview.
+export function overviewComparable(value: unknown): string {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return JSON.stringify(value);
+  const src = value as Record<string, unknown>;
+  const out: Record<string, unknown> = { ...src };
+  delete out.machine;
+  const disk = src.disk;
+  if (disk !== null && typeof disk === "object" && !Array.isArray(disk)) {
+    const d = disk as Record<string, unknown>;
+    const free = d.freeBytes;
+    if (typeof free === "number") {
+      const total = typeof d.totalBytes === "number" ? d.totalBytes : 0;
+      const low = total > 0 ? free * 10 <= total || free <= LOW_DISK_BYTES : free <= LOW_DISK_BYTES;
+      out.disk = { ...d, freeBytes: low ? Math.floor(free / LOW_DISK_STEP) : "ok" };
+    }
+  }
+  if (Array.isArray(src.processes)) {
+    out.processes = src.processes.map((p) => {
+      if (p === null || typeof p !== "object" || Array.isArray(p)) return p;
+      const { rssMb: _, ...rest } = p as Record<string, unknown>;
+      return rest;
+    });
+  }
+  return JSON.stringify(out);
+}
 /// What the streams tell is read by the station's own reader (read/pool.ts), never behind what a device asked.
 const TOLD = { told: true };
 /// A stream's answer when it was told first what came after `since` (the client then reads nothing again).
@@ -243,6 +278,9 @@ export class Events {
   private usageTold = -Infinity;
   private usageLater: (() => void) | null = null;
   private usageFrom: number | null | undefined = undefined;
+  /// When a broadcast overview was last flushed and any pending coalesced flush for background changes.
+  private overviewToldAt = -Infinity;
+  private overviewLater: (() => void) | null = null;
   /// What is read to be told once read (a thread's entries, a job): waited for before what is told goes over.
   private reading = new Set<Promise<void>>();
   /// Until what the process before this one handed over is taken up (`takeUp`): no stream is answered before, and what
@@ -340,6 +378,11 @@ export class Events {
       this.usageLater = null;
       this.tellUsage();
     }
+    if (this.overviewLater !== null) {
+      this.overviewLater();
+      this.overviewLater = null;
+      this.overviewChanged();
+    }
     for (;;) {
       const telling = [...this.reading, ...(this.flushing ? [this.flushing] : [])];
       if (telling.length === 0) break;
@@ -412,6 +455,21 @@ export class Events {
   overviewChanged() {
     this.dirty.overview = true;
     this.wake();
+  }
+
+  /// Background overview change (process state, profile checks, backup progress, decision checks): emits at once when
+  /// quiet, or coalesces a burst into one trailing overview after OVERVIEW_SOON_MS.
+  overviewSoon() {
+    if (this.overviewLater !== null) return;
+    const wait = this.overviewToldAt + OVERVIEW_SOON_MS - this.time.now();
+    if (wait <= 0) {
+      this.overviewChanged();
+      return;
+    }
+    this.overviewLater = this.time.after(wait, () => { // timer: burst debounce for background overview changes
+      this.overviewLater = null;
+      this.overviewChanged();
+    });
   }
 
   inUse(): boolean {
@@ -863,7 +921,7 @@ export class Events {
       }
       case "processes":
       case "decisionChecks":
-        this.overviewChanged();
+        this.overviewSoon();
         break;
     }
   }
@@ -924,7 +982,8 @@ export class Events {
       const state = this.deps.processState?.(key);
       if (state !== undefined && this.states.get(key) !== state) {
         this.states.set(key, state);
-        overview = true;
+        if (this.overviewToldAt + OVERVIEW_SOON_MS <= this.time.now()) overview = true;
+        else this.overviewSoon();
       }
     }
     if (!this.listening()) return;
@@ -944,6 +1003,13 @@ export class Events {
     // The overview to each viewer, in each language their streams were asked in (only to those that came back, where
     // nothing else changed it).
     if ((overview || dirty.overviewOf.size > 0) && this.deps.overview) {
+      if (overview) {
+        this.overviewToldAt = this.time.now();
+        if (this.overviewLater !== null) {
+          this.overviewLater();
+          this.overviewLater = null;
+        }
+      }
       const seen = new Set<string>();
       const wanted = (k: string) => overview || dirty.overviewOf.has(k);
       const viewers = this.clients.filter((c) => wanted(viewerKey(c.viewer, c.lang)) && !seen.has(viewerKey(c.viewer, c.lang)) && seen.add(viewerKey(c.viewer, c.lang)));
@@ -953,7 +1019,7 @@ export class Events {
             const value = await this.deps.overview!(viewer, lang);
             // Told only as it changed for them: a stream that comes back has every viewer's made again.
             const k = viewerKey(viewer, lang);
-            const text = JSON.stringify(value);
+            const text = overviewComparable(value);
             if (this.overviewTold.get(k) === text) return;
             this.overviewTold.set(k, text);
             this.emit("overview", value, { viewer: k }, `overview\0${k}`);

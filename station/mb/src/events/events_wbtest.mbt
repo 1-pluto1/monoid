@@ -372,3 +372,29 @@ test "connect_shown emits startsOn and startsOnStations consistently for none, s
   assert_eq(auto_c.get("startsOn").map(stringify), Some("null"))
   assert_eq(auto_c.get("startsOnStations").map(stringify), Some("null"))
 }
+
+///|
+test "overview_comparable ignores volatile telemetry drift while preserving low-disk warning transitions" {
+  let gib = 1073741824.0
+  let a = jo([
+    ("counts", jo([("running", jn(1.0))])),
+    ("disk", jo([("freeBytes", jn(50.0 * gib)), ("totalBytes", jn(100.0 * gib))])),
+    ("processes", ja([jo([("pid", jn(1.0)), ("rssMb", jn(100.0))])])),
+    ("machine", jo([("uptime", jn(10.0))])),
+  ])
+  let b = jo([
+    ("counts", jo([("running", jn(1.0))])),
+    ("disk", jo([("freeBytes", jn(49.5 * gib)), ("totalBytes", jn(100.0 * gib))])),
+    ("processes", ja([jo([("pid", jn(1.0)), ("rssMb", jn(142.0))])])),
+    ("machine", jo([("uptime", jn(999.0))])),
+  ])
+  assert_eq(overview_comparable(a), overview_comparable(b))
+  // 100 GiB disk crossing 10 GiB threshold (20 GiB <-> 8 GiB).
+  let ok100 = jo([("disk", jo([("freeBytes", jn(20.0 * gib)), ("totalBytes", jn(100.0 * gib))]))])
+  let warn100 = jo([("disk", jo([("freeBytes", jn(8.0 * gib)), ("totalBytes", jn(100.0 * gib))]))])
+  assert_not_eq(overview_comparable(ok100), overview_comparable(warn100))
+  // 1000 GiB disk crossing 10% threshold (120 GiB <-> 80 GiB).
+  let ok1000 = jo([("disk", jo([("freeBytes", jn(120.0 * gib)), ("totalBytes", jn(1000.0 * gib))]))])
+  let warn1000 = jo([("disk", jo([("freeBytes", jn(80.0 * gib)), ("totalBytes", jn(1000.0 * gib))]))])
+  assert_not_eq(overview_comparable(ok1000), overview_comparable(warn1000))
+}
