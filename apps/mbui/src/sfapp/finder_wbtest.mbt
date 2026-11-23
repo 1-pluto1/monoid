@@ -515,12 +515,11 @@ test "⌘K at its end leaves its last result as far from the foot as from the si
     t.wheel(list.x + list.w / 2.0, list.y + list.h / 2.0, 3000.0)
     t.run_for(@ui.move_most_ms)
     let children = switcher_blocks(t, list)
-    assert_true(children.length() >= 2, msg="\{width}: last row and its foot")
-    let last = children[children.length() - 2]
-    let blank = children[children.length() - 1]
+    assert_true(children.length() >= 1, msg="\{width}: last row")
+    let last = children[children.length() - 1]
     let inset = list.x - px
+    // (the room under it the list's own foot, under what it scrolls, no block of it)
     assert_true(((last.y + last.h) - (py + ph - inset)).abs() < 0.5, msg="\{width}: last result ends at \{last.y + last.h}, panel at \{py + ph}")
-    assert_true((blank.h - inset).abs() < 0.5, msg="\{width}: foot room \{blank.h}, side room \{inset}")
   }
 }
 
@@ -779,12 +778,68 @@ fn switcher_lists(t : @ui.Tester, panel : (Double, Double, Double, Double)) -> A
 }
 
 ///|
-/// What ⌘K's list `list` holds in its order, as it scrolls: its lines and the room under its last (the blocks of what
+/// What ⌘K's list `list` holds in its order, as it scrolls: its lines (the blocks of what
 /// it scrolls, none of what stands for those not made: View::scrolls_window's spacers, as tall as nothing at its ends).
 fn switcher_blocks(t : @ui.Tester, list : @ui.Laid) -> Array[@ui.Laid] {
   let boxes = t.boxes_held()
   match boxes.iter().find_first(fn(c) { c.parent == list.index && c.h > list.h }) {
     Some(content) => boxes.filter(fn(b) { b.parent == content.index && b.h > 0.0 })
     None => []
+  }
+}
+
+///|
+/// How far down what it holds each list of the window's tree of `t` whose box `pick` takes is scrolled (its box over
+/// what it scrolls, a box taller than it: View::scrolls_window's; under its top by its padding at its top), and how
+/// far it could be.
+fn scrolled_lists(t : @ui.Tester, pick : (@ui.Laid) -> Bool) -> Array[(Double, Double)] {
+  let boxes = t.boxes_held()
+  let out = []
+  for b in boxes {
+    if b.h > 20.0 && pick(b) {
+      for c in boxes {
+        if c.parent == b.index && c.h > b.h + 1.0 {
+          out.push((b.y - c.y, c.h - b.h))
+        }
+      }
+    }
+  }
+  out
+}
+
+///|
+test "⌘K over a core that answers after it opens: its list at its top, not at its end" {
+  // (its lines told after the panel shows, the room under the last alone in it till then: what showed held it, and
+  // the lines came in over it, the list at its end)
+  let heard = []
+  let (t, _) = switch_on(fn(_) { 0.0 }, heard, 1280.0, 800.0, 0, 0.0)
+  t.key(@ui.key_of_char('k'), mods=@ui.mod_cmd)
+  t.frame()
+  for at in ["opened", "at rest"] {
+    let (px, py, pw, ph) = switcher_panel_rect(t)
+    let lists = switcher_lists(t, (px, py, pw, ph))
+    assert_eq(lists.length(), 1, msg="\{at}: list")
+    let gone = scrolled_lists(t, fn(b) { b.index == lists[0].index })
+    assert_eq(gone.length(), 1, msg="\{at}: what it scrolls")
+    assert_true(gone[0].1 > 100.0, msg="\{at}: more lines than it shows (\{gone[0].1})")
+    assert_true(gone[0].0 < 0.5, msg="\{at}: scrolled \{gone[0].0} of \{gone[0].1}")
+    t.run_for(@ui.move_most_ms)
+  }
+}
+
+///|
+test "a place's sidebar over a core that answers after it opens: its list at its top, not at its end" {
+  // (the Profile place's list, more profiles than a short window shows: place_list_node's room under its last, alone in
+  // it as its lines were first told, held what showed)
+  let heard = []
+  let (t, _) = switch_on(fn(_) { 0.0 }, heard, 1280.0, 300.0, 0, 0.0)
+  assert_true(@sfbase.go_place("profiles"), msg="went")
+  t.frame()
+  for at in ["opened", "at rest"] {
+    // (the sidebar's, beside the rail: what scrolls there more than a few points)
+    let gone = scrolled_lists(t, fn(b) { b.x > 52.0 && b.x + b.w < 400.0 }).filter(fn(g) { g.1 > 50.0 })
+    assert_eq(gone.length(), 1, msg="\{at}: the sidebar's list: \{Repr(gone)}")
+    assert_true(gone[0].0 < 0.5, msg="\{at}: scrolled \{gone[0].0} of \{gone[0].1}")
+    t.run_for(@ui.move_most_ms)
   }
 }
