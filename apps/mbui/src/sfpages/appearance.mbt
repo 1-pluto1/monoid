@@ -25,7 +25,7 @@ pub fn appearance_node(
   }
   // (what this device offers: its window zoomed, files dropped in; the rail changed where it is beside the page)
   let keys = fn() {
-    let k = ["theme", "accent", "fonts", "motion", "haptics", "language"]
+    let k = ["theme", "accent", "fonts", "glass", "motion", "haptics", "language"]
     if @ui.window_zoom_supported() {
       k.push("zoom")
     }
@@ -48,9 +48,9 @@ pub fn appearance_node(
     fn() { if wide() { ["settings"] } else { keys() } },
     fn(b, key) {
       if key == "settings" {
-        @sf.group_node(b, fn(g) { g.each(keys, fn(k) { k }, fn(r, k) { appearance_setting(r, core, k.untracked()) }) })
+        @sf.group_node(b, fn(g) { g.each(keys, fn(k) { k }, fn(r, k) { appearance_setting(r, core, k.untracked(), wide) }) })
       } else {
-        appearance_setting(b, core, key)
+        appearance_setting(b, core, key, wide)
       }
     },
   )
@@ -59,7 +59,7 @@ pub fn appearance_node(
 ///|
 /// One of 外观's settings, by its key: 主题, 主题色, 字体 (the faces chosen, opening their page), 动画, 震动, 语言, 缩放,
 /// 拖入的文件, 侧栏. Each choice the core's prefs (`prefs.set`), shown at once.
-fn appearance_setting(v : @view.View, core : Core, key : String) -> Unit {
+fn appearance_setting(v : @view.View, core : Core, key : String, wide : () -> Bool) -> Unit {
   let prefs = fn() { (core.topic)("prefs", Map([])).get().value }
   // a choice of a few (Segmented, Seg): the kept value, or the one just chosen while the core takes it
   let choice = fn(title : String, note : String, options : Array[(String, String)], now : () -> String) {
@@ -135,6 +135,72 @@ fn appearance_setting(v : @view.View, core : Core, key : String) -> Unit {
         fn() { (core.push)(Fonts) },
         note=fn() { @sf.t("web-pages.appearance.fonts.description") },
       )
+    // liquid glass frost level (0..100: 0 default clear, 100 solid surfaces)
+    "glass" => {
+      let frost_pct = fn() -> Int {
+        let s = @settings.pref(core, "glassFrost")
+        if s == "" {
+          0
+        } else {
+          let n = @string.parse_int(s) catch { _ => 0 }
+          if n < 0 { 0 } else if n > 100 { 100 } else { n }
+        }
+      }
+      let frost_label = fn(n : Int) -> String {
+        if n <= 0 {
+          @sf.t("web-pages.appearance.glass.clear")
+        } else if n >= 100 {
+          @sf.t("web-pages.appearance.glass.solid")
+        } else {
+          "\{n}%"
+        }
+      }
+      @sf.setting_node(
+        v,
+        fn() { @sf.t("web-pages.appearance.glass.title") },
+        note=fn() { @sf.t("web-pages.appearance.glass.description") },
+        fn(r) {
+          r.box(fn(row) {
+            row
+            .row(Is(true))
+            .gap(Is(12.0))
+            .lines_up(Is(Some(Middle)))
+            .width(By(fn() { if wide() { Some(220.0) } else { None } }))
+            .shrink(Is(0.0))
+            |> ignore
+            @sf.value_slider_node(
+              row,
+              fn() { @sf.t("web-pages.appearance.glass.title") },
+              fn() { frost_pct().to_double() },
+              fn(x) {
+                let n = x.round().to_int()
+                let next = if n <= 0 { "" } else if n >= 100 { "100" } else { n.to_string() }
+                if next != @signals.untracked(fn() { @settings.pref(core, "glassFrost") }) {
+                  @settings.set_pref(core, "glassFrost", next)
+                }
+              },
+              min=0.0,
+              max=100.0,
+              step=5.0,
+              format=frost_label,
+            )
+            .grow(Is(1.0))
+            |> ignore
+            row.box(fn(val_box) {
+              val_box
+              .row(Is(true))
+              .lies_along(Is(End))
+              .shrink(Is(0.0))
+              .min_width(Is(Some(44.0)))
+              |> ignore
+              @sf.words_node(val_box, fn() { frost_label(frost_pct()) }, fn() { glass_frost_value_style }) |> ignore
+            })
+            |> ignore
+          })
+          |> ignore
+        },
+      )
+    }
     "motion" =>
       choice(
         "web-pages.appearance.motion.title",
@@ -235,6 +301,10 @@ pub fn fonts_node(
     block,
   )
 }
+
+///|
+// kept across runs: a value (no field of it changes)
+let glass_frost_value_style : @ui.TextStyle = @ui.text_style(size=Ui, color=Muted, wrap=false)
 
 ///|
 /// The accents' names, as @sf.accents has them.
