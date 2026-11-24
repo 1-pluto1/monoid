@@ -47,6 +47,7 @@ import {
   "station/pi",
   "station/pieces",
   "station/nodepath",
+  "station/shim_plan",
   "station/admit",
   "moonbitlang/core/encoding/base64",
   "moonbitlang/core/encoding/hex",
@@ -55,7 +56,6 @@ import {
   "moonbitlang/core/encoding/utf8",
   "moonbitlang/core/buffer",
   "ui/effect",
-  "station/station_main",
 }
 
 pkgtype(kind: "executable")

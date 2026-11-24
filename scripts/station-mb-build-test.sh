@@ -54,7 +54,7 @@ cat > "$t/root/libs/ui/scripts/mbc" <<'EOF'
 [ "$1" = key ] && { echo made-up-mbc; exit 0; }
 obj= j=none prev=
 for a in "$@"; do
-  case "$a" in --obj=*) obj=${a#--obj=} ;; -j=*) j=${a#-j=} ;; --cflags=*) echo "${a#--cflags=}" > "$LOG/cflags" ;; esac
+  case "$a" in --obj=*) obj=${a#--obj=} ;; -j=*) j=${a#-j=} ;; --cflags=*) echo "${a#--cflags=}" > "$LOG/cflags" ;; --extra=*) echo "${a#--extra=}" >> "$LOG/extras" ;; esac
   [ "$prev" = -j ] && j=$a
   prev=$a
 done
@@ -209,6 +209,50 @@ fresh; bash "$t/root/station/mb/build.sh" --harness darwin-arm64 "$t/out/harness
 [ ! -e "$t/log/moon-builds" ] || fail "--harness again, nothing changed: moon built $(cat "$t/log/moon-builds") again"
 grep -q 'reader_harness' "$t/log/c" || fail "--harness again: mbc given $(cat "$t/log/c"), not the harness's kept C"
 grep -q 'unit.o' "$t/out/harness2" || fail "--harness into OUT: not linked there"
+
+# 5b. Changing frozen station_main never invalidates reader's gen_key, and reader only compiles its own C stubs.
+mkdir -p "$t/root/station/mb/src/station_main" "$t/root/station/mb/src/drive" "$t/root/station/mb/src/host"
+echo 'int sm_stub;' > "$t/root/station/mb/src/station_main/sys.c"
+echo 'int drv_stub;' > "$t/root/station/mb/src/drive/drive.c"
+echo 'int host_stub;' > "$t/root/station/mb/src/host/host.c"
+echo 'pub fn v() -> Int { 1 }' > "$t/root/station/mb/src/station_main/a.mbt"
+fresh; run cache1 || fail "reader before station_main edit: $(cat "$t/log/build-cache1.out")"
+grep -q 'host/host.c' "$t/log/extras" || fail "reader extras missing host/host.c: $(cat "$t/log/extras" 2>/dev/null)"
+if grep -qE 'station_main/|drive/drive\.c' "$t/log/extras"; then
+  fail "reader extras unexpectedly included frozen C stubs: $(cat "$t/log/extras")"
+fi
+echo 'pub fn v() -> Int { 2 }' > "$t/root/station/mb/src/station_main/a.mbt"
+fresh; run cache2 || fail "reader after station_main edit: $(cat "$t/log/build-cache2.out")"
+[ ! -e "$t/log/moon-builds" ] || fail "editing station_main invalidated reader gen_key (rebuilt $(cat "$t/log/moon-builds"))"
+fresh; bash "$t/root/station/mb/build.sh" --harness darwin-arm64 "$t/out/harness3" > "$t/log/build-harness3.out" 2>&1 || fail "--harness after station_main edit: $(cat "$t/log/build-harness3.out")"
+[ "$(cat "$t/log/moon-builds")" = reader_harness ] || fail "--harness did not rebuild after station_main edit"
+grep -q 'station_main/sys.c' "$t/log/extras" || fail "--harness extras missing station_main/sys.c"
+grep -q 'drive/drive.c' "$t/log/extras" || fail "--harness extras missing drive/drive.c"
+
+# 5c. Changing libs/ui/tools/mbc/csplit.mbt or libs/ui/tools/moon.{mod,work} invalidates both reader and harness gen_key.
+mkdir -p "$t/root/libs/ui/tools/mbc"
+echo '// csplit v1' > "$t/root/libs/ui/tools/mbc/csplit.mbt"
+echo '{"name":"ui/tools"}' > "$t/root/libs/ui/tools/moon.mod"
+echo 'version = 1' > "$t/root/libs/ui/tools/moon.work"
+fresh; run mbc1 || fail "reader with mbc v1: $(cat "$t/log/build-mbc1.out")"
+[ "$(cat "$t/log/moon-builds")" = reader ] || fail "reader did not rebuild when libs/ui/tools/mbc/csplit.mbt appeared"
+fresh; bash "$t/root/station/mb/build.sh" --harness darwin-arm64 "$t/out/harness-mbc1" > "$t/log/build-hmbc1.out" 2>&1 || fail "harness with mbc v1: $(cat "$t/log/build-hmbc1.out")"
+[ "$(cat "$t/log/moon-builds")" = reader_harness ] || fail "harness did not rebuild when libs/ui/tools/mbc/csplit.mbt appeared"
+echo '// csplit v2' > "$t/root/libs/ui/tools/mbc/csplit.mbt"
+fresh; run mbc2 || fail "reader with mbc v2: $(cat "$t/log/build-mbc2.out")"
+[ "$(cat "$t/log/moon-builds")" = reader ] || fail "editing libs/ui/tools/mbc/csplit.mbt did not invalidate reader gen_key"
+fresh; bash "$t/root/station/mb/build.sh" --harness darwin-arm64 "$t/out/harness-mbc2" > "$t/log/build-hmbc2.out" 2>&1 || fail "harness with mbc v2: $(cat "$t/log/build-hmbc2.out")"
+[ "$(cat "$t/log/moon-builds")" = reader_harness ] || fail "editing libs/ui/tools/mbc/csplit.mbt did not invalidate harness gen_key"
+echo '{"name":"ui/tools","version":"0.2"}' > "$t/root/libs/ui/tools/moon.mod"
+fresh; run mbc3 || fail "reader with tools moon.mod v2: $(cat "$t/log/build-mbc3.out")"
+[ "$(cat "$t/log/moon-builds")" = reader ] || fail "editing libs/ui/tools/moon.mod did not invalidate reader gen_key"
+fresh; bash "$t/root/station/mb/build.sh" --harness darwin-arm64 "$t/out/harness-mbc3" > "$t/log/build-hmbc3.out" 2>&1 || fail "harness with tools moon.mod v2: $(cat "$t/log/build-hmbc3.out")"
+[ "$(cat "$t/log/moon-builds")" = reader_harness ] || fail "editing libs/ui/tools/moon.mod did not invalidate harness gen_key"
+echo 'version = 2' > "$t/root/libs/ui/tools/moon.work"
+fresh; run mbc4 || fail "reader with tools moon.work v2: $(cat "$t/log/build-mbc4.out")"
+[ "$(cat "$t/log/moon-builds")" = reader ] || fail "editing libs/ui/tools/moon.work did not invalidate reader gen_key"
+fresh; bash "$t/root/station/mb/build.sh" --harness darwin-arm64 "$t/out/harness-mbc4" > "$t/log/build-hmbc4.out" 2>&1 || fail "harness with tools moon.work v2: $(cat "$t/log/build-hmbc4.out")"
+[ "$(cat "$t/log/moon-builds")" = reader_harness ] || fail "editing libs/ui/tools/moon.work did not invalidate harness gen_key"
 
 # 6. ~/stillfail-ci/reader-mbc-prepped self-pruning: stale locks/tmps (>30m), old prepared C (>180m), and cap at newest 16.
 prepped_ci="$t/ci-home/stillfail-ci/reader-mbc-prepped"
