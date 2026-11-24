@@ -1222,6 +1222,8 @@ export class Views implements Owner {
   /// Shown again while it was kept: a search asks its stations again (what they hold changes; station/sync.ts
   /// `searchShown`), what they found before shown meanwhile.
   resume(view: Topic): void {
+    // (one let go before its messages were looked for: looked for now, its value kept sent without them meanwhile)
+    if (this.#saidSkipped.delete(topicKey(view))) this.#core.store.invalidate(view);
     if (view.topic !== "search" && view.topic !== "archive" && view.topic !== "chatSubchats") return;
     const live = this.#views.get(topicKey(view));
     for (const key of live?.watches.keys() ?? []) {
@@ -1252,6 +1254,7 @@ export class Views implements Owner {
 
   stop(view: Topic): void {
     const key = topicKey(view);
+    this.#saidSkipped.delete(key);
     const live = this.#views.get(key);
     this.#views.delete(key);
     // (nothing holds the list any more: told again as it is asked again)
@@ -2908,6 +2911,35 @@ export class Views implements Owner {
     clock: () => this.#clock(),
   };
 
+  /// The searches whose messages are looked for after their value went out (#foundMessages), by topic.
+  readonly #saidAsked = new Set<string>();
+  /// Those let go before their turn came (#saidLater): looked for as they are shown again (`resume`).
+  readonly #saidSkipped = new Set<string>();
+
+  #saidLater(asked: Topic, stations: string[], words: string[], limit: number): void {
+    // (the search asks with how many messages it shows: views/search.ts)
+    const { messages: _shown, ...rest } = asked;
+    const view = asked.topic === "search" ? (rest as Topic) : asked;
+    const key = topicKey(view);
+    if (this.#saidAsked.has(key)) return;
+    this.#saidAsked.add(key);
+    const store = this.#core.store;
+    this.#core.runner.fork(
+      Effect.gen({ self: this }, function* () {
+        yield* store.turn();
+        this.#saidAsked.delete(key);
+        // (words typed on meanwhile: those of before are not looked for, nothing shows them)
+        if (!this.#views.has(key)) return;
+        if (!store.subscribed(view)) {
+          this.#saidSkipped.add(key);
+          return;
+        }
+        untracked(() => this.#core.data.findSaid(stations, words, limit));
+        store.invalidate(view);
+      }),
+    );
+  }
+
   #foundMessages(chats: J, view: Topic): J[] {
     const words = refs.terms(view.query as string);
     if (words.length === 0) return [];
@@ -2926,8 +2958,13 @@ export class Views implements Owner {
     const members_ = arr(get(this.ok({ topic: "workspace", workspace: scope }), "members"));
     const clock = this.#clock();
     const out: J[] = [];
-    // Those of chats not listed (archived) are passed over: some more are asked for.
-    for (const hit of data.findSaid(stations, words, wanted * 3)) {
+    // Those of chats not listed (archived) are passed over: some more are asked for. What was said is looked through
+    // only once the value without it has gone out: the scan reads every message the device keeps (150,000 of them: 160
+    // ms in Node, more in Hermes), and the chats found by their titles are not to wait for it.
+    // Said since it was looked through: what it found shown meanwhile.
+    const kept = data.saidFoundKept(stations, words, wanted * 3);
+    if (kept === null || !kept.now) this.#saidLater(view, stations, words, wanted * 3);
+    for (const hit of kept?.found ?? []) {
       const chat = rows.get(`${hit.station}\u0001${hit.thread}`);
       if (!chat) continue;
       const entry = data.logRange("entry", hit.station, String(hit.thread), hit.seq, hit.seq).get(hit.seq);
