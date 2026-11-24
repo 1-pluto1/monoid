@@ -5,6 +5,7 @@ members = [
   "packages/sql_db",
   "packages/builders_core",
   "packages/builders_index",
+  "packages/builders_stateful",
   "packages/footprint",
   "packages/memory",
   "packages/packed",
@@ -21,6 +22,7 @@ sqlite_ffi = { path = "packages/sqlite_ffi" }
 sql_db = { path = "packages/sql_db" }
 builders_core = { path = "packages/builders_core" }
 builders_index = { path = "packages/builders_index" }
+builders_stateful = { path = "packages/builders_stateful" }
 footprint = { path = "packages/footprint" }
 memory = { path = "packages/memory" }
 packed = { path = "packages/packed" }
