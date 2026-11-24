@@ -86,8 +86,32 @@ pub fn viewer_stage_node(n : @view.View, src : Source, vw : Viewer, width : () -
         match vw.bytes.untracked() {
           Some(b) => {
             let file = @sf.blob_file(b, vw.file.name, vw.file.size, mime=vw.mime, save=fn() { vw.save_tree() })
+            // (a Markdown file's words marked, its notes beside the reader where it is wide enough, the reader narrowed
+            // for them; else at its foot: viewer_md_marks.mbt)
+            let notes = markdown
+            let side = fn() {
+              notes &&
+doc_notes_side(width(), vw.md_notes().length())
+            }
+            let side_room = fn() { if side() { doc_notes_side_room } else { 0.0 } }
+            let row = p.box(fn(r) { r.over(Is(true)).row(Is(true)) |> ignore })
+            let holds = row.box(fn(h) { h.grow(Is(1.0)).basis(Is(Some(0.0))) |> ignore })
+            row.box(fn(g) { g.width(By(fn() { Some(side_room()) })) |> ignore }) |> ignore
+            if notes {
+              vw.md_marks.src = Some(src)
+              p.owns(fn() { vw.md_note_done() }) |> ignore
+              @sf.reader_marks(holds, {
+                lits: fn(k) { vw.md_lits(k) },
+                tapped: fn() { vw.md_tapped() },
+                bars: fn(on, set) {
+                  vw.md_marks.bars_on = on
+                  vw.md_marks.bars_set = set
+                },
+              })
+              |> ignore
+            }
             @sf.reader_node(
-              p,
+              holds,
               vw.read_key(),
               file,
               markdown~,
@@ -100,7 +124,7 @@ pub fn viewer_stage_node(n : @view.View, src : Source, vw : Viewer, width : () -
               } else {
                 @sf.ReaderHost::Tab
               },
-              width~,
+              width=fn() { width() - side_room() },
               move_beside=if vw.beside {
                 None
               } else {
@@ -114,6 +138,12 @@ pub fn viewer_stage_node(n : @view.View, src : Source, vw : Viewer, width : () -
               },
             )
             |> ignore
+            if notes {
+              md_pick_bar_node(n, vw)
+              // (its foot clear of the reader's phone bars: away while they show, a note's card taking them away)
+              doc_notes_foot_node(p, vw.md_doc_notes(), side, hidden=fn() { (vw.md_marks.bars_on)() })
+              doc_notes_side_node(p, vw.md_doc_notes(), side, fn() { md_side_top }, fn() { md_side_foot })
+            }
           }
           None => ()
         }
@@ -281,7 +311,7 @@ fn pdf_stage_node(parent : @view.View, src : Source, vw : Viewer, width : () -> 
     },
   )
   |> ignore
-  pdf_marks_bar_node(parent, vw, side)
+  doc_notes_foot_node(parent, vw.pdf_doc_notes(), side)
   doc_notes_side_node(
     parent,
     vw.pdf_doc_notes(),
@@ -775,3 +805,11 @@ let desk_cell_share : Double = 18.0 / 13.0
 
 ///|
 let csv_foot : Double = 48.0
+
+///|
+/// How far under the stage's top and over its foot a Markdown file's notes stand at its side: under the bar every file
+/// opened has, as a PDF's pages are.
+let md_side_top : Double = desk_page_top
+
+///|
+let md_side_foot : Double = 12.0
