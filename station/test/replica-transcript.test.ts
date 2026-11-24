@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join, sep } from "node:path";
@@ -14,16 +14,16 @@ import { TestClock } from "effect/testing";
 import { PeerBus, bytesOf, withBytes } from "../src/mesh/bus.ts";
 import { Fibers } from "../src/ops/fibers.ts";
 import { MbProcess, mbReaderBinary } from "../src/read/mb-reader.ts";
-import { claudeProject } from "../src/read/transcript.ts";
+import { claudeProject, resetTranscriptLocateCache } from "../src/read/transcript.ts";
 import type { NormalizedBackupConfig, NormalizedS3Target } from "../src/replica/backup-config.ts";
 import { Copies } from "../src/replica/copies.ts";
 import { PeerPlace, serve } from "../src/replica/peers.ts";
 import { FolderPlace, level } from "../src/replica/places.ts";
 import { moved, takeBackSoon } from "../src/replica/restore.ts";
 import { ProgramRunner, exportThread } from "../src/replica/runner.ts";
-import { S3Place } from "../src/replica/s3.ts";
+import { S3Place, extractAllXmlTags } from "../src/replica/s3.ts";
 import { Store } from "../src/store/store.ts";
-import { HOME, dataDir } from "./replica-fakes.ts";
+import { HOME, OTHER, dataDir } from "./replica-fakes.ts";
 import { CHUNK_GC_GRACE_MS, Exporter, nothingTold } from "./reference/replica-export.ts";
 import { decodeBatch } from "./reference/replica-format.ts";
 import { takeBack } from "./reference/replica-restore.ts";
@@ -134,6 +134,24 @@ class MockS3Server {
         return;
       }
       res.writeHead(200, { "content-type": "application/octet-stream" }).end(obj);
+      return;
+    }
+    if (req.method === "POST" && url.searchParams.has("delete")) {
+      const expectedMd5 = createHash("md5").update(body).digest("base64");
+      if (req.headers["content-md5"] !== expectedMd5) {
+        res.writeHead(400, { "content-type": "application/xml" }).end("<Error><Code>InvalidDigest</Code></Error>");
+        return;
+      }
+      const keys = extractAllXmlTags(body.toString("utf8"), "Key");
+      for (const k of keys) {
+        this.objects.delete(k);
+        this.deletes.push(k);
+      }
+      const xml =
+        `<?xml version="1.0" encoding="UTF-8"?><DeleteResult>` +
+        keys.map((k) => `<Deleted><Key>${escapeXml(k)}</Key></Deleted>`).join("") +
+        `</DeleteResult>`;
+      res.writeHead(200, { "content-type": "application/xml" }).end(xml);
       return;
     }
     if (req.method === "DELETE") {
@@ -926,7 +944,14 @@ test("Copies pass failure strictly respects exponential backoff even when told()
   assert.ok(seenSessions.includes("s3"));
 });
 
-async function makeMbExportHelper(db: string, replica: string, data: string, origin: string, chunkBytes = 4096) {
+async function makeMbExportHelper(
+  db: string,
+  replica: string,
+  data: string,
+  origin: string,
+  chunkBytes = 4096,
+  extraArgs: string[] = [],
+) {
   const proc = new MbProcess(binary!, [
     "--builder",
     "replica-export",
@@ -942,6 +967,7 @@ async function makeMbExportHelper(db: string, replica: string, data: string, ori
     sep,
     "--chunk-bytes",
     String(chunkBytes),
+    ...extraArgs,
   ]);
   closing.push(() => proc.terminate().then(() => {}));
   const waiting = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
@@ -963,7 +989,9 @@ async function makeMbExportHelper(db: string, replica: string, data: string, ori
       proc.postMessage({ ...m, id, now });
     });
   return {
-    places: (now: number) => ask({ type: "places", places: { home: HOME, workspaces: [{ workspace: HOME, name: "src" }] } }, now),
+    places: (now: number, workspaces: { workspace: string; name: string }[] = [{ workspace: HOME, name: "src" }]) =>
+      ask({ type: "places", places: { home: HOME, workspaces } }, now),
+    testFaults: (faults: Record<string, string[]> | null, now: number) => ask({ type: "testFaults", faults }, now),
     pass: (told: ReturnType<typeof nothingTold>, now: number) => ask({ type: "pass", told }, now),
     sources: (hashes: string[], now: number) => ask({ type: "sources", hashes }, now) as Promise<Record<string, string>>,
     newGenerations: (after: number, now: number) => ask({ type: "newGenerations", after }, now),
@@ -1271,3 +1299,882 @@ test("TS reference: transcriptFiles cache stays consistent across chat-only pass
 
 test("MoonBit reader: transcriptFiles cache stays consistent across chat-only pass, tr, tr_del, rollback, and newGenerations", { skip: skipMb }, () =>
   runTranscriptCacheConsistency("mb"));
+
+// ── D71: AGY brain cache pruning, unreadable protection, tr_del batch throttling, and restore compatibility ──
+
+function makeAgyBrainStation() {
+  const data = dataDir("agy-d71");
+  const db = join(data, "stillfail.db");
+  const store = Store.open(db, join(data, "archive"));
+  const agyRoom = join(data, "sessions", "chat", "chat:agy-d71", "workspace");
+  mkdirSync(agyRoom, { recursive: true });
+  const agyId = "agy-brain-d71";
+  store.insertSession({
+    key: "chat:agy-d71",
+    connect: "chat",
+    runtime: "agy",
+    profile: "agyprof",
+    workspace: agyRoom,
+    token: "tok-agy-d71",
+    createdAt: 1,
+    lastActiveAt: 1,
+    ws: null,
+  });
+  store.setRuntimeSessionId("chat:agy-d71", agyId);
+  const t = store.openThread("chat", "C", "ts-agy-d71", "AGY D71", "p@x").id;
+  store.joinThread(t, "chat:agy-d71", "chat");
+  store.insertMessage({ thread: t, ts: "g.1", authorKind: "person", author: "p@x", text: "hello agy d71" });
+
+  const cli = join(data, "homes", "agyprof", "agy", ".gemini", "antigravity-cli");
+  const brain = join(cli, "brain", agyId);
+  const keptFiles = [
+    join(cli, "conversations", `${agyId}.db`),
+    join(cli, "annotations", `${agyId}.pbtxt`),
+    join(brain, "task.md"),
+    join(brain, "scratchpad", "a.txt"),
+    join(brain, "notes", "scratch", "b.txt"),
+    join(brain, ".system_generated", "logs", "transcript.jsonl"),
+    join(brain, ".system_generated", "logs", "transcript_full.jsonl"),
+    join(brain, ".system_generated", "logs", "media", "x.png"),
+    join(brain, ".system_generated", "messages", "m1.json"),
+  ];
+  const prunedFiles = [
+    join(brain, ".system_generated", "steps", "1", "output.txt"),
+    join(brain, ".system_generated", "logs", "chunks", "chunk-0.json"),
+    join(brain, "scratch", "tmp.py"),
+  ];
+  for (const p of [...keptFiles, ...prunedFiles]) {
+    mkdirSync(join(p, ".."), { recursive: true });
+    writeFileSync(p, `content:${p}\n`);
+  }
+  return { data, db, store, cli, brain, agyId, keptFiles, prunedFiles };
+}
+
+test("D71: AGY brain exact pruning (no-descend) + restore parity + legacy backup compatibility (TS + MoonBit)", async () => {
+  const s = makeAgyBrainStation();
+  closing.push(async () => s.store.close());
+  const now = 1_700_000_000_000;
+  const originId = sid("a");
+
+  // 1. TS reference: record every readdir call and explicitly assert pruned dirs have 0 readdir calls
+  const prunedDirs = new Set([
+    join(s.brain, ".system_generated", "steps"),
+    join(s.brain, ".system_generated", "logs", "chunks"),
+    join(s.brain, "scratch"),
+  ]);
+  const readdirVisited: string[] = [];
+  const replicaTs = join(s.data, "replica-ts");
+  const exporter = new Exporter({
+    db: s.db,
+    replica: replicaTs,
+    dataDir: s.data,
+    origin: originId,
+    now: () => now,
+    chunkBytes: 4096,
+    testFaults: {
+      onReaddir: (dir) => {
+        readdirVisited.push(dir);
+      },
+    },
+  });
+  closing.push(async () => exporter.close());
+  exporter.setPlaces({ home: HOME, workspaces: [{ workspace: HOME, name: "src" }] });
+  const pTs = exporter.pass(nothingTold());
+  const headTs = pTs.heads[HOME]!;
+  const genDirTs = join(replicaTs, "own", HOME, headTs.gen);
+  const trPathsTs = headTs.batches
+    .flatMap((b) => [...decodeBatch(readFileSync(join(genDirTs, "log", b))).lines].map((l) => JSON.parse(l)))
+    .filter((r) => "tr" in r)
+    .map((r) => r.tr as string)
+    .sort();
+  assert.deepEqual(trPathsTs, [...s.keptFiles].sort(), "TS reference keeps exact non-cache files and excludes 3 cache subtrees");
+  assert.ok(readdirVisited.includes(s.brain), "TS actually walked brain root");
+  for (const pd of prunedDirs) {
+    assert.equal(readdirVisited.filter((d) => d === pd).length, 0, `TS must never call readdir on pruned dir ${pd}`);
+  }
+
+  // 2. Restore TS export into a new dataDir -> all kept files restored, pruned caches absent
+  const restoreDir = dataDir("agy-d71-restore");
+  Store.open(join(restoreDir, "stillfail.db"), join(restoreDir, "archive")).close();
+  const copyDir = join(restoreDir, "restore", "copy");
+  mkdirSync(join(copyDir, "files"), { recursive: true });
+  mkdirSync(join(copyDir, headTs.gen, "log"), { recursive: true });
+  writeFileSync(join(copyDir, headTs.gen, "head.json"), JSON.stringify(headTs));
+  for (const b of headTs.batches) {
+    writeFileSync(join(copyDir, headTs.gen, "log", b), readFileSync(join(genDirTs, "log", b)));
+  }
+  for (const h of [...Object.keys(headTs.files), ...Object.keys(headTs.transcriptFiles ?? {})]) {
+    writeFileSync(join(copyDir, "files", h), readFileSync(exporter.sourceOf(h)!));
+  }
+  writeFileSync(
+    join(restoreDir, "restore", "ready.json"),
+    JSON.stringify({ origin: originId, workspace: HOME, gen: headTs.gen, name: "src", from: "peer" }),
+  );
+  takeBack(restoreDir, join(restoreDir, "stillfail.db"), now + 1000);
+  for (const p of s.keptFiles) {
+    const dest = p.replace(s.data, restoreDir);
+    assert.equal(existsSync(dest), true, `restored kept file ${dest}`);
+    assert.equal(readFileSync(dest, "utf8"), `content:${p}\n`);
+  }
+  for (const p of s.prunedFiles) {
+    const dest = p.replace(s.data, restoreDir);
+    assert.equal(existsSync(dest), false, `pruned cache file must not exist after restore: ${dest}`);
+  }
+
+  // 3. Legacy backup containing brain/<id>/scratch/legacy.txt is STILL restorable (is_transcript_path untouched)
+  const legacyDir = dataDir("agy-d71-legacy-restore");
+  Store.open(join(legacyDir, "stillfail.db"), join(legacyDir, "archive")).close();
+  const legacyCopy = join(legacyDir, "restore", "copy");
+  const legacyChunkHash = Object.keys(headTs.transcriptFiles!)[0]!;
+  const legacyPath = join(s.brain, "scratch", "legacy.txt");
+  const legacyGen = "1000-deadbeef";
+  const legacyLines = [
+    ...headTs.batches.flatMap((b) => [...decodeBatch(readFileSync(join(genDirTs, "log", b))).lines]),
+    JSON.stringify({ tr: legacyPath, room: null, size: 12, mtime: now, mode: 0o644, chunks: [legacyChunkHash] }),
+  ];
+  const { encodeBatch, batchName } = await import("./reference/replica-format.ts");
+  const batchBytes = encodeBatch({ v: 1, gen: legacyGen, from: 1, to: 1, made: now }, [], legacyLines.map((l) => Buffer.from(l + "\n")));
+  const bName = batchName(1, 1, batchBytes);
+  mkdirSync(join(legacyCopy, "files"), { recursive: true });
+  mkdirSync(join(legacyCopy, legacyGen, "log"), { recursive: true });
+  writeFileSync(join(legacyCopy, legacyGen, "log", bName), batchBytes);
+  writeFileSync(
+    join(legacyCopy, legacyGen, "head.json"),
+    JSON.stringify({ ...headTs, gen: legacyGen, batches: [bName], to: 1 }),
+  );
+  for (const h of [...Object.keys(headTs.files), ...Object.keys(headTs.transcriptFiles ?? {})]) {
+    writeFileSync(join(legacyCopy, "files", h), readFileSync(exporter.sourceOf(h)!));
+  }
+  writeFileSync(
+    join(legacyDir, "restore", "ready.json"),
+    JSON.stringify({ origin: originId, workspace: HOME, gen: legacyGen, name: "src", from: "peer" }),
+  );
+  takeBack(legacyDir, join(legacyDir, "stillfail.db"), now + 2000);
+  assert.equal(existsSync(legacyPath.replace(s.data, legacyDir)), true, "legacy backup scratch file still restores cleanly");
+
+  // 4. MoonBit reader parity: forbid_readdir proves MoonBit never calls readdir on pruned dirs
+  if (binary !== null) {
+    const replicaMb = join(s.data, "replica-mb");
+    const mb = await makeMbExportHelper(s.db, replicaMb, s.data, originId, 4096, [
+      "--test-faults",
+      JSON.stringify({ forbid_readdir: [...prunedDirs] }),
+    ]);
+    await mb.places(now);
+    const pMb = await mb.pass(nothingTold(), now);
+    const headMb = pMb.heads[HOME]!;
+    const genDirMb = join(replicaMb, "own", HOME, headMb.gen);
+    const trPathsMb = headMb.batches
+      .flatMap((b: string) => [...decodeBatch(readFileSync(join(genDirMb, "log", b))).lines].map((l) => JSON.parse(l)))
+      .filter((r: any) => "tr" in r)
+      .map((r: any) => r.tr as string)
+      .sort();
+    assert.deepEqual(trPathsMb, trPathsTs, "MoonBit reader matches TS reference brain pruning 1:1");
+  }
+});
+
+test("D71: brain/<id> root symlink and subdir symlink are never followed or exported (TS + MoonBit)", async () => {
+  const s = makeAgyBrainStation();
+  closing.push(async () => s.store.close());
+  const now = 1_700_000_000_000;
+  const originId = sid("a");
+
+  // Outside target dir that symlinks point to (must NEVER be exported)
+  const outsideTarget = join(s.data, "outside-secret");
+  mkdirSync(outsideTarget, { recursive: true });
+  writeFileSync(join(outsideTarget, "leak.md"), "secret-via-symlink\n");
+
+  // Subdir symlink inside existing brain/<id>
+  symlinkSync(outsideTarget, join(s.brain, "linked-sub"), "dir");
+
+  // Second AGY session whose brain/<id2> root itself is a symlink
+  const agyId2 = "agy-brain-symlink-root";
+  const room2 = join(s.data, "sessions", "chat", "chat:agy-sym", "workspace");
+  mkdirSync(room2, { recursive: true });
+  s.store.insertSession({
+    key: "chat:agy-sym",
+    connect: "chat",
+    runtime: "agy",
+    profile: "agyprof",
+    workspace: room2,
+    token: "tok-agy-sym",
+    createdAt: 2,
+    lastActiveAt: 2,
+    ws: null,
+  });
+  s.store.setRuntimeSessionId("chat:agy-sym", agyId2);
+  const t2 = s.store.openThread("chat", "C", "ts-agy-sym", "AGY Sym", "p@x").id;
+  s.store.joinThread(t2, "chat:agy-sym", "chat");
+  symlinkSync(outsideTarget, join(s.cli, "brain", agyId2), "dir");
+
+  const replicaTs = join(s.data, "replica-sym-ts");
+  const exporter = new Exporter({ db: s.db, replica: replicaTs, dataDir: s.data, origin: originId, now: () => now, chunkBytes: 4096 });
+  closing.push(async () => exporter.close());
+  exporter.setPlaces({ home: HOME, workspaces: [{ workspace: HOME, name: "src" }] });
+  const pTs = exporter.pass(nothingTold());
+  const headTs = pTs.heads[HOME]!;
+  const genDirTs = join(replicaTs, "own", HOME, headTs.gen);
+  const tsPaths = headTs.batches
+    .flatMap((b) => [...decodeBatch(readFileSync(join(genDirTs, "log", b))).lines].map((l) => JSON.parse(l)))
+    .filter((r) => "tr" in r)
+    .map((r) => r.tr as string);
+  assert.ok(!tsPaths.some((p) => p.includes("leak.md")), "TS must not follow root or subdir symlinks");
+
+  if (binary !== null) {
+    const replicaMb = join(s.data, "replica-sym-mb");
+    const mb = await makeMbExportHelper(s.db, replicaMb, s.data, originId, 4096);
+    await mb.places(now);
+    const pMb = await mb.pass(nothingTold(), now);
+    const headMb = pMb.heads[HOME]!;
+    const genDirMb = join(replicaMb, "own", HOME, headMb.gen);
+    const mbPaths = headMb.batches
+      .flatMap((b: string) => [...decodeBatch(readFileSync(join(genDirMb, "log", b))).lines].map((l) => JSON.parse(l)))
+      .filter((r: any) => "tr" in r)
+      .map((r: any) => r.tr as string);
+    assert.ok(!mbPaths.some((p: string) => p.includes("leak.md")), "MoonBit must not follow root or subdir symlinks");
+    assert.deepEqual(mbPaths.sort(), tsPaths.sort());
+  }
+});
+
+test("D71: unreadable directory / lstat / discovery-parent / fresh & mid short-read protection (TS + MoonBit, root-safe)", async () => {
+  const s = makeAgyBrainStation();
+  closing.push(async () => s.store.close());
+  let now = 1_700_000_000_000;
+  const originId = sid("a");
+  const mkErr = (code: string): NodeJS.ErrnoException => Object.assign(new Error(`${code}: injected`), { code });
+
+  // Also add a Claude session with subagent dir to cover claude unreadable protection
+  const claudeRoom = join(s.data, "sessions", "chat", "chat:claude-d71", "workspace");
+  mkdirSync(claudeRoom, { recursive: true });
+  const claudeId = "claude-d71-001";
+  s.store.insertSession({
+    key: "chat:claude-d71",
+    connect: "chat",
+    runtime: "claude",
+    profile: "cc",
+    workspace: claudeRoom,
+    token: "tok-cc-d71",
+    createdAt: 2,
+    lastActiveAt: 2,
+    ws: null,
+  });
+  s.store.setRuntimeSessionId("chat:claude-d71", claudeId);
+  const tClaude = s.store.openThread("chat", "C", "ts-cc-d71", "Claude D71", "p@x").id;
+  s.store.joinThread(tClaude, "chat:claude-d71", "chat");
+  const claudeTrDir = join(s.data, "transcripts", "claude", claudeProject(claudeRoom)!);
+  const claudeSubDir = join(claudeTrDir, claudeId);
+  mkdirSync(claudeSubDir, { recursive: true });
+  const claudeTrPath = join(claudeTrDir, `${claudeId}.jsonl`);
+  const claudeSubPath = join(claudeSubDir, "sub-1.jsonl");
+  writeFileSync(claudeTrPath, '{"role":"user","text":"hello"}\n');
+  writeFileSync(claudeSubPath, '{"sub":true}\n');
+
+  // Dedicated Claude session discovered via Finder scanning `transcripts/claude/` (workspace != slug)
+  const finderEioId = "cc-finder-eio";
+  const claudeProjectsDir = join(s.data, "transcripts", "claude");
+  const finderEioSlugDir = join(claudeProjectsDir, "-finder-eio-slug");
+  mkdirSync(finderEioSlugDir, { recursive: true });
+  const finderEioTrPath = join(finderEioSlugDir, `${finderEioId}.jsonl`);
+  writeFileSync(finderEioTrPath, '{"role":"user","text":"finder-eio-keep"}\n');
+  const finderEioRoom = join(s.data, "sessions", "chat", "chat:claude-finder-eio", "workspace");
+  mkdirSync(finderEioRoom, { recursive: true });
+  s.store.insertSession({
+    key: "chat:claude-finder-eio",
+    connect: "chat",
+    runtime: "claude",
+    profile: "cc",
+    workspace: finderEioRoom,
+    token: "tok-cc-finder-eio",
+    createdAt: 2,
+    lastActiveAt: 2,
+    ws: null,
+  });
+  s.store.setRuntimeSessionId("chat:claude-finder-eio", finderEioId);
+  const tFinderEio = s.store.openThread("chat", "C", "ts-cc-finder-eio", "Claude Finder EIO", "p@x").id;
+  s.store.joinThread(tFinderEio, "chat:claude-finder-eio", "chat");
+
+  // Sibling dir notes2 to verify strict directory boundary matching (notes vs notes2)
+  const notesDir = join(s.brain, "notes");
+  const notes2File = join(s.brain, "notes2", "sibling.txt");
+  mkdirSync(join(notes2File, ".."), { recursive: true });
+  writeFileSync(notes2File, "sibling content\n");
+
+  const taskPath = join(s.brain, "task.md");
+  const notesFile = join(s.brain, "notes", "scratch", "b.txt");
+  const annPath = join(s.cli, "annotations", `${s.agyId}.pbtxt`);
+
+  const readStatePaths = (replica: string) => {
+    const db = new DatabaseSync(join(replica, "export.db"), { readOnly: true });
+    try {
+      return db.prepare("SELECT path, chunks_json FROM transcript_files ORDER BY path").all() as { path: string; chunks_json: string }[];
+    } finally {
+      db.close();
+    }
+  };
+
+  type FaultSpec = {
+    lstat_err?: string[];
+    readdir_err?: string[];
+    finder_readdir_err?: string[];
+    forbid_readdir?: string[];
+    read_short?: string[];
+    read_short_after_first?: string[];
+    other_kind?: string[];
+  };
+
+  const runDeterministicSuite = async (mode: "ts" | "mb") => {
+    const replica = join(s.data, `replica-faults-${mode}`);
+    let activeFaults: FaultSpec = {};
+    const readdirVisited = new Set<string>();
+    let exporter: Exporter | null = null;
+    let mb: Awaited<ReturnType<typeof makeMbExportHelper>> | null = null;
+    if (mode === "ts") {
+      exporter = new Exporter({
+        db: s.db,
+        replica,
+        dataDir: s.data,
+        origin: originId,
+        now: () => now,
+        chunkBytes: 16,
+        testFaults: {
+          onReaddir: (d) => {
+            readdirVisited.add(d);
+            if (activeFaults.forbid_readdir?.includes(d)) throw new Error(`BUG: descended into forbidden directory ${d}`);
+          },
+          lstatError: (p) => (activeFaults.lstat_err?.includes(p) ? mkErr("EIO") : null),
+          readdirError: (d) => (activeFaults.readdir_err?.includes(d) ? mkErr("EACCES") : null),
+          finderReaddirError: (d) => (activeFaults.finder_readdir_err?.includes(d) ? mkErr("EIO") : null),
+          readShort: (p, offset) =>
+            Boolean(activeFaults.read_short?.includes(p) || (offset > 0 && activeFaults.read_short_after_first?.includes(p))),
+          otherKind: (p) => Boolean(activeFaults.other_kind?.includes(p)),
+        },
+      });
+      closing.push(async () => exporter?.close());
+      exporter.setPlaces({ home: HOME, workspaces: [{ workspace: HOME, name: "src" }] });
+    } else {
+      mb = await makeMbExportHelper(s.db, replica, s.data, originId, 16);
+      await mb.places(now);
+    }
+    const setFaults = async (f: FaultSpec) => {
+      activeFaults = f;
+      if (mb !== null) await mb.testFaults(f, now);
+    };
+    const pass = async (told: ReturnType<typeof nothingTold>) =>
+      exporter !== null ? exporter.pass(told) : mb!.pass(told, now);
+
+    // Ensure notes2File, annPath, taskPath, and finderEioTrPath start from clean baseline for this mode run
+    mkdirSync(join(notes2File, ".."), { recursive: true });
+    writeFileSync(notes2File, "sibling content\n");
+    writeFileSync(annPath, `content:${annPath}\n`);
+    writeFileSync(taskPath, `content:${taskPath}\n`);
+    utimesSync(taskPath, new Date(now), new Date(now));
+    writeFileSync(finderEioTrPath, '{"role":"user","text":"finder-eio-keep"}\n');
+    utimesSync(finderEioTrPath, new Date(now), new Date(now));
+
+    // Baseline export
+    await pass(nothingTold());
+    const baseline = readStatePaths(replica);
+    assert.ok(baseline.some((r) => r.path === notes2File));
+    assert.ok(baseline.some((r) => r.path === claudeSubPath));
+
+    // (a) brain root lstat EIO -> all brain files preserved, 0 tr_del
+    now += 10_000;
+    await setFaults({ lstat_err: [s.brain] });
+    const pRoot = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pRoot.wrote, 0, `${mode}: brain root lstat EIO emits no tr_del`);
+    assert.deepEqual(readStatePaths(replica), baseline);
+
+    // (b) claude subdir readdir EACCES -> claudeSubPath preserved
+    now += 10_000;
+    await setFaults({ readdir_err: [claudeSubDir] });
+    const pClaude = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pClaude.wrote, 0, `${mode}: claude subdir EACCES preserves subagent transcript`);
+    assert.ok(readStatePaths(replica).some((r) => r.path === claudeSubPath));
+
+    // (c) subdir readdir EACCES on `notes` while `notes2/sibling.txt` is genuinely deleted (ENOENT)
+    now += 10_000;
+    await setFaults({ readdir_err: [notesDir] });
+    rmSync(notes2File);
+    const pSub = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pSub.wrote, 1);
+    const afterSub = readStatePaths(replica);
+    assert.ok(afterSub.some((r) => r.path === notesFile), `${mode}: unreadable subdir preserves its files`);
+    assert.ok(!afterSub.some((r) => r.path === notes2File), `${mode}: strict dir boundary allows genuine ENOENT sibling tr_del`);
+
+    // (d) single file lstat EIO -> preserved; confirmed ENOENT -> normal tr_del
+    now += 10_000;
+    await setFaults({ lstat_err: [annPath] });
+    const pLstat = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pLstat.wrote, 0, `${mode}: file lstat EIO preserves row`);
+    assert.ok(readStatePaths(replica).some((r) => r.path === annPath));
+
+    now += 10_000;
+    await setFaults({});
+    rmSync(annPath);
+    const pEnoent = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pEnoent.wrote, 1);
+    assert.ok(!readStatePaths(replica).some((r) => r.path === annPath), `${mode}: confirmed ENOENT emits tr_del`);
+
+    // (e) Discovery-stage parent dir unreadable (e.g. chmod 0o111 on parent dir while file exists on disk):
+    // Simulate a file not discovered in `active` whose parent dir fails `readdir` -> tr_del double-check preserves it!
+    now += 10_000;
+    const orphanDir = join(s.brain, "unlisted-parent");
+    const orphanFile = join(orphanDir, "keep.md");
+    mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(orphanFile, "keep-me\n");
+    await pass({ ...nothingTold(), transcripts: true });
+    assert.ok(readStatePaths(replica).some((r) => r.path === orphanFile));
+    now += 10_000;
+    // Inject readdir_err on orphanDir so walk skips it AND tr_del parent check sees unreadable parent
+    await setFaults({ readdir_err: [orphanDir] });
+    const pParentUnreadable = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pParentUnreadable.wrote, 0, `${mode}: unreadable parent dir protects file from tr_del`);
+    assert.ok(readStatePaths(replica).some((r) => r.path === orphanFile));
+    await setFaults({});
+
+    // (f) Fresh file short read (offset 0) -> never commits half record or emits tr
+    now += 10_000;
+    const freshFile = join(s.brain, "fresh-short.md");
+    writeFileSync(freshFile, "brand-new-file-content-that-fails-at-offset-0\n");
+    await setFaults({ read_short: [freshFile] });
+    const pFreshShort = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pFreshShort.wrote, 0, `${mode}: fresh file short read must not commit`);
+    assert.ok(!readStatePaths(replica).some((r) => r.path === freshFile));
+    await setFaults({});
+    rmSync(freshFile);
+
+    // (g) Existing file mid-stream short read (offset > 0) -> preserves old row, emits no tr/tr_del
+    now += 10_000;
+    const prevTaskRow = readStatePaths(replica).find((r) => r.path === taskPath)!;
+    writeFileSync(taskPath, "0123456789abcdef_second_chunk_that_will_short_read\n");
+    utimesSync(taskPath, new Date(now), new Date(now));
+    await setFaults({ read_short_after_first: [taskPath] });
+    const pMidShort = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pMidShort.wrote, 0, `${mode}: mid-stream short read preserves old row`);
+    assert.deepEqual(readStatePaths(replica).find((r) => r.path === taskPath), prevTaskRow);
+    await setFaults({});
+    now += 10_000;
+    const pRecover = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pRecover.wrote, 1);
+    assert.notDeepEqual(readStatePaths(replica).find((r) => r.path === taskPath), prevTaskRow);
+
+    // (h) R2: `other` dirent kind -> lstat dispatch exports file & dir, enforces brain pruning, protects lstat_err
+    now += 10_000;
+    const otherFile = join(s.brain, "other-file.md");
+    const otherDir = join(s.brain, "other-dir");
+    const otherInside = join(otherDir, "inside.md");
+    const otherBad = join(s.brain, "other-bad.md");
+    const scratchDir = join(s.brain, "scratch");
+    mkdirSync(otherDir, { recursive: true });
+    writeFileSync(otherBad, "other-bad-keep\n");
+    await pass({ ...nothingTold(), transcripts: true });
+    assert.ok(readStatePaths(replica).some((r) => r.path === otherBad));
+
+    now += 10_000;
+    writeFileSync(otherFile, "other-file-content\n");
+    writeFileSync(otherInside, "other-dir-inside-content\n");
+    readdirVisited.clear();
+    await setFaults({
+      other_kind: [otherFile, otherDir, otherBad, scratchDir],
+      lstat_err: [otherBad],
+      forbid_readdir: [scratchDir],
+    });
+    const pOther = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pOther.wrote, 1);
+    if (mode === "ts") {
+      assert.equal(readdirVisited.has(scratchDir), false, "TS: other-kind scratch dir must have 0 readdir visits");
+    }
+    const afterOther = readStatePaths(replica);
+    assert.ok(afterOther.some((r) => r.path === otherFile), `${mode}: other-kind file exported via lstat dispatch`);
+    assert.ok(afterOther.some((r) => r.path === otherInside), `${mode}: other-kind dir recursed via lstat dispatch`);
+    assert.ok(afterOther.some((r) => r.path === otherBad), `${mode}: other-kind lstat_err preserved without tr_del`);
+    await setFaults({});
+    rmSync(otherFile);
+    rmSync(otherDir, { recursive: true, force: true });
+    rmSync(otherBad);
+    now += 10_000;
+    await pass({ ...nothingTold(), transcripts: true });
+
+    // (i) R2: previously backed-up dir replaced with symlink to external dir -> emits tr_del and NEVER follows/probes external target
+    now += 10_000;
+    const swapDir = join(s.brain, "swapdir");
+    const swapFile = join(swapDir, "a.txt");
+    mkdirSync(swapDir, { recursive: true });
+    writeFileSync(swapFile, "real-dir-content\n");
+    await pass({ ...nothingTold(), transcripts: true });
+    assert.ok(readStatePaths(replica).some((r) => r.path === swapFile));
+
+    now += 10_000;
+    rmSync(swapDir, { recursive: true, force: true });
+    const extTarget = dataDir(`d71-swap-ext-${mode}`);
+    writeFileSync(join(extTarget, "a.txt"), "external-secret\n");
+    symlinkSync(extTarget, swapDir);
+    readdirVisited.clear();
+    await setFaults({ readdir_err: [extTarget, swapDir], forbid_readdir: [extTarget, swapDir] });
+    const pSwap = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pSwap.wrote, 1);
+    if (mode === "ts") {
+      assert.equal(readdirVisited.has(extTarget), false, "TS: symlink external target must have 0 readdir visits");
+      assert.equal(readdirVisited.has(swapDir), false, "TS: symlinked dir must have 0 readdir visits");
+    }
+    assert.ok(!readStatePaths(replica).some((r) => r.path === swapFile), `${mode}: dir replaced by symlink emits tr_del without following target`);
+    await setFaults({});
+    rmSync(swapDir, { force: true });
+
+    // (j) R3/R4: Finder opendir succeeds (dir is 0o755!) but mid-iteration readdir hits EIO -> ONLY Finder failed_dirs
+    //     saves existing Claude transcript (dir_unreadable_checked sees 0o755 as readable!) -> 0 tr_del (root-safe, TS + MB);
+    //     then clear fault + append new content -> re-discovered and exported (proves no poisoned `elsewhere` negative cache!)
+    const prevFinderRow = readStatePaths(replica).find((r) => r.path === finderEioTrPath)!;
+    assert.ok(prevFinderRow, `${mode}: baseline has finderEioTrPath`);
+    resetTranscriptLocateCache();
+    now += 10_000;
+    await setFaults({ finder_readdir_err: [claudeProjectsDir] });
+    const pFinderEio = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pFinderEio.wrote, 0, `${mode}: Finder mid-iteration EIO on 0o755 dir preserves transcript with 0 tr_del`);
+    assert.deepEqual(readStatePaths(replica).find((r) => r.path === finderEioTrPath), prevFinderRow);
+
+    await setFaults({});
+    now += 10_000;
+    writeFileSync(finderEioTrPath, `{"role":"user","text":"finder-eio-keep"}\n{"role":"assistant","text":"recovered-after-eio-${mode}"}\n`);
+    utimesSync(finderEioTrPath, new Date(now), new Date(now));
+    const pFinderRecover = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pFinderRecover.wrote, 1, `${mode}: recovery pass after Finder EIO re-discovers and exports appended content`);
+    const recoveredFinderRow = readStatePaths(replica).find((r) => r.path === finderEioTrPath)!;
+    assert.ok(recoveredFinderRow, `${mode}: finderEioTrPath retained after recovery`);
+    assert.notEqual(recoveredFinderRow.chunks_json, prevFinderRow.chunks_json, `${mode}: appended content exported (no poisoned negative cache)`);
+
+    // (k) R4: two workspaces in the SAME pass sharing the same Claude runtime ID (both scanning `transcripts/claude`):
+    //     injecting `finder_readdir_err` must preserve BOTH workspaces' rows with 0 tr_del (no negative-cache short-circuit on 2nd ws)
+    const ws2Key = `chat:claude-finder-eio-ws2-${mode}`;
+    const ws2Room = join(s.data, "sessions", "chat", ws2Key, "workspace");
+    mkdirSync(ws2Room, { recursive: true });
+    s.store.insertSession({
+      key: ws2Key,
+      connect: "chat",
+      runtime: "claude",
+      profile: "cc",
+      workspace: ws2Room,
+      token: `tok-${ws2Key}`,
+      createdAt: 4,
+      lastActiveAt: 4,
+      ws: OTHER,
+    });
+    s.store.setRuntimeSessionId(ws2Key, finderEioId);
+    const tWs2 = s.store.openThread("chat", "C", `ts-${ws2Key}`, "Claude Finder WS2", "p@x").id;
+    s.store.joinThread(tWs2, ws2Key, "chat");
+    const twoWsList = [
+      { workspace: HOME, name: "src" },
+      { workspace: OTHER, name: "other" },
+    ];
+    if (exporter !== null) exporter.setPlaces({ home: HOME, workspaces: twoWsList });
+    else await mb!.places(now, twoWsList);
+
+    const readWsRows = (ws: string) => {
+      const db = new DatabaseSync(join(replica, "export.db"), { readOnly: true });
+      try {
+        return db.prepare("SELECT path, chunks_json FROM transcript_files WHERE ws = ? ORDER BY path").all(ws) as { path: string; chunks_json: string }[];
+      } finally {
+        db.close();
+      }
+    };
+    resetTranscriptLocateCache();
+    now += 10_000;
+    await pass({ ...nothingTold(), transcripts: true });
+    assert.ok(readWsRows(HOME).some((r) => r.path === finderEioTrPath), `${mode}: HOME has shared Claude transcript`);
+    assert.ok(readWsRows(OTHER).some((r) => r.path === finderEioTrPath), `${mode}: OTHER has shared Claude transcript`);
+
+    resetTranscriptLocateCache();
+    now += 10_000;
+    await setFaults({ finder_readdir_err: [claudeProjectsDir] });
+    const pTwoWsEio = await pass({ ...nothingTold(), transcripts: true });
+    assert.equal(pTwoWsEio.wrote, 0, `${mode}: shared Claude ID across 2 workspaces emits 0 tr_del on Finder EIO`);
+    assert.ok(readWsRows(HOME).some((r) => r.path === finderEioTrPath), `${mode}: HOME row preserved`);
+    assert.ok(readWsRows(OTHER).some((r) => r.path === finderEioTrPath), `${mode}: OTHER row preserved (no negative-cache skip)`);
+    await setFaults({});
+    if (exporter !== null) exporter.setPlaces({ home: HOME, workspaces: [{ workspace: HOME, name: "src" }] });
+    else await mb!.places(now);
+  };
+
+  await runDeterministicSuite("ts");
+  if (binary !== null) {
+    await runDeterministicSuite("mb");
+  }
+
+  // Real OS EACCES check on non-root systems (Linux CI / pvg-office-1), including Finder discovery-stage chmod 0o111!
+  if (typeof process.getuid === "function" && process.getuid() !== 0) {
+    // Dedicated Claude session whose transcript is discovered via Finder scanning `transcripts/claude/` (cwd != slug)
+    const finderClaudeId = "cc-finder-0111";
+    const finderSlugDir = join(s.data, "transcripts", "claude", "-other-project-slug");
+    const finderProjectsDir = join(s.data, "transcripts", "claude");
+    mkdirSync(finderSlugDir, { recursive: true });
+    const finderTrPath = join(finderSlugDir, `${finderClaudeId}.jsonl`);
+    writeFileSync(finderTrPath, '{"role":"user","text":"finder-0111-keep"}\n');
+    const finderRoom = join(s.data, "sessions", "chat", "chat:claude-finder", "workspace");
+    mkdirSync(finderRoom, { recursive: true });
+    s.store.insertSession({
+      key: "chat:claude-finder",
+      connect: "chat",
+      runtime: "claude",
+      profile: "cc",
+      workspace: finderRoom,
+      token: "tok-cc-finder",
+      createdAt: 3,
+      lastActiveAt: 3,
+      ws: null,
+    });
+    s.store.setRuntimeSessionId("chat:claude-finder", finderClaudeId);
+    const tFinder = s.store.openThread("chat", "C", "ts-cc-finder", "Claude Finder", "p@x").id;
+    s.store.joinThread(tFinder, "chat:claude-finder", "chat");
+
+    // Verify Finder discovery-stage chmod 0o111 (execute-only, not readable) protects finderTrPath in BOTH TS and MB!
+    const replicaOsTs = join(s.data, "replica-faults-os-ts");
+    const expOsTs = new Exporter({
+      db: s.db,
+      replica: replicaOsTs,
+      dataDir: s.data,
+      origin: originId,
+      now: () => now,
+      chunkBytes: 16,
+    });
+    closing.push(async () => expOsTs.close());
+    expOsTs.setPlaces({ home: HOME, workspaces: [{ workspace: HOME, name: "src" }] });
+    expOsTs.pass(nothingTold());
+    assert.ok(readStatePaths(replicaOsTs).some((r) => r.path === finderTrPath), "TS baseline has Finder-discovered Claude transcript");
+
+    const replicaOsMb = join(s.data, "replica-faults-os-mb");
+    const mb = binary !== null ? await makeMbExportHelper(s.db, replicaOsMb, s.data, originId, 16) : null;
+    if (mb !== null) {
+      await mb.places(now);
+      await mb.pass(nothingTold(), now);
+      assert.ok(readStatePaths(replicaOsMb).some((r) => r.path === finderTrPath), "MB baseline has Finder-discovered Claude transcript");
+    }
+
+    const convDir = join(s.cli, "conversations");
+    const dbPath = join(convDir, `${s.agyId}.db`);
+    try {
+      // Clear TS `elsewhere` cache so Finder must actually readdir `transcripts/claude` (no stale cache hit!)
+      resetTranscriptLocateCache();
+      // chmod 0o111 on `transcripts/claude` (Finder's scan dir!): lstat on <slug> and <id>.jsonl SUCCEEDS,
+      // Finder's readdir FAILS, so ONLY Finder failed_dirs + ancestor dir readability check saves finderTrPath from tr_del!
+      chmodSync(finderProjectsDir, 0o111);
+      now += 10_000;
+      assert.equal(expOsTs.pass({ ...nothingTold(), transcripts: true }).wrote, 0, "TS: chmod 0o111 on Finder projects dir preserves transcript");
+      assert.ok(readStatePaths(replicaOsTs).some((r) => r.path === finderTrPath));
+      if (mb !== null) {
+        assert.equal((await mb.pass({ ...nothingTold(), transcripts: true }, now)).wrote, 0, "MB: chmod 0o111 on Finder projects dir preserves transcript");
+        assert.ok(readStatePaths(replicaOsMb).some((r) => r.path === finderTrPath));
+      }
+      chmodSync(finderProjectsDir, 0o755);
+
+      if (mb !== null) {
+        chmodSync(notesDir, 0o000);
+        now += 10_000;
+        assert.equal((await mb.pass({ ...nothingTold(), transcripts: true }, now)).wrote, 0);
+        assert.ok(readStatePaths(replicaOsMb).some((r) => r.path === notesFile));
+        chmodSync(notesDir, 0o755);
+
+        chmodSync(convDir, 0o000);
+        now += 10_000;
+        assert.equal((await mb.pass({ ...nothingTold(), transcripts: true }, now)).wrote, 0);
+        assert.ok(readStatePaths(replicaOsMb).some((r) => r.path === dbPath));
+        chmodSync(convDir, 0o755);
+      }
+    } finally {
+      try { chmodSync(finderProjectsDir, 0o755); } catch {}
+      try { chmodSync(notesDir, 0o755); } catch {}
+      try { chmodSync(convDir, 0o755); } catch {}
+    }
+  }
+});
+
+test("D71: tr_del batch throttling shares budget across multiple workspaces (ws1 + ws2) with TS/MoonBit 0-diff", async () => {
+  const s = makeAgyBrainStation();
+  closing.push(async () => s.store.close());
+  let now = 1_700_000_000_000;
+  const originId = sid("a");
+
+  // Second AGY session in workspace OTHER
+  const agyId2 = "agy-brain-other-ws";
+  const room2 = join(s.data, "sessions", "chat", "chat:agy-other", "workspace");
+  mkdirSync(room2, { recursive: true });
+  s.store.insertSession({
+    key: "chat:agy-other",
+    connect: "chat",
+    runtime: "agy",
+    profile: "agyprof",
+    workspace: room2,
+    token: "tok-agy-other",
+    createdAt: 2,
+    lastActiveAt: 2,
+    ws: OTHER,
+  });
+  s.store.setRuntimeSessionId("chat:agy-other", agyId2);
+  const t2 = s.store.openThread("chat", "C", "ts-agy-other", "AGY Other", "p@x").id;
+  s.store.joinThread(t2, "chat:agy-other", "chat");
+
+  // ws1 (HOME): 2 stale files; ws2 (OTHER): 3 stale files; budget = 3 -> pass 1 deletes 3 total (more:true), pass 2 deletes 2 (more:false)
+  const ws1Files: string[] = [];
+  for (let i = 1; i <= 2; i++) {
+    const p = join(s.brain, "extra1", `a${i}.txt`);
+    mkdirSync(join(p, ".."), { recursive: true });
+    writeFileSync(p, `ws1-${i}\n`);
+    ws1Files.push(p);
+  }
+  const brain2 = join(s.cli, "brain", agyId2);
+  const ws2Keep = join(brain2, "keep.md");
+  mkdirSync(brain2, { recursive: true });
+  writeFileSync(ws2Keep, "keep\n");
+  const ws2Files: string[] = [];
+  for (let i = 1; i <= 3; i++) {
+    const p = join(brain2, "extra2", `b${i}.txt`);
+    mkdirSync(join(p, ".."), { recursive: true });
+    writeFileSync(p, `ws2-${i}\n`);
+    ws2Files.push(p);
+  }
+
+  const wsList = [
+    { workspace: HOME, name: "home" },
+    { workspace: OTHER, name: "other" },
+  ];
+  const replicaTs = join(s.data, "replica-multiws-ts");
+  const exporter = new Exporter({
+    db: s.db,
+    replica: replicaTs,
+    dataDir: s.data,
+    origin: originId,
+    now: () => now,
+    chunkBytes: 4096,
+    transcriptPassDeletes: 3,
+    fold: false,
+  });
+  closing.push(async () => exporter.close());
+  exporter.setPlaces({ home: HOME, workspaces: wsList });
+  exporter.pass(nothingTold());
+
+  const replicaMb = join(s.data, "replica-multiws-mb");
+  const mb = binary !== null
+    ? await makeMbExportHelper(s.db, replicaMb, s.data, originId, 4096, ["--transcript-pass-deletes", "3", "--no-fold"])
+    : null;
+  if (mb !== null) {
+    await mb.places(now, wsList);
+    await mb.pass(nothingTold(), now);
+  }
+
+  for (const p of [...ws1Files, ...ws2Files]) rmSync(p);
+
+  const countAll = (replica: string) => {
+    const db = new DatabaseSync(join(replica, "export.db"), { readOnly: true });
+    try {
+      return (db.prepare("SELECT COUNT(*) AS n FROM transcript_files").get() as { n: number }).n;
+    } finally {
+      db.close();
+    }
+  };
+  const baseKeep = s.keptFiles.length + 1; // +1 for ws2Keep
+  assert.equal(countAll(replicaTs), baseKeep + 5);
+
+  now += 10_000;
+  const p1Ts = exporter.pass({ ...nothingTold(), transcripts: true });
+  assert.equal(p1Ts.more, true, "TS pass 1 hits shared budget=3 across ws1+ws2");
+  assert.equal(countAll(replicaTs), baseKeep + 2, "TS pass 1 deleted exactly 3 across workspaces");
+
+  now += 10_000;
+  const p2Ts = exporter.pass(nothingTold());
+  assert.equal(p2Ts.more, false, "TS pass 2 drains remaining 2");
+  assert.equal(countAll(replicaTs), baseKeep);
+
+  if (mb !== null) {
+    const p1Mb = await mb.pass({ ...nothingTold(), transcripts: true }, now - 10_000);
+    assert.equal(p1Mb.more, true, "MB pass 1 hits shared budget=3 across ws1+ws2");
+    assert.equal(countAll(replicaMb), baseKeep + 2, "MB pass 1 deleted exactly 3 across workspaces");
+    const p2Mb = await mb.pass(nothingTold(), now);
+    assert.equal(p2Mb.more, false, "MB pass 2 drains remaining 2");
+    assert.equal(countAll(replicaMb), baseKeep);
+  }
+});
+
+test("D71: tr_del batch throttling drains 7 stale records in 3 passes (3 + 3 + 1) with TS/MoonBit 0-diff", async () => {
+  const s = makeAgyBrainStation();
+  closing.push(async () => s.store.close());
+  let now = 1_700_000_000_000;
+  const originId = sid("a");
+
+  // Create 7 extra files under brain/<id>/extra/
+  const extraFiles: string[] = [];
+  const extraDir = join(s.brain, "extra");
+  mkdirSync(extraDir, { recursive: true });
+  for (let i = 1; i <= 7; i++) {
+    const p = join(extraDir, `f${i}.txt`);
+    writeFileSync(p, `extra-${i}\n`);
+    extraFiles.push(p);
+  }
+
+  const replicaTs = join(s.data, "replica-del-ts");
+  const exporter = new Exporter({
+    db: s.db,
+    replica: replicaTs,
+    dataDir: s.data,
+    origin: originId,
+    now: () => now,
+    chunkBytes: 4096,
+    transcriptPassDeletes: 3,
+    fold: false,
+  });
+  closing.push(async () => exporter.close());
+  exporter.setPlaces({ home: HOME, workspaces: [{ workspace: HOME, name: "src" }] });
+  exporter.pass(nothingTold());
+
+  const replicaMb = join(s.data, "replica-del-mb");
+  const mb = binary !== null
+    ? await makeMbExportHelper(s.db, replicaMb, s.data, originId, 4096, ["--transcript-pass-deletes", "3", "--no-fold"])
+    : null;
+  if (mb !== null) {
+    await mb.places(now);
+    await mb.pass(nothingTold(), now);
+  }
+
+  const countStateRows = (replica: string) => {
+    const db = new DatabaseSync(join(replica, "export.db"), { readOnly: true });
+    try {
+      return (db.prepare("SELECT COUNT(*) AS n FROM transcript_files").get() as { n: number }).n;
+    } finally {
+      db.close();
+    }
+  };
+  const initialCount = countStateRows(replicaTs);
+  assert.equal(initialCount, s.keptFiles.length + 7);
+
+  // Delete all 7 extra files -> must drain in 3 passes: 3 (more:true), 3 (more:true), 1 (more:false)
+  for (const p of extraFiles) rmSync(p);
+
+  const trDelsInLatestBatch = (replica: string, head: any) => {
+    const genDir = join(replica, "own", HOME, head.gen);
+    const last = head.batches[head.batches.length - 1]!;
+    return [...decodeBatch(readFileSync(join(genDir, "log", last))).lines]
+      .map((l) => JSON.parse(l))
+      .filter((r) => "tr_del" in r)
+      .map((r) => r.tr_del as string);
+  };
+
+  const tsPerPass: string[][] = [];
+  const mbPerPass: string[][] = [];
+  const expectedRemaining = [s.keptFiles.length + 4, s.keptFiles.length + 1, s.keptFiles.length];
+  for (let round = 1; round <= 3; round++) {
+    now += 10_000;
+    const pTs = exporter.pass(round === 1 ? { ...nothingTold(), transcripts: true } : nothingTold());
+    assert.equal(pTs.more, round < 3, `TS pass ${round}: expected more=${round < 3}`);
+    assert.equal(countStateRows(replicaTs), expectedRemaining[round - 1], `TS pass ${round} remaining rows`);
+    tsPerPass.push(trDelsInLatestBatch(replicaTs, pTs.heads[HOME]!));
+
+    if (mb !== null) {
+      const pMb = await mb.pass(round === 1 ? { ...nothingTold(), transcripts: true } : nothingTold(), now);
+      assert.equal(pMb.more, round < 3, `MB pass ${round}: expected more=${round < 3}`);
+      assert.equal(countStateRows(replicaMb), expectedRemaining[round - 1], `MB pass ${round} remaining rows`);
+      mbPerPass.push(trDelsInLatestBatch(replicaMb, pMb.heads[HOME]!));
+    }
+  }
+  assert.deepEqual(tsPerPass.map((x) => x.length), [3, 3, 1], "TS deletes 3 + 3 + 1");
+  assert.deepEqual(tsPerPass.flat().sort(), [...extraFiles].sort());
+  if (mb !== null) {
+    assert.deepEqual(mbPerPass, tsPerPass, "MoonBit and TS reference emit identical tr_del batches pass by pass");
+  }
+});

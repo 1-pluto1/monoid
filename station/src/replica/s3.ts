@@ -10,6 +10,7 @@ import type { Held, Holding, Place } from "./places.ts";
 
 export const MULTIPART_THRESHOLD = 16 * 1024 * 1024;
 export const MULTIPART_PART_SIZE = 8 * 1024 * 1024;
+export const DELETE_OBJECTS_BATCH = 1000;
 const FILE_READ_PIECE = 1 << 20;
 
 const sha256Hex = (data: Buffer | string): string => createHash("sha256").update(data).digest("hex");
@@ -46,6 +47,16 @@ export function formatAmzDate(ms: number): { amzDate: string; dateStamp: string 
   const p4 = (n: number) => String(n).padStart(4, "0");
   const dateStamp = `${p4(year)}${p2(m)}${p2(d)}`;
   return { dateStamp, amzDate: `${dateStamp}T${p2(hh)}${p2(mm)}${p2(ss)}Z` };
+}
+
+export function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;")
+    .replace(/\r/g, "&#13;");
 }
 
 export function unescapeXml(s: string): string {
@@ -345,6 +356,53 @@ export class S3Client {
       throw new S3HttpError(res.status, `S3 DELETE ${key} failed (${res.status}): ${extractXmlTag(text, "Message") ?? text.slice(0, 200)}`);
     }
   }
+
+  async deleteObjects(keys: string[]): Promise<{ deleted: string[]; errors: { key: string; code: string; message: string }[] }> {
+    const deleted: string[] = [];
+    const errors: { key: string; code: string; message: string }[] = [];
+    if (keys.length === 0) return { deleted, errors };
+    for (let i = 0; i < keys.length; i += DELETE_OBJECTS_BATCH) {
+      const batch = keys.slice(i, i + DELETE_OBJECTS_BATCH);
+      const xml = `<Delete><Quiet>false</Quiet>${batch.map((k) => `<Object><Key>${escapeXml(k)}</Key></Object>`).join("")}</Delete>`;
+      const body = Buffer.from(xml, "utf8");
+      const contentMd5 = createHash("md5").update(body).digest("base64");
+      const res = await this.#fetch("POST", "", { delete: "" }, body, {
+        "content-md5": contentMd5,
+        "content-type": "application/xml",
+      });
+      const text = await res.text();
+      if (!res.ok) {
+        throw new S3HttpError(res.status, `S3 DeleteObjects failed (${res.status}): ${extractXmlTag(text, "Message") ?? text.slice(0, 200)}`);
+      }
+      const batchAccounted = new Set<string>();
+      const deletedRe = /<(?:[A-Za-z0-9_.-]+:)?Deleted(?:\s[^>]*)?>([\s\S]*?)<\/(?:[A-Za-z0-9_.-]+:)?Deleted>/g;
+      let m: RegExpExecArray | null;
+      while ((m = deletedRe.exec(text)) !== null) {
+        const k = extractXmlTag(m[1]!, "Key");
+        if (k !== null) {
+          deleted.push(k);
+          batchAccounted.add(k);
+        }
+      }
+      const errorRe = /<(?:[A-Za-z0-9_.-]+:)?Error(?:\s[^>]*)?>([\s\S]*?)<\/(?:[A-Za-z0-9_.-]+:)?Error>/g;
+      while ((m = errorRe.exec(text)) !== null) {
+        const block = m[1]!;
+        const k = extractXmlTag(block, "Key") ?? "";
+        errors.push({
+          key: k,
+          code: extractXmlTag(block, "Code") ?? "UnknownError",
+          message: extractXmlTag(block, "Message") ?? "",
+        });
+        if (k !== "") batchAccounted.add(k);
+      }
+      for (const k of batch) {
+        if (!batchAccounted.has(k)) {
+          errors.push({ key: k, code: "MissingFromResponse", message: "key omitted from S3 DeleteObjects response" });
+        }
+      }
+    }
+    return { deleted, errors };
+  }
 }
 
 async function* fileChunks(path: string): AsyncIterable<Buffer> {
@@ -370,8 +428,16 @@ export class S3Place implements Place {
   readonly target: NormalizedS3Target;
   readonly client: S3Client;
   readonly #key: Buffer;
-  /// Cached present `fileTag`s per `${ws}\n${origin}` from the last `held()` listing, for orphan cleanup in `drop()`.
+  /// Cached present `fileTag`s per `${ws}\n${origin}` from the last `held()` listing.
   readonly #presentFileTags = new Map<string, Set<string>>();
+  /// Orphan `fileTag`s (`fileTags \ referencedTags`) discovered by `held()` ONLY when every listed head was verified.
+  readonly #orphanFileTags = new Map<string, Set<string>>();
+  /// Per `${ws}\n${origin}` set of `gen`s whose `head/<gen>.enc` failed verification in `held()`.
+  readonly #unverifiedGens = new Map<string, Set<string>>();
+  /// Per `${ws}\n${origin}` -> `gen` -> referenced `files` and (for older gens) `transcriptFiles` hash maps (0-HMAC reference).
+  readonly #genRefHashes = new Map<string, Map<string, { files: Record<string, number>; transcriptFiles?: Record<string, number> }>>();
+  /// Last head reconciled against `#orphanFileTags` per `${ws}\n${origin}` (present ONLY while orphans are non-empty, for O(delta) incremental checks).
+  readonly #lastOrphanHead = new Map<string, Head>();
 
   constructor(target: NormalizedS3Target, opts: S3ClientOptions = {}) {
     this.target = target;
@@ -465,33 +531,119 @@ export class S3Place implements Place {
 
     const gens: Holding[] = [];
     const presentHashes = new Set<string>();
+    const referencedTags = new Set<string>();
+    const unverified = new Set<string>();
+    for (const gen of headGens) {
+      if (headMap.get(gen) === null) unverified.add(gen);
+    }
+    const allHeadsVerified = unverified.size === 0;
+    const byGen = new Map<string, { files: Record<string, number>; transcriptFiles?: Record<string, number> }>();
     for (const gen of allGens) {
       const head = headMap.get(gen) ?? null;
       const batches = (batchesByGen.get(gen) ?? []).sort();
       gens.push({ gen, head, batches });
       if (head !== null) {
         for (const h of Object.keys(head.files)) {
-          if (fileTags.has(this.fileTag(h))) presentHashes.add(h);
+          const tag = this.fileTag(h);
+          referencedTags.add(tag);
+          if (fileTags.has(tag)) presentHashes.add(h);
         }
         for (const h of Object.keys(head.transcriptFiles ?? {})) {
-          if (fileTags.has(this.fileTag(h))) presentHashes.add(h);
+          const tag = this.fileTag(h);
+          referencedTags.add(tag);
+          if (fileTags.has(tag)) presentHashes.add(h);
         }
+        byGen.set(gen, { files: head.files, transcriptFiles: head.transcriptFiles });
       }
+    }
+    const scopeKey = `${ws}\n${origin}`;
+    if (unverified.size > 0) this.#unverifiedGens.set(scopeKey, unverified);
+    else this.#unverifiedGens.delete(scopeKey);
+    this.#genRefHashes.set(scopeKey, byGen);
+    if (allHeadsVerified) {
+      const orphans = new Set<string>();
+      for (const tag of fileTags) {
+        if (!referencedTags.has(tag)) orphans.add(tag);
+      }
+      if (orphans.size > 0) {
+        this.#orphanFileTags.set(scopeKey, orphans);
+        const single = headMap.size === 1 ? ([...headMap.values()][0] ?? null) : null;
+        if (single !== null) this.#lastOrphanHead.set(scopeKey, single);
+        else this.#lastOrphanHead.delete(scopeKey);
+      } else {
+        this.#orphanFileTags.delete(scopeKey);
+        this.#lastOrphanHead.delete(scopeKey);
+      }
+    } else {
+      this.#orphanFileTags.delete(scopeKey);
+      this.#lastOrphanHead.delete(scopeKey);
     }
     gens.sort((a, b) => genMade(a.gen) - genMade(b.gen) || (a.gen < b.gen ? -1 : 1));
     return { gens, files: [...presentHashes] };
   }
 
-  async put(ws: string, origin: string, gen: string, kind: "batch" | "head", name: string, bytes: Buffer): Promise<void> {
+  #reconcileOrphans(scopeKey: string, head: Head): void {
+    const orphans = this.#orphanFileTags.get(scopeKey);
+    if (orphans === undefined || orphans.size === 0) {
+      this.#lastOrphanHead.delete(scopeKey);
+      return;
+    }
+    const prev = this.#lastOrphanHead.get(scopeKey);
+    const incremental = prev !== undefined && prev.gen === head.gen;
+    for (const h in head.files) {
+      if (!Object.hasOwn(head.files, h)) continue;
+      if (incremental && Object.hasOwn(prev.files, h)) continue;
+      orphans.delete(this.fileTag(h));
+      if (orphans.size === 0) break;
+    }
+    if (orphans.size > 0 && head.transcriptFiles !== undefined) {
+      const prevTf = incremental ? prev.transcriptFiles : undefined;
+      for (const h in head.transcriptFiles) {
+        if (!Object.hasOwn(head.transcriptFiles, h)) continue;
+        if (prevTf !== undefined && Object.hasOwn(prevTf, h)) continue;
+        orphans.delete(this.fileTag(h));
+        if (orphans.size === 0) break;
+      }
+    }
+    if (orphans.size === 0) {
+      this.#orphanFileTags.delete(scopeKey);
+      this.#lastOrphanHead.delete(scopeKey);
+    } else {
+      this.#lastOrphanHead.set(scopeKey, head);
+    }
+  }
+
+  async put(ws: string, origin: string, gen: string, kind: "batch" | "head", name: string, bytes: Buffer, head?: Head): Promise<void> {
     if (!WORKSPACE.test(ws) || !STATION.test(origin) || !GEN.test(gen)) throw new Error("not a copy's name");
     if (kind === "batch") {
       if (!BATCH.test(name)) throw new Error("not a batch's name");
       const enc = sfb1Seal(this.#key, { ws, origin, logicalPath: `log/${gen}/${name}` }, bytes);
       await this.client.putObject(this.#batchKey(ws, origin, gen, name), enc);
     } else {
+      let parsed: Head | null = head ?? null;
+      if (parsed === null) {
+        try {
+          parsed = asHead(JSON.parse(bytes.toString("utf8")));
+        } catch {
+          parsed = null;
+        }
+      }
       const ot = this.originTag(origin);
       const enc = sfb1Seal(this.#key, { ws, origin: ot, logicalPath: `head/${gen}` }, bytes);
       await this.client.putObject(this.#headKey(ws, origin, gen), enc);
+      const scopeKey = `${ws}\n${origin}`;
+      const unverified = this.#unverifiedGens.get(scopeKey);
+      if (unverified !== undefined) {
+        unverified.delete(gen);
+        if (unverified.size === 0) this.#unverifiedGens.delete(scopeKey);
+      }
+      if (parsed !== null) {
+        let byGen = this.#genRefHashes.get(scopeKey);
+        if (byGen === undefined) this.#genRefHashes.set(scopeKey, (byGen = new Map()));
+        // Current gen only needs `files` protected in `drop()` (never retains 246k `transcriptFiles` in memory).
+        byGen.set(gen, { files: parsed.files });
+        this.#reconcileOrphans(scopeKey, parsed);
+      }
     }
   }
 
@@ -500,20 +652,116 @@ export class S3Place implements Place {
     const chunks = Buffer.isBuffer(source) ? oneChunk(source) : fileChunks(source);
     const encStream = sfb1SealStream(this.#key, { ws, origin, logicalPath: `files/${hash}` }, chunks);
     await this.client.putStream(this.#fileKey(ws, origin, hash), encStream);
-    this.#presentFileTags.get(`${ws}\n${origin}`)?.add(this.fileTag(hash));
+    const tag = this.fileTag(hash);
+    const scopeKey = `${ws}\n${origin}`;
+    this.#presentFileTags.get(scopeKey)?.add(tag);
+    this.#orphanFileTags.get(scopeKey)?.delete(tag);
   }
 
   async drop(ws: string, origin: string, gen: string, batches: string[], files: string[]): Promise<void> {
     if (!WORKSPACE.test(ws) || !STATION.test(origin) || !GEN.test(gen)) throw new Error("not a copy's name");
-    for (const b of batches) {
-      if (BATCH.test(b)) await this.client.deleteObject(this.#batchKey(ws, origin, gen, b));
-    }
-    const tags = this.#presentFileTags.get(`${ws}\n${origin}`);
-    for (const f of files) {
-      if (HASH.test(f)) {
-        await this.client.deleteObject(this.#fileKey(ws, origin, f));
-        tags?.delete(this.fileTag(f));
+    const scopeKey = `${ws}\n${origin}`;
+    const unverified = this.#unverifiedGens.get(scopeKey);
+    const allVerified = unverified === undefined || unverified.size === 0;
+    const byGen = this.#genRefHashes.get(scopeKey);
+    const isProtectedHash = (hash: string): boolean => {
+      if (byGen === undefined) return false;
+      for (const [otherGen, refs] of byGen) {
+        if (Object.hasOwn(refs.files, hash)) return true;
+        if (otherGen !== gen && refs.transcriptFiles !== undefined && Object.hasOwn(refs.transcriptFiles, hash)) return true;
       }
+      return false;
+    };
+    const keys: string[] = [];
+    const fileKeyToTag = new Map<string, string>();
+    for (const b of batches) {
+      if (BATCH.test(b)) keys.push(this.#batchKey(ws, origin, gen, b));
+    }
+    if (allVerified) {
+      for (const f of files) {
+        if (!HASH.test(f)) continue;
+        if (isProtectedHash(f)) continue;
+        const tag = this.fileTag(f);
+        const k = this.#fileKey(ws, origin, f);
+        keys.push(k);
+        fileKeyToTag.set(k, tag);
+      }
+    }
+    if (keys.length === 0) return;
+    const { deleted, errors } = await this.client.deleteObjects(keys);
+    const tags = this.#presentFileTags.get(scopeKey);
+    const orphans = this.#orphanFileTags.get(scopeKey);
+    for (const k of deleted) {
+      const tag = fileKeyToTag.get(k);
+      if (tag !== undefined) {
+        tags?.delete(tag);
+        orphans?.delete(tag);
+      }
+    }
+    const realErrors: { key: string; code: string; message: string }[] = [];
+    for (const err of errors) {
+      if (err.code === "NoSuchKey") {
+        const tag = fileKeyToTag.get(err.key);
+        if (tag !== undefined) {
+          tags?.delete(tag);
+          orphans?.delete(tag);
+        }
+      } else {
+        realErrors.push(err);
+      }
+    }
+    if (realErrors.length > 0) {
+      const sample = realErrors[0]!;
+      throw new Error(`S3 DeleteObjects failed for ${realErrors.length} key(s): ${sample.key} (${sample.code}: ${sample.message})`);
+    }
+  }
+
+  async pruneOrphans(ws: string, origin: string, liveHead?: Head): Promise<void> {
+    if (!WORKSPACE.test(ws) || !STATION.test(origin)) throw new Error("not a copy's name");
+    const scopeKey = `${ws}\n${origin}`;
+    if (liveHead !== undefined) this.#reconcileOrphans(scopeKey, liveHead);
+    const orphans = this.#orphanFileTags.get(scopeKey);
+    if (orphans === undefined || orphans.size === 0) {
+      this.#lastOrphanHead.delete(scopeKey);
+      return;
+    }
+    const wt = this.wsTag(ws);
+    const ot = this.originTag(origin);
+    const keys: string[] = [];
+    const keyToTag = new Map<string, string>();
+    for (const tag of orphans) {
+      const k = this.#prefixed(`${wt}/${ot}/files/${tag}.enc`);
+      keys.push(k);
+      keyToTag.set(k, tag);
+    }
+    const { deleted, errors } = await this.client.deleteObjects(keys);
+    const tags = this.#presentFileTags.get(scopeKey);
+    for (const k of deleted) {
+      const tag = keyToTag.get(k);
+      if (tag !== undefined) {
+        orphans.delete(tag);
+        tags?.delete(tag);
+      }
+    }
+    const realErrors: { key: string; code: string; message: string }[] = [];
+    for (const err of errors) {
+      if (err.code === "NoSuchKey") {
+        const tag = keyToTag.get(err.key);
+        if (tag !== undefined) {
+          orphans.delete(tag);
+          tags?.delete(tag);
+        }
+      } else {
+        realErrors.push(err);
+      }
+    }
+    if (orphans.size === 0) {
+      this.#orphanFileTags.delete(scopeKey);
+      this.#lastOrphanHead.delete(scopeKey);
+    }
+    if (realErrors.length > 0) {
+      const sample = realErrors[0]!;
+      throw new Error(`S3 pruneOrphans failed for ${realErrors.length} key(s): ${sample.key} (${sample.code}: ${sample.message})`);
     }
   }
 

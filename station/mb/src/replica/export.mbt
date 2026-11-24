@@ -25,10 +25,16 @@ let default_transcript_pass_files : Int = 512
 let default_transcript_pass_bytes : Int = 33554432
 
 ///|
+let default_transcript_pass_deletes : Int = 2000
+
+///|
 pub let transcript_pass_files : Int = default_transcript_pass_files
 
 ///|
 pub let transcript_pass_bytes : Int = default_transcript_pass_bytes
+
+///|
+pub let transcript_pass_deletes : Int = default_transcript_pass_deletes
 
 ///|
 let default_chunk_gc_grace_ms : Double = 600000.0
@@ -104,6 +110,45 @@ priv struct Places {
 }
 
 ///|
+/// Optional test-only fault injection hooks (zero overhead when `None` in production).
+pub struct TestFaults {
+  lstat_err : Set[String]
+  readdir_err : Set[String]
+  finder_readdir_err : Set[String]
+  forbid_readdir : Set[String]
+  read_short : Set[String]
+  read_short_after_first : Set[String]
+  other_kind : Set[String]
+}
+
+///|
+pub fn TestFaults::from_jvalue(v : JValue) -> TestFaults? {
+  guard v is Obj(_) else { return None }
+  let set_of = (k : String) => {
+    let s : Set[String] = Set([])
+    for item in strings_of(get(v, k)) {
+      s.add(item)
+    }
+    s
+  }
+  Some({
+    lstat_err: set_of("lstat_err"),
+    readdir_err: set_of("readdir_err"),
+    finder_readdir_err: set_of("finder_readdir_err"),
+    forbid_readdir: set_of("forbid_readdir"),
+    read_short: set_of("read_short"),
+    read_short_after_first: set_of("read_short_after_first"),
+    other_kind: set_of("other_kind"),
+  })
+}
+
+///|
+pub fn TestFaults::from_json(raw : String) -> TestFaults? {
+  let v = @jsjson.parse(raw) catch { _ => return None }
+  TestFaults::from_jvalue(v)
+}
+
+///|
 pub struct Exporter {
   priv host : @host.Host
   priv files : Files
@@ -116,6 +161,7 @@ pub struct Exporter {
   priv chunk_bytes : Int
   priv transcript_pass_files : Int
   priv transcript_pass_bytes : Int
+  priv transcript_pass_deletes : Int
   priv chunk_gc_grace_ms : Double
   priv fold : Bool
   priv now : () -> Double
@@ -123,6 +169,7 @@ pub struct Exporter {
   priv mut known : Bool
   priv mut transcripts_pending : Bool
   priv tf_cache : Map[String, Array[(String, JValue)]]
+  priv mut test_faults : TestFaults?
   /// This run of the exporter.
   run : String
   priv mut read : Int
@@ -141,8 +188,10 @@ pub fn Exporter::new(
   chunk_bytes? : Int = chunk_plain_bytes,
   transcript_pass_files? : Int = transcript_pass_files,
   transcript_pass_bytes? : Int = transcript_pass_bytes,
+  transcript_pass_deletes? : Int = transcript_pass_deletes,
   chunk_gc_grace_ms? : Double = chunk_gc_grace_ms,
   fold? : Bool = true,
+  test_faults? : TestFaults? = None,
 ) -> Exporter raise {
   let files = { host, sep }
   let reading = @sql.Db::attach(host, db, wait=5000)
@@ -162,6 +211,7 @@ pub fn Exporter::new(
     chunk_bytes: if chunk_bytes > 0 { chunk_bytes } else { chunk_plain_bytes },
     transcript_pass_files: if transcript_pass_files > 0 { transcript_pass_files } else { default_transcript_pass_files },
     transcript_pass_bytes: if transcript_pass_bytes > 0 { transcript_pass_bytes } else { default_transcript_pass_bytes },
+    transcript_pass_deletes: if transcript_pass_deletes > 0 { transcript_pass_deletes } else { default_transcript_pass_deletes },
     chunk_gc_grace_ms: if chunk_gc_grace_ms >= 0.0 { chunk_gc_grace_ms } else { default_chunk_gc_grace_ms },
     fold,
     now,
@@ -169,6 +219,7 @@ pub fn Exporter::new(
     known: false,
     transcripts_pending: false,
     tf_cache: Map([]),
+    test_faults,
     run: files.random(4),
     read: 0,
   }
@@ -179,6 +230,11 @@ pub fn Exporter::new(
     e.forget()
   }
   e
+}
+
+///|
+pub fn Exporter::set_test_faults(self : Exporter, faults : TestFaults?) -> Unit {
+  self.test_faults = faults
 }
 
 ///|
@@ -1185,19 +1241,222 @@ fn Files::is_transcript_path(self : Files, data : String, path : String) -> Bool
 }
 
 ///|
+#borrow(path)
+extern "C" fn missing_ffi(path : Bytes, follow : Int) -> Int = "sfc_missing"
+
+///|
+#borrow(path)
+extern "C" fn dir_missing_ffi(path : Bytes) -> Int = "sfc_dir_missing"
+
+///|
+#borrow(path)
+extern "C" fn dir_readable_ffi(path : Bytes) -> Int = "sfc_dir_readable"
+
+///|
+fn Files::is_missing(self : Files, path : String, follow? : Bool = true) -> Bool {
+  ignore(self)
+  missing_ffi(c_path(path), if follow { 1 } else { 0 }) == 1
+}
+
+///|
+fn Files::is_dir_missing(self : Files, path : String) -> Bool {
+  ignore(self)
+  dir_missing_ffi(c_path(path)) == 1
+}
+
+///|
+fn Exporter::dir_unreadable_checked(self : Exporter, dir : String) -> Bool raise {
+  if self.test_faults is Some(f) {
+    if f.forbid_readdir.contains(dir) {
+      fail("BUG: descended into pruned directory \{dir}")
+    }
+    if f.readdir_err.contains(dir) {
+      return true
+    }
+  }
+  dir_readable_ffi(c_path(dir)) == 0
+}
+
+///|
+fn path_under_any_dir(path : String, dirs : Set[String], sep : String) -> Bool {
+  for d in dirs {
+    let prefix = if d.has_suffix(sep) { d } else { d + sep }
+    if path == d || path.has_prefix(prefix) {
+      return true
+    }
+  }
+  false
+}
+
+///|
+fn is_pruned_brain_rel(rel_parts : Array[String]) -> Bool {
+  match rel_parts {
+    [".system_generated", "steps"] => true
+    [".system_generated", "logs", "chunks"] => true
+    ["scratch"] => true
+    _ => false
+  }
+}
+
+///|
+/// Whether `path` lies under one of the three pruned AGY brain derived cache subtrees.
+fn Files::is_pruned_brain_path(self : Files, data : String, path : String) -> Bool {
+  guard self.under_of(data, path) is Some(rel) && rel != "" else { return false }
+  let parts : Array[String] = rel.split(self.sep).map(x => x.to_string()).collect()
+  guard parts.length() >= 8 &&
+    parts[0] == "homes" &&
+    one_segment(parts[1]) &&
+    parts[2] == "agy" &&
+    parts[3] == ".gemini" &&
+    parts[4] == "antigravity-cli" &&
+    parts[5] == "brain" &&
+    one_segment(parts[6]) else {
+    return false
+  }
+  if parts[7] == "scratch" {
+    return true
+  }
+  if parts.length() >= 9 && parts[7] == ".system_generated" && parts[8] == "steps" {
+    return true
+  }
+  if parts.length() >= 10 && parts[7] == ".system_generated" && parts[8] == "logs" && parts[9] == "chunks" {
+    return true
+  }
+  false
+}
+
+///|
+/// `lstat` distinguishing confirmed missing (`Ok(None)`) from unreadable error (`Err(())`).
+fn Exporter::lstat_checked(self : Exporter, path : String) -> Result[(String, Double, Int, Double)?, Unit] {
+  if self.test_faults is Some(f) && f.lstat_err.contains(path) {
+    return Err(())
+  }
+  match self.files.lstat(path) {
+    Some(st) => Ok(Some(st))
+    None => if self.files.is_missing(path, follow=false) { Ok(None) } else { Err(()) }
+  }
+}
+
+///|
+/// `listing` distinguishing confirmed missing (`Ok(None)`) from unreadable error (`Err(())`).
+fn Exporter::listing_checked(self : Exporter, dir : String) -> Result[Array[(String, String)]?, Unit] raise {
+  if self.test_faults is Some(f) {
+    if f.forbid_readdir.contains(dir) {
+      fail("BUG: descended into pruned directory \{dir}")
+    }
+    if f.readdir_err.contains(dir) {
+      return Err(())
+    }
+  }
+  match self.files.listing(dir) {
+    Some(entries) =>
+      match self.test_faults {
+        Some(f) if !f.other_kind.is_empty() =>
+          Ok(
+            Some(
+              entries.map(e => {
+                let (name, kind) = e
+                let path = self.files.join([dir, name])
+                if f.other_kind.contains(path) {
+                  (name, "other")
+                } else {
+                  (name, kind)
+                }
+              }),
+            ),
+          )
+        _ => Ok(Some(entries))
+      }
+    None => if self.files.is_dir_missing(dir) { Ok(None) } else { Err(()) }
+  }
+}
+
+///|
 fn Exporter::walk_transcript_dir(
   self : Exporter,
   dir : String,
   add : (String) -> Unit,
-) -> Unit {
-  guard self.files.listing(dir) is Some(entries) else { return }
+  on_error? : (String) -> Unit = _ => (),
+  on_unreadable_path? : (String) -> Unit = _ => (),
+) -> Unit raise {
+  let entries = match self.listing_checked(dir) {
+    Ok(Some(es)) => es
+    Ok(None) => return
+    Err(_) => {
+      on_error(dir)
+      return
+    }
+  }
   for e in entries {
     let (name, kind) = e
     let path = self.files.join([dir, name])
     if kind == "dir" {
-      self.walk_transcript_dir(path, add)
+      self.walk_transcript_dir(path, add, on_error~, on_unreadable_path~)
     } else if kind == "file" {
       add(path)
+    } else if kind == "other" {
+      match self.lstat_checked(path) {
+        Ok(Some(("file", _, _, _))) => add(path)
+        Ok(Some(("dir", _, _, _))) => self.walk_transcript_dir(path, add, on_error~, on_unreadable_path~)
+        Ok(_) => ()
+        Err(_) => {
+          on_unreadable_path(path)
+          on_error(path)
+        }
+      }
+    }
+  }
+}
+
+///|
+/// Dedicated walker for AGY `brain/<id>/` that prunes the three derived cache subtrees by exact relative path segments
+/// before descending (never enters or reads pruned directories).
+fn Exporter::walk_brain_dir(
+  self : Exporter,
+  brain_root : String,
+  dir : String,
+  rel_parts : Array[String],
+  add : (String) -> Unit,
+  on_error : (String) -> Unit,
+  on_unreadable_path : (String) -> Unit,
+) -> Unit raise {
+  if is_pruned_brain_rel(rel_parts) {
+    return
+  }
+  let entries = match self.listing_checked(dir) {
+    Ok(Some(es)) => es
+    Ok(None) => return
+    Err(_) => {
+      on_error(dir)
+      return
+    }
+  }
+  for e in entries {
+    let (name, kind) = e
+    let path = self.files.join([dir, name])
+    if kind == "dir" {
+      let next_rel = rel_parts + [name]
+      if is_pruned_brain_rel(next_rel) {
+        continue
+      }
+      self.walk_brain_dir(brain_root, path, next_rel, add, on_error, on_unreadable_path)
+    } else if kind == "file" {
+      add(path)
+    } else if kind == "other" {
+      match self.lstat_checked(path) {
+        Ok(Some(("file", _, _, _))) => add(path)
+        Ok(Some(("dir", _, _, _))) => {
+          let next_rel = rel_parts + [name]
+          if !is_pruned_brain_rel(next_rel) {
+            self.walk_brain_dir(brain_root, path, next_rel, add, on_error, on_unreadable_path)
+          }
+        }
+        Ok(_) => ()
+        Err(_) => {
+          on_unreadable_path(path)
+          on_error(path)
+        }
+      }
     }
   }
 }
@@ -1213,14 +1472,31 @@ async fn Exporter::export_transcripts(
   ws_of_session : (JValue?) -> String,
   say : (String, JValue) -> Unit,
 ) -> Bool {
-  let finder = @locate.Finder::new(self.host, self.files.sep)
+  let finder_readdir_err : Set[String] = Set([])
+  if self.test_faults is Some(f) {
+    for d in f.readdir_err {
+      finder_readdir_err.add(d)
+    }
+    for d in f.finder_readdir_err {
+      finder_readdir_err.add(d)
+    }
+  }
+  let finder = @locate.Finder::new(self.host, self.files.sep, track_failed_dirs=true, readdir_err=finder_readdir_err)
   let by_ws : Map[String, Map[String, String?]] = Map([])
+  let unreadable_dirs_by_ws : Map[String, Set[String]] = Map([])
+  let unreadable_paths_by_ws : Map[String, Set[String]] = Map([])
   for ws, _ in outs {
     by_ws[ws] = Map([])
+    unreadable_dirs_by_ws[ws] = Set([])
+    unreadable_paths_by_ws[ws] = Set([])
   }
   for sess in sess_rows {
     let ws = ws_of_session(get(sess, "ws"))
     guard by_ws.get(ws) is Some(found_map) else { continue }
+    let unreadable_dirs = unreadable_dirs_by_ws.get(ws).unwrap_or(Set([]))
+    let unreadable_paths_ws = unreadable_paths_by_ws.get(ws).unwrap_or(Set([]))
+    let add_unreadable_dir = (d : String) => unreadable_dirs.add(d)
+    let add_unreadable_path = (p : String) => unreadable_paths_ws.add(p)
     let key = text_of(get(sess, "key")).unwrap_or("")
     let s_runtime = text_of(get(sess, "runtime")).unwrap_or("")
     let orig_runtime = text_of(get(sess, "original_runtime")).unwrap_or(s_runtime)
@@ -1267,6 +1543,11 @@ async fn Exporter::export_transcripts(
     let valid_sources = sources.filter(r => @locate.runtime_kind(r.runtime))
     if valid_sources.length() > 0 {
       let (located, _) = finder.sources(self.data_dir, [], valid_sources, places, anywhere=true)
+      for d in finder.take_failed_dirs() {
+        if !self.files.is_dir_missing(d) {
+          add_unreadable_dir(d)
+        }
+      }
       for t in located {
         let (path, kind) = t
         let actual = if self.files.exists(path) { path } else { path + ".zst" }
@@ -1275,8 +1556,10 @@ async fn Exporter::export_transcripts(
           let name = path.view(start_offset=path.rev_find(self.files.sep).unwrap_or(-1) + 1).to_string()
           let id = if name.has_suffix(".jsonl") { name.view(end_offset=name.length() - 6).to_string() } else { name }
           let sub = self.files.join([self.files.dir_of(path), id])
-          if self.files.kind(sub) is Some("dir") {
-            self.walk_transcript_dir(sub, add_path)
+          match self.lstat_checked(sub) {
+            Ok(Some(("dir", _, _, _))) => self.walk_transcript_dir(sub, add_path, on_error=add_unreadable_dir, on_unreadable_path=add_unreadable_path)
+            Ok(_) => ()
+            Err(_) => add_unreadable_dir(sub)
           }
         }
       }
@@ -1289,25 +1572,41 @@ async fn Exporter::export_transcripts(
       add_path(self.files.join([cli, "conversations", r.id + ".db-wal"]))
       add_path(self.files.join([cli, "annotations", r.id + ".pbtxt"]))
       let brain = self.files.join([cli, "brain", r.id])
-      if self.files.kind(brain) is Some("dir") {
-        self.walk_transcript_dir(brain, add_path)
+      match self.lstat_checked(brain) {
+        Ok(Some(("dir", _, _, _))) => self.walk_brain_dir(brain, brain, [], add_path, add_unreadable_dir, add_unreadable_path)
+        Ok(_) => ()
+        Err(_) => add_unreadable_dir(brain)
       }
     }
   }
   let mut done_files = 0
   let mut done_bytes = 0
+  let mut done_deletes = 0
   let mut truncated = false
+  let parent_unreadable_cache : Map[String, Bool] = Map([])
+  let ancestor_lstat_cache : Map[String, String] = Map([])
   for ws, found_map in by_ws {
     if truncated {
       break
     }
+    let unreadable_dirs = unreadable_dirs_by_ws.get(ws).unwrap_or(Set([]))
+    let unreadable_paths = unreadable_paths_by_ws.get(ws).unwrap_or(Set([]))
     let paths = found_map.keys().collect()
     paths.sort_by(compare_units)
     let active : Set[String] = Set([])
     let mut ws_truncated = false
     for path in paths {
-      guard self.files.lstat(path) is Some(("file", size, mode, mtime)) else { continue }
-      active.add(path)
+      let (kind, size, mode, mtime) = match self.lstat_checked(path) {
+        Ok(Some(st)) => st
+        Ok(None) => continue
+        Err(_) => {
+          unreadable_paths.add(path)
+          continue
+        }
+      }
+      if kind != "file" {
+        continue
+      }
       let room = found_map.get(path).unwrap_or(None)
       let m = mode & 0o777
       let mtime_ms = @math.floor(mtime)
@@ -1323,6 +1622,7 @@ async fn Exporter::export_transcripts(
         _ => false
       }
       if unchanged {
+        active.add(path)
         continue
       }
       if done_files > 0 && (done_files >= self.transcript_pass_files || done_bytes >= self.transcript_pass_bytes) {
@@ -1333,9 +1633,22 @@ async fn Exporter::export_transcripts(
       let chunks : Array[String] = []
       let total = size.to_int()
       let mut offset = 0
+      let mut read_failed = false
       while offset < total {
         let want = if total - offset < self.chunk_bytes { total - offset } else { self.chunk_bytes }
-        guard self.host.read_bytes(path, from=offset, length=want) is Some(plain) && plain.length() > 0 else { break }
+        let injected_short = match self.test_faults {
+          Some(f) => f.read_short.contains(path) || (offset > 0 && f.read_short_after_first.contains(path))
+          None => false
+        }
+        let plain_opt = if injected_short {
+          None
+        } else {
+          self.host.read_bytes(path, from=offset, length=want) catch { _ => None }
+        }
+        guard plain_opt is Some(plain) && plain.length() > 0 else {
+          read_failed = true
+          break
+        }
         let plain_hash = @hash.sha256_hex(plain[:])
         let chunk_hash = match self.state.all("SELECT chunk_hash FROM transcript_chunks WHERE plain_hash = ?", [s(plain_hash)]) {
           [row, ..] => {
@@ -1372,6 +1685,11 @@ async fn Exporter::export_transcripts(
         chunks.push(ch)
         offset += plain.length()
       }
+      if read_failed || offset != total {
+        unreadable_paths.add(path)
+        continue
+      }
+      active.add(path)
       let chunks_json = stringify(strs(chunks))
       let room_param = match room {
         Some(r) => s(r)
@@ -1404,13 +1722,93 @@ async fn Exporter::export_transcripts(
       done_bytes += offset
     }
     if !ws_truncated {
+      let mut deleted_in_ws = false
       for row in self.state.all("SELECT path FROM transcript_files WHERE ws = ? ORDER BY path", [s(ws)]) {
         let old_path = field_text(row, "path")
-        if !active.contains(old_path) {
-          ignore(self.state.run("DELETE FROM transcript_files WHERE ws = ? AND path = ?", [s(ws), s(old_path)]))
-          self.tf_cache.remove(ws)
-          say(ws, Obj([("tr_del", str(old_path))]))
+        if active.contains(old_path) || unreadable_paths.contains(old_path) || path_under_any_dir(old_path, unreadable_dirs, self.files.sep) {
+          continue
         }
+        if !self.files.is_pruned_brain_path(self.data_dir, old_path) {
+          match self.files.under_of(self.data_dir, old_path) {
+            Some(rel) if rel != "" => {
+              let parts : Array[String] = rel.split(self.files.sep).map(x => x.to_string()).collect()
+              let ancestors : Array[String] = []
+              let mut cur = self.data_dir
+              let mut keep = false
+              let mut all_real_dirs = true
+              for i = 0; i + 1 < parts.length(); i = i + 1 {
+                cur = self.files.join([cur, parts[i]])
+                let kind = match ancestor_lstat_cache.get(cur) {
+                  Some(k) => k
+                  None => {
+                    let k = match self.lstat_checked(cur) {
+                      Err(_) => "err"
+                      Ok(Some(("dir", _, _, _))) => "dir"
+                      Ok(_) => "other"
+                    }
+                    ancestor_lstat_cache[cur] = k
+                    k
+                  }
+                }
+                if kind == "err" {
+                  keep = true
+                  break
+                } else if kind != "dir" {
+                  all_real_dirs = false
+                  break
+                }
+                ancestors.push(cur)
+              }
+              if keep {
+                continue
+              }
+              if all_real_dirs {
+                match self.lstat_checked(old_path) {
+                  Err(_) => continue
+                  Ok(None) => ()
+                  Ok(Some(_)) => {
+                    let mut ancestor_unreadable = false
+                    let check_dir = (d : String) => {
+                      match parent_unreadable_cache.get(d) {
+                        Some(b) => b
+                        None => {
+                          let bad = self.dir_unreadable_checked(d)
+                          parent_unreadable_cache[d] = bad
+                          bad
+                        }
+                      }
+                    }
+                    if check_dir(self.data_dir) {
+                      ancestor_unreadable = true
+                    } else {
+                      for a in ancestors {
+                        if check_dir(a) {
+                          ancestor_unreadable = true
+                          break
+                        }
+                      }
+                    }
+                    if ancestor_unreadable {
+                      continue
+                    }
+                  }
+                }
+              }
+            }
+            _ => ()
+          }
+        }
+        if done_deletes >= self.transcript_pass_deletes {
+          truncated = true
+          break
+        }
+        ignore(self.state.run("DELETE FROM transcript_files WHERE ws = ? AND path = ?", [s(ws), s(old_path)]))
+        deleted_in_ws = true
+        say(ws, Obj([("tr_del", str(old_path))]))
+        done_deletes += 1
+      }
+      if deleted_in_ws {
+        self.tf_cache.remove(ws)
       }
     }
   }

@@ -19,11 +19,27 @@ pub struct Finder {
   priv elsewhere : Map[String, String?]
   priv rollouts : Map[String, String]
   priv said : Map[String, Map[String, Said]]
+  priv track_failed_dirs : Bool
+  priv failed_dirs : Set[String]
+  priv readdir_err : Set[String]
 }
 
 ///|
-pub fn Finder::new(host : @host.Host, sep : String) -> Finder {
-  { host, sep, elsewhere: Map([]), rollouts: Map([]), said: Map([]) }
+pub fn Finder::new(
+  host : @host.Host,
+  sep : String,
+  track_failed_dirs? : Bool = false,
+  readdir_err? : Set[String] = Set([]),
+) -> Finder {
+  { host, sep, elsewhere: Map([]), rollouts: Map([]), said: Map([]), track_failed_dirs, failed_dirs: Set([]), readdir_err }
+}
+
+///|
+/// Returns and clears directories whose `fs.readdir` failed during discovery (for unreadable-path protection).
+pub fn Finder::take_failed_dirs(self : Finder) -> Array[String] {
+  let out = self.failed_dirs.iter().collect()
+  self.failed_dirs.clear()
+  out
 }
 
 ///|
@@ -67,23 +83,49 @@ fn Finder::kept(self : Finder, path : String) -> Bool {
 }
 
 ///|
+fn Finder::readdir_json(self : Finder, dir : String, types : Bool) -> Json? {
+  if self.readdir_err.contains(dir) {
+    return None
+  }
+  let args : Json = if types {
+    { "path": Json::string(dir), "types": true }
+  } else {
+    { "path": Json::string(dir) }
+  }
+  match (try { Ok(self.host.shell_sync("fs.readdir", args)) } catch { e => Err(e) }) {
+    Ok(Array(_) as arr) => Some(arr)
+    _ => None
+  }
+}
+
+///|
 /// A directory's names, none when it cannot be read.
 fn Finder::entries(self : Finder, dir : String) -> Array[String]? {
-  match (try { Ok(self.host.shell_sync("fs.readdir", { "path": Json::string(dir) })) } catch { e => Err(e) }) {
-    Ok(Array(names)) => Some(names.filter_map(n => if n is String(s) { Some(s) } else { None }))
-    _ => None
+  match self.readdir_json(dir, false) {
+    Some(Array(names)) => Some(names.filter_map(n => if n is String(s) { Some(s) } else { None }))
+    _ => {
+      if self.track_failed_dirs {
+        self.failed_dirs.add(dir)
+      }
+      None
+    }
   }
 }
 
 ///|
 /// A directory's names with their kinds as the directory says them ("file", "dir", "link", "other").
 fn Finder::typed_entries(self : Finder, dir : String) -> Array[(String, String)]? {
-  match (try { Ok(self.host.shell_sync("fs.readdir", { "path": Json::string(dir), "types": true })) } catch { e => Err(e) }) {
-    Ok(Array(entries)) =>
+  match self.readdir_json(dir, true) {
+    Some(Array(entries)) =>
       Some(
         entries.filter_map(e => if e is Array([String(name), String(kind)]) { Some((name, kind)) } else { None }),
       )
-    _ => None
+    _ => {
+      if self.track_failed_dirs {
+        self.failed_dirs.add(dir)
+      }
+      None
+    }
   }
 }
 
@@ -177,7 +219,8 @@ fn Finder::transcript_in(self : Finder, runtime : String, dir : String, id : Str
       if !anywhere {
         return None
       }
-      for project in self.entries(dir).unwrap_or([]) {
+      guard self.entries(dir) is Some(projects) else { return None }
+      for project in projects {
         let path = self.join([dir, project, id + ".jsonl"])
         if self.kept(path) {
           self.elsewhere[at] = Some(path)
