@@ -25,6 +25,7 @@ import { DatabaseSync } from "node:sqlite";
 import { zstdCompressSync } from "node:zlib";
 import { runtimeKind } from "../../src/agents/runtime.ts";
 import { type Places, type Passed, type Told, nothingTold } from "../../src/replica/export.ts";
+import { MANIFEST_GC_GRACE_MS, encodeTranscriptManifest } from "../../src/replica/manifest.ts";
 import { type Head, type Rec, type Row, BATCH, BATCH_BYTES, Folded, TABLES, VERSION, attachedPaths, batchName, batchSpan, decodeBatch, encodeBatch, genName, keyOf, runsOf } from "./replica-format.ts";
 import { type Look, type Looking, storage, transcriptSourcesLooking } from "./transcript-paths.ts";
 export * from "../../src/replica/export.ts";
@@ -217,6 +218,8 @@ export type ExporterOptions = {
   chunkGcGraceMs?: number;
   /// False: batches left as they were written, never folded (a test's, to restore a generation from them as written).
   fold?: boolean;
+  /// True: emit compact `transcriptManifest` heads in IPC `pass()` results (TS runner enables via `--compact-heads`; default false for MoonBit compatibility).
+  compactHeads?: boolean;
   /// Optional test-only hooks to inject deterministic filesystem faults (works even when running as root).
   testFaults?: {
     onReaddir?: (dir: string) => void;
@@ -238,6 +241,9 @@ export class Exporter {
   /// Whether a transcript scan was deferred or truncated by budget and must continue in the next pass.
   #transcriptsPending = false;
   readonly #tfCache = new Map<string, Record<string, number>>();
+  readonly #manifestCache = new Map<string, { rootHash: string; leafHashes: string[] }>();
+  #manifestLive = new Set<string>();
+  readonly #manifestSupersededAt = new Map<string, number>();
   #closed = false;
   /// This run of the exporter: a generation's head lists the runs that wrote it (a copy that holds a run this station's
   /// own does not know was written by one rolled back).
@@ -303,6 +309,9 @@ export class Exporter {
     this.#known = false;
     this.#transcriptsPending = false;
     this.#tfCache.clear();
+    this.#manifestCache.clear();
+    this.#manifestLive.clear();
+    this.#manifestSupersededAt.clear();
   }
 
   setPlaces(places: Places): void {
@@ -334,6 +343,7 @@ export class Exporter {
     this.#state.prepare("DELETE FROM entering WHERE ws = ?").run(ws);
     this.#state.prepare("DELETE FROM transcript_files WHERE ws = ?").run(ws);
     this.#tfCache.delete(ws);
+    this.#manifestCache.delete(ws);
     return gen;
   }
 
@@ -364,6 +374,7 @@ export class Exporter {
     } catch (e) {
       this.#state.exec("ROLLBACK");
       this.#tfCache.clear();
+      this.#manifestCache.clear();
       throw e;
     }
   }
@@ -681,7 +692,10 @@ export class Exporter {
         this.#write(ws, out);
         wrote++;
       }
-      heads[ws] = out.head;
+      heads[ws] = this.#o.compactHeads === true ? this.#compactHead(ws, out.head) : out.head;
+    }
+    if (this.#o.compactHeads === true) {
+      this.#gcManifests(outs);
     }
     if (scanTranscripts && !this.#transcriptsPending) {
       this.#gcTranscriptChunks();
@@ -857,6 +871,10 @@ export class Exporter {
     const chunk = join(this.#o.replica, "chunks", hash);
     try {
       if (statSync(chunk).isFile()) return chunk; // sync: in the export's own thread (worker.ts)
+    } catch {}
+    const manifest = join(this.#o.replica, "manifests", hash);
+    try {
+      if (statSync(manifest).isFile()) return manifest; // sync: in the export's own thread (worker.ts)
     } catch {}
     return null;
   }
@@ -1204,6 +1222,7 @@ export class Exporter {
         active.add(path);
         this.#state.prepare("INSERT OR REPLACE INTO transcript_files (ws, path, room, size, mtime, mode, chunks_json) VALUES (?, ?, ?, ?, ?, ?, ?)").run(ws, path, room, size, mtime, mode, JSON.stringify(chunks));
         this.#tfCache.delete(ws);
+        this.#manifestCache.delete(ws);
         say(ws, { tr: path, room, size, mtime, mode, chunks });
         doneFiles++;
         doneBytes += readBytes;
@@ -1284,7 +1303,10 @@ export class Exporter {
           say(ws, { tr_del: row.path });
           doneDeletes++;
         }
-        if (deletedInWs) this.#tfCache.delete(ws);
+        if (deletedInWs) {
+          this.#tfCache.delete(ws);
+          this.#manifestCache.delete(ws);
+        }
       }
     }
     return truncated;
@@ -1366,6 +1388,101 @@ export class Exporter {
       if (!live.has(row.chunk_hash) && !keptOnDisk.has(row.chunk_hash)) {
         this.#state.prepare("DELETE FROM transcript_chunks WHERE plain_hash = ?").run(row.plain_hash);
       }
+    }
+  }
+
+  #compactHead(ws: string, head: Head): Head {
+    const tf = head.transcriptFiles;
+    let hasTf = false;
+    if (tf !== undefined) {
+      for (const _ in tf) {
+        hasTf = true;
+        break;
+      }
+    }
+    if (!hasTf || tf === undefined) {
+      this.#manifestCache.delete(ws);
+      const { transcriptManifest: _, ...rest } = head;
+      return rest;
+    }
+    const manifestsDir = join(this.#o.replica, "manifests");
+    const cached = this.#manifestCache.get(ws);
+    let rootHash: string;
+    if (cached !== undefined && existsSync(join(manifestsDir, cached.rootHash))) { // sync: in the export's own thread (worker.ts)
+      rootHash = cached.rootHash;
+    } else {
+      const enc = encodeTranscriptManifest(tf);
+      const leafHashes: string[] = [];
+      for (const [lh, { bytes }] of enc.leaves) {
+        leafHashes.push(lh);
+        const lp = join(manifestsDir, lh);
+        if (!existsSync(lp)) writeWhole(lp, bytes, true); // sync: in the export's own thread (worker.ts)
+      }
+      const rp = join(manifestsDir, enc.rootHash);
+      if (!existsSync(rp)) writeWhole(rp, enc.rootBytes, true); // sync: in the export's own thread (worker.ts)
+      this.#manifestCache.set(ws, { rootHash: enc.rootHash, leafHashes });
+      rootHash = enc.rootHash;
+    }
+    const { transcriptFiles: _, ...rest } = head;
+    return { ...rest, transcriptManifest: rootHash };
+  }
+
+  #gcManifests(outs: Map<string, Out>): void {
+    const now = this.#o.now();
+    const manifestsDir = join(this.#o.replica, "manifests");
+    const live = new Set<string>();
+    for (const [ws, out] of outs) {
+      const cached = this.#manifestCache.get(ws);
+      if (cached !== undefined) {
+        live.add(cached.rootHash);
+        for (const lh of cached.leafHashes) live.add(lh);
+      } else if (out.head.transcriptFiles !== undefined) {
+        let hasTf = false;
+        for (const _ in out.head.transcriptFiles) {
+          hasTf = true;
+          break;
+        }
+        if (hasTf) {
+          const enc = encodeTranscriptManifest(out.head.transcriptFiles);
+          live.add(enc.rootHash);
+          for (const lh of enc.leaves.keys()) live.add(lh);
+        }
+      }
+    }
+    for (const h of live) this.#manifestSupersededAt.delete(h);
+    for (const prev of this.#manifestLive) {
+      if (!live.has(prev) && !this.#manifestSupersededAt.has(prev)) {
+        this.#manifestSupersededAt.set(prev, now);
+      }
+    }
+    this.#manifestLive = live;
+    let names: string[];
+    try {
+      const faultErr = this.#o.testFaults?.readdirError?.(manifestsDir);
+      if (faultErr) throw faultErr;
+      names = readdirSync(manifestsDir); // sync: in the export's own thread (worker.ts)
+    } catch {
+      return;
+    }
+    const onDisk = new Set<string>();
+    for (const name of names) {
+      onDisk.add(name);
+      if (live.has(name)) continue;
+      const supersededAt = this.#manifestSupersededAt.get(name);
+      if (supersededAt === undefined) {
+        // First time this process observes an unreferenced file on disk (e.g. after restart):
+        // record `now` and grant a full 10-minute grace period before reclaiming.
+        this.#manifestSupersededAt.set(name, now);
+      } else if (now - supersededAt >= MANIFEST_GC_GRACE_MS) {
+        const p = join(manifestsDir, name);
+        try {
+          rmSync(p, { force: true }); // sync: in the export's own thread (worker.ts)
+        } catch {}
+        this.#manifestSupersededAt.delete(name);
+      }
+    }
+    for (const k of [...this.#manifestSupersededAt.keys()]) {
+      if (!onDisk.has(k)) this.#manifestSupersededAt.delete(k);
     }
   }
 

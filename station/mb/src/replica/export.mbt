@@ -166,11 +166,15 @@ pub struct Exporter {
   priv transcript_pass_deletes : Int
   priv chunk_gc_grace_ms : Double
   priv fold : Bool
+  priv compact_heads : Bool
   priv now : () -> Double
   priv mut places : Places
   priv mut known : Bool
   priv mut transcripts_pending : Bool
   priv tf_cache : Map[String, Array[(String, JValue)]]
+  priv manifest_cache : Map[String, (String, Array[String])]
+  priv mut manifest_live : Set[String]
+  priv manifest_superseded_at : Map[String, Double]
   priv mut test_faults : TestFaults?
   /// This run of the exporter.
   run : String
@@ -193,6 +197,7 @@ pub fn Exporter::new(
   transcript_pass_deletes? : Int = transcript_pass_deletes,
   chunk_gc_grace_ms? : Double = chunk_gc_grace_ms,
   fold? : Bool = true,
+  compact_heads? : Bool = false,
   test_faults? : TestFaults? = None,
 ) -> Exporter raise {
   let files = { host, sep }
@@ -216,11 +221,15 @@ pub fn Exporter::new(
     transcript_pass_deletes: if transcript_pass_deletes > 0 { transcript_pass_deletes } else { default_transcript_pass_deletes },
     chunk_gc_grace_ms: if chunk_gc_grace_ms >= 0.0 { chunk_gc_grace_ms } else { default_chunk_gc_grace_ms },
     fold,
+    compact_heads,
     now,
     places: { home: None, workspaces: [] },
     known: false,
     transcripts_pending: false,
     tf_cache: Map([]),
+    manifest_cache: Map([]),
+    manifest_live: Set([]),
+    manifest_superseded_at: Map([]),
     test_faults,
     run: files.random(4),
     read: 0,
@@ -273,6 +282,9 @@ fn Exporter::forget(self : Exporter) -> Unit raise {
   self.known = false
   self.transcripts_pending = false
   self.tf_cache.clear()
+  self.manifest_cache.clear()
+  self.manifest_live = Set([])
+  self.manifest_superseded_at.clear()
 }
 
 ///|
@@ -352,6 +364,7 @@ fn Exporter::gen_of(self : Exporter, ws : String) -> String raise {
     ignore(self.state.run("DELETE FROM \{t} WHERE ws = ?", [s(ws)]))
   }
   self.tf_cache.remove(ws)
+  self.manifest_cache.remove(ws)
   gen
 }
 
@@ -392,6 +405,7 @@ pub async fn Exporter::pass(self : Exporter, told : JValue) -> JValue {
         _ => ()
       }
       self.tf_cache.clear()
+      self.manifest_cache.clear()
       raise e
     }
   }
@@ -907,7 +921,10 @@ async fn Exporter::pass_in(self : Exporter, told : JValue, home : String) -> JVa
       self.write(w.0, out)
       wrote += 1
     }
-    heads.push((w.0, out.head))
+    heads.push((w.0, if self.compact_heads { self.compact_head(w.0, out.head) } else { out.head }))
+  }
+  if self.compact_heads {
+    self.gc_manifests(outs)
   }
   if scan_transcripts && !self.transcripts_pending {
     self.gc_transcript_chunks()
@@ -1243,6 +1260,13 @@ pub fn Exporter::sources(self : Exporter, hashes : Array[String]) -> JValue rais
       let chunk = self.files.join([self.replica, "chunks", h])
       if self.files.is_regular_file(chunk) {
         out.push((h, str(chunk)))
+        found = true
+      }
+    }
+    if !found {
+      let manifest = self.files.join([self.replica, "manifests", h])
+      if self.files.is_regular_file(manifest) {
+        out.push((h, str(manifest)))
       }
     }
   }
@@ -1745,6 +1769,7 @@ async fn Exporter::export_transcripts(
         ]),
       )
       self.tf_cache.remove(ws)
+      self.manifest_cache.remove(ws)
       say(
         ws,
         Obj([
@@ -1847,6 +1872,7 @@ async fn Exporter::export_transcripts(
       }
       if deleted_in_ws {
         self.tf_cache.remove(ws)
+        self.manifest_cache.remove(ws)
       }
     }
   }
@@ -1958,5 +1984,116 @@ fn Exporter::gc_transcript_chunks(self : Exporter) -> Unit raise {
     if !live.contains(ch) && !kept_on_disk.contains(ch) {
       ignore(self.state.run("DELETE FROM transcript_chunks WHERE plain_hash = ?", [s(field_text(row, "plain_hash"))]))
     }
+  }
+}
+
+///|
+/// Writes the canonical 2-level transcript manifest for `head` under `<replica>/manifests/<hash>` (atomic tmp + fsync
+/// + rename, skipping existing files) and returns the compact IPC head carrying `transcriptManifest` instead of inline
+/// `transcriptFiles`. Disk `own/<ws>/<gen>/head.json` keeps inline `transcriptFiles` unchanged (D72a invariant).
+async fn Exporter::compact_head(self : Exporter, ws : String, head : JValue) -> JValue {
+  match get(head, "transcriptFiles") {
+    Some(Obj(entries)) if entries.length() > 0 => {
+      let manifests_dir = self.files.join([self.replica, "manifests"])
+      let root_hash = match self.manifest_cache.get(ws) {
+        Some((rh, _)) if self.files.kind(self.files.join([manifests_dir, rh])) is Some("file") => rh
+        _ => {
+          let pairs : Array[(String, Double)] = entries.map(e => (@jsjson.sanitize_str(e.0), num(Some(e.1))))
+          let enc = encode_transcript_manifest(pairs)
+          let leaf_hashes : Array[String] = []
+          for leaf in enc.leaves {
+            let (_, lh, lbytes) = leaf
+            leaf_hashes.push(lh)
+            let lp = self.files.join([manifests_dir, lh])
+            if !(self.files.kind(lp) is Some("file")) {
+              self.host.write_atomic(lp, lbytes, mode=0o644, sync=true, mkdir=true, sep=self.files.sep)
+            }
+          }
+          let rp = self.files.join([manifests_dir, enc.root_hash])
+          if !(self.files.kind(rp) is Some("file")) {
+            self.host.write_atomic(rp, enc.root_bytes, mode=0o644, sync=true, mkdir=true, sep=self.files.sep)
+          }
+          self.manifest_cache[ws] = (enc.root_hash, leaf_hashes)
+          enc.root_hash
+        }
+      }
+      set(without(head, "transcriptFiles"), "transcriptManifest", str(root_hash))
+    }
+    _ => {
+      self.manifest_cache.remove(ws)
+      without(head, "transcriptManifest")
+    }
+  }
+}
+
+///|
+/// Reclaims unreferenced manifest files under `<replica>/manifests/` after a 10-minute grace period
+/// measured from when a manifest hash leaves the live set (falling back to mtime for cross-process leftovers),
+/// always preserving root + leaf hashes referenced by current `own` heads.
+fn Exporter::gc_manifests(self : Exporter, outs : Map[String, Out]) -> Unit raise {
+  let now = (self.now)()
+  let manifests_dir = self.files.join([self.replica, "manifests"])
+  let live : Set[String] = Set([])
+  for ws, out in outs {
+    match self.manifest_cache.get(ws) {
+      Some((rh, leaves)) => {
+        live.add(rh)
+        for lh in leaves {
+          live.add(lh)
+        }
+      }
+      None =>
+        match get(out.head, "transcriptFiles") {
+          Some(Obj(entries)) if entries.length() > 0 => {
+            let pairs : Array[(String, Double)] = entries.map(e => (@jsjson.sanitize_str(e.0), num(Some(e.1))))
+            let enc = encode_transcript_manifest(pairs)
+            live.add(enc.root_hash)
+            for leaf in enc.leaves {
+              live.add(leaf.1)
+            }
+          }
+          _ => ()
+        }
+    }
+  }
+  for h in live {
+    self.manifest_superseded_at.remove(h)
+  }
+  for prev in self.manifest_live {
+    if !live.contains(prev) && !self.manifest_superseded_at.contains(prev) {
+      self.manifest_superseded_at[prev] = now
+    }
+  }
+  self.manifest_live = live
+  let on_disk : Set[String] = Set([])
+  guard self.files.names(manifests_dir) is Some(names) else { return }
+  for name in names {
+    on_disk.add(name)
+    if live.contains(name) {
+      continue
+    }
+    match self.manifest_superseded_at.get(name) {
+      Some(superseded_at) =>
+        if now - superseded_at >= manifest_gc_grace_ms {
+          let p = self.files.join([manifests_dir, name])
+          self.files.remove(p) catch {
+            _ => ()
+          }
+          self.manifest_superseded_at.remove(name)
+        }
+      None =>
+        // First time this process observes an unreferenced file on disk (e.g. after restart):
+        // record `now` and grant a full 10-minute grace period before reclaiming.
+        self.manifest_superseded_at[name] = now
+    }
+  }
+  let stale_keys : Array[String] = []
+  for k, _ in self.manifest_superseded_at {
+    if !on_disk.contains(k) {
+      stale_keys.push(k)
+    }
+  }
+  for k in stale_keys {
+    self.manifest_superseded_at.remove(k)
   }
 }
