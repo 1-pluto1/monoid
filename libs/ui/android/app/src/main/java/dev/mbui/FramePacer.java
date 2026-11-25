@@ -137,13 +137,14 @@ final class FramePacer {
 
     /** Atomic snapshot of frame demand and vsync timeline taken by the drawing thread. */
     static final class Taken {
-        final boolean app, pictured, external;
+        final boolean app, pictured, external, picturedPaced;
         final long[] vsyncAt;
 
-        Taken(boolean app, boolean pictured, boolean external, long[] vsyncAt) {
+        Taken(boolean app, boolean pictured, boolean external, boolean picturedPaced, long[] vsyncAt) {
             this.app = app;
             this.pictured = pictured;
             this.external = external;
+            this.picturedPaced = picturedPaced;
             this.vsyncAt = vsyncAt;
         }
     }
@@ -151,6 +152,8 @@ final class FramePacer {
     private final Object dispatchLock = new Object();
     /** Whether the current vsyncAt has been dispatched for an app frame (prevents stealing T+1's appWanted early). */
     private boolean appDispatched;
+    /** Whether a pending picture-only redraw originated while a low-rate paced vote was active (guarded by dispatchLock). */
+    private boolean picturedFromPaced;
 
     /** Atomically consumes pending frame flags, reads vsyncAt, and claims vsyncAt[0] when building an app frame. */
     Taken takeRender() {
@@ -161,10 +164,12 @@ final class FramePacer {
                 ahead.set(false);
             }
             boolean pictured = picturesOnly.getAndSet(false);
+            boolean picturedPaced = pictured && picturedFromPaced;
+            if (pictured) picturedFromPaced = false;
             boolean external = app && externalWanted.getAndSet(false);
             long[] at = vsyncAt;
             if (app && at[0] != 0) lastAppDispatchedVsyncNs.set(at[0]);
-            return new Taken(app, pictured, external, at);
+            return new Taken(app, pictured, external, picturedPaced, at);
         }
     }
 
@@ -437,7 +442,7 @@ final class FramePacer {
     }
 
     /** A frame wanted (atomically sets flags under dispatchLock, from any thread): drawn for the vsync kept, or the next. */
-    private void ask(boolean forApp, boolean isExternal) {
+    private void ask(boolean forApp, boolean isExternal, boolean fromPaced) {
         boolean renderNow = false;
         boolean postNext = false;
         synchronized (dispatchLock) {
@@ -446,6 +451,7 @@ final class FramePacer {
                 appWanted.set(true);
             } else {
                 picturesOnly.set(true);
+                if (fromPaced) picturedFromPaced = true;
             }
             boolean alreadyPendingForT = false;
             if (ahead.getAndSet(false) && p.nanoTime() - vsyncAt[0] < framePeriod) {
@@ -467,17 +473,22 @@ final class FramePacer {
 
     /** A frame at the next vsync (from any thread). */
     void wantFrame() {
-        ask(true, true);
+        ask(true, true, false);
     }
 
     /** A paced timer wakeup frame at the next vsync (from any thread): does not mark externalDemand. */
     void wantPacedFrame() {
-        ask(true, false);
+        ask(true, false, false);
     }
 
     /** Only a native view's picture to show again (from any thread): the last frame drawn again at the next vsync. */
     void pictureFrame() {
-        ask(false, false);
+        pictureFrame(pacedActive);
+    }
+
+    /** Picture-only redraw with caller-captured paced state (sampled before lifting a low-rate vote). */
+    void pictureFrame(boolean fromPaced) {
+        ask(false, false, fromPaced);
     }
 
     /**
@@ -581,6 +592,12 @@ final class FramePacer {
     }
 
     void ended(boolean more, boolean later, boolean following, float paced, boolean externalDemand) {
+        applyRate(more, later, following, paced, externalDemand);
+        scheduleNext(more || later);
+    }
+
+    /** Applies the frame's display-rate vote and returns whether a low-rate paced vote is active. */
+    boolean applyRate(boolean more, boolean later, boolean following, float paced, boolean externalDemand) {
         boolean ext = externalDemand || (lastVsync != 0 && externalForVsync.compareAndSet(lastVsync, 0L));
         askedAtEnd = more || later;
         drawn++;
@@ -621,8 +638,154 @@ final class FramePacer {
                 stillAfter(moved);
             }
         }
-        if (more || later) wantFrame();
+        return pacedActive;
+    }
+
+    /** Schedules the next frame (or clears ahead) after handing over the current frame. */
+    void scheduleNext(boolean wantMore) {
+        if (wantMore) wantFrame();
         else ahead.set(false);
+    }
+
+    /** Valid thread CPU delta in ns, or -1 if either sample is unavailable or moved backwards. */
+    static long cpuDeltaNanos(long cpuStartNs, long cpuEndNs) {
+        return (cpuStartNs >= 0L && cpuEndNs >= cpuStartNs) ? (cpuEndNs - cpuStartNs) : -1L;
+    }
+
+    /**
+     * GL thread work duration (ns): non-paced swaps keep full wall time (including real GPU backpressure);
+     * paced swaps exclude intentional pacing sleep in eglSwapBuffers / lazy dequeueBuffer via thread CPU time,
+     * falling back to pre-swap wall time if CPU time is unavailable.
+     */
+    static long glWorkNanos(long drawStartNs, long drawEndNs, long swapDoneNs, long cpuDeltaNs, boolean pacedSwap) {
+        long wallNs = Math.max(0L, swapDoneNs - drawStartNs);
+        if (!pacedSwap) return wallNs;
+        if (cpuDeltaNs >= 0L) return Math.min(wallNs, cpuDeltaNs);
+        return Math.min(wallNs, Math.max(0L, drawEndNs - drawStartNs));
+    }
+
+    /** ADPF target work duration (70% of period), optionally clamped to the display's top refresh rate. */
+    static long adpfTargetNanos(long framePeriodNs, float topRate, boolean clampToTop) {
+        long period = framePeriodNs;
+        if (clampToTop && topRate > 0f) {
+            long topPeriod = (long) (1e9 / topRate);
+            if (topPeriod > 0L && (period <= 0L || topPeriod < period)) period = topPeriod;
+        }
+        return period > 0L ? period * 7L / 10L : 0L;
+    }
+
+    /**
+     * Whether {@code framePeriodNs} is still a stale low-rate paced timeline (20-30 Hz: 33-50 ms) rather than
+     * a normal or system-capped interactive rate (e.g. 60 Hz = 16.67 ms on a 120 Hz panel).
+     */
+    static boolean isStalePacedPeriod(long framePeriodNs, float topRate) {
+        if (topRate <= 0f || framePeriodNs <= 0L) return false;
+        long threshold = Math.max(20_000_000L, (long) (1.75e9 / topRate));
+        return framePeriodNs > threshold;
+    }
+
+    /** Minimal ADPF hint session interface (plain Java, no Android dependency). */
+    interface AdpfSession {
+        void updateTargetWorkDuration(long nanos);
+
+        void reportActualWorkDuration(long nanos);
+    }
+
+    /**
+     * Unified ADPF target/boost policy state (drawing thread), shared across touch boost, IME warmup,
+     * resume, session creation, and per-frame work reporting.
+     */
+    static final class AdpfState {
+        boolean boostActive;
+        long hintTarget;
+        long lastFrameWorkedNs;
+
+        void reset() {
+            boostActive = false;
+            hintTarget = 0L;
+        }
+
+        private void refreshBoost(long framePeriodNs, float topRate, boolean pacedActive, boolean touching, float rateSaid) {
+            if (!boostActive) return;
+            if (!isStalePacedPeriod(framePeriodNs, topRate)
+                    || (!touching && (pacedActive || rateSaid == 0f))) {
+                boostActive = false;
+            }
+        }
+
+        long targetNanos(long framePeriodNs, float topRate, boolean pacedActive, boolean touching, float rateSaid) {
+            refreshBoost(framePeriodNs, topRate, pacedActive, touching, rateSaid);
+            return adpfTargetNanos(framePeriodNs, topRate, boostActive);
+        }
+
+        boolean onSessionCreated(long target, AdpfSession session) {
+            hintTarget = target;
+            if (session != null && target > 0L) {
+                session.reportActualWorkDuration(target);
+                return true;
+            }
+            return false;
+        }
+
+        boolean beginTouchBoost(boolean fromPaced, long nowNs, long framePeriodNs, float topRate) {
+            if (fromPaced) {
+                if (isStalePacedPeriod(framePeriodNs, topRate)) {
+                    boostActive = true;
+                }
+                return true;
+            }
+            if (boostActive) return true;
+            return lastFrameWorkedNs == 0L || nowNs - lastFrameWorkedNs >= 250_000_000L;
+        }
+
+        void wake(long framePeriodNs, float topRate, boolean pacedActive, boolean touching, float rateSaid,
+                  boolean created, AdpfSession session) {
+            long target = targetNanos(framePeriodNs, topRate, pacedActive, touching, rateSaid);
+            if (session == null) return;
+            if (target > 0L && target != hintTarget) {
+                hintTarget = target;
+                session.updateTargetWorkDuration(target);
+            }
+            if (!created && hintTarget > 0L) {
+                session.reportActualWorkDuration(hintTarget);
+            }
+        }
+
+        void frameWorked(long nanos, long gl, long nowNs, long framePeriodNs, float topRate,
+                         boolean pacedActive, boolean touching, float rateSaid, AdpfSession session) {
+            lastFrameWorkedNs = nowNs;
+            long target = targetNanos(framePeriodNs, topRate, pacedActive, touching, rateSaid);
+            if (session == null) return;
+            if (target > 0L && target != hintTarget) {
+                hintTarget = target;
+                session.updateTargetWorkDuration(target);
+            }
+            long actual = Math.max(nanos, gl);
+            if (actual > 0L) session.reportActualWorkDuration(actual);
+        }
+    }
+
+    /** Dual GL timing reading: ADPF/work duration alongside raw wall time and measurement flags. */
+    static final class GlTiming {
+        final long workNs;
+        final long rawWallNs;
+        final boolean paced;
+        final boolean swapMeasured;
+
+        GlTiming(long workNs, long rawWallNs, boolean paced, boolean swapMeasured) {
+            this.workNs = workNs;
+            this.rawWallNs = rawWallNs;
+            this.paced = paced;
+            this.swapMeasured = swapMeasured;
+        }
+    }
+
+    /** Computes both GL work duration and raw wall duration from a single GL frame sample. */
+    static GlTiming measureGl(long d0, long drawEnd, long swapEnd, long cpuDeltaNs, boolean paced, boolean swapMeasured) {
+        long effectiveEnd = swapMeasured ? swapEnd : drawEnd;
+        long rawWallNs = Math.max(0L, effectiveEnd - d0);
+        long workNs = glWorkNanos(d0, drawEnd, effectiveEnd, cpuDeltaNs, paced);
+        return new GlTiming(workNs, rawWallNs, paced, swapMeasured);
     }
 
     // ---- the display's rate ----

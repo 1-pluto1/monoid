@@ -1620,6 +1620,226 @@ public final class FramePacerTest {
                         + "), imeInsets=" + deltaInsets + " (t1=" + nowsInsets[1] + ")");
     }
 
+    /** 21. applyRate + scheduleNext matches ended() and covers pacedBefore || pacedNow on paced exit and follow-up frame. */
+    static void applyRateScheduleNextEquivalenceCase() {
+        Phone ph = new Phone(120, 3, true, 200_000);
+        long t1 = 12 * ph.period;
+        ph.pacer.wantPacedFrame();
+        ph.pacer.vsyncCame(t1, t1 + 2 * ph.period);
+        FramePacer.Taken tk1 = ph.pacer.takeRender();
+        FramePacer.Begun b1 = ph.pacer.begin(tk1.vsyncAt, t1 + 200_000L, tk1.external);
+        boolean pacedBefore1 = ph.pacer.isPacedActive();
+        boolean pacedNow1 = ph.pacer.applyRate(false, false, b1.following, 20f, b1.externalDemand);
+        ph.pacer.scheduleNext(false);
+        boolean ok1 = !pacedBefore1 && pacedNow1 && (pacedBefore1 || pacedNow1)
+                && ph.pacer.isPacedActive() && ph.rate == 20f;
+
+        // Exit frame (20 Hz -> 120 Hz): pacedBefore=true, pacedNow=false, pacedBefore || pacedNow == true.
+        long t2 = 13 * ph.period;
+        ph.pacer.wantFrame();
+        ph.pacer.vsyncCame(t2, t2 + 2 * ph.period);
+        FramePacer.Taken tk2 = ph.pacer.takeRender();
+        FramePacer.Begun b2 = ph.pacer.begin(tk2.vsyncAt, t2 + 200_000L, tk2.external);
+        boolean pacedBefore2 = ph.pacer.isPacedActive();
+        boolean pacedNow2 = ph.pacer.applyRate(true, false, b2.following, 20f, b2.externalDemand);
+        int postsBefore = ph.vsyncPosts;
+        ph.pacer.scheduleNext(true);
+        ph.runUntil(ph.now);
+        boolean ok2 = pacedBefore2 && !pacedNow2 && (pacedBefore2 || pacedNow2)
+                && !ph.pacer.isPacedActive() && ph.rate == 120f && ph.vsyncPosts > postsBefore;
+
+        // Following normal interactive frame: pacedBefore=false, pacedNow=false, pacedBefore || pacedNow == false.
+        long t3 = 14 * ph.period;
+        ph.pacer.vsyncCame(t3, t3 + 2 * ph.period);
+        FramePacer.Taken tk3 = ph.pacer.takeRender();
+        FramePacer.Begun b3 = ph.pacer.begin(tk3.vsyncAt, t3 + 200_000L, tk3.external);
+        boolean pacedBefore3 = ph.pacer.isPacedActive();
+        boolean pacedNow3 = ph.pacer.applyRate(true, false, b3.following, 0f, b3.externalDemand);
+        ph.pacer.scheduleNext(true);
+        boolean ok3 = !pacedBefore3 && !pacedNow3 && !(pacedBefore3 || pacedNow3)
+                && !ph.pacer.isPacedActive() && ph.rate == 120f;
+
+        check("applyRate + scheduleNext matches ended() and tracks pacedBefore || pacedNow across exit",
+                ok1 && ok2 && ok3, "ok1=" + ok1 + ", ok2=" + ok2 + ", ok3=" + ok3);
+    }
+
+    /** 22. cpuDeltaNanos, glWorkNanos, and measureGl separate GL work from raw wall time and measurement flags. */
+    static void cpuDeltaAndGlWorkNanosCase() {
+        // cpuDeltaNanos edge cases: both -1 (must NOT return 0!), single -1, backwards, normal.
+        boolean cpuOk = FramePacer.cpuDeltaNanos(-1L, -1L) == -1L
+                && FramePacer.cpuDeltaNanos(-1L, 1_000_000L) == -1L
+                && FramePacer.cpuDeltaNanos(1_000_000L, -1L) == -1L
+                && FramePacer.cpuDeltaNanos(5_000_000L, 4_000_000L) == -1L
+                && FramePacer.cpuDeltaNanos(1_000_000L, 3_000_000L) == 2_000_000L;
+
+        long d0 = 100_000_000L;
+        // Non-paced with 48 ms GPU backpressure in swap: must report full 50 ms wall time.
+        long nonPaced = FramePacer.glWorkNanos(d0, d0 + 2_000_000L, d0 + 50_000_000L, 2_000_000L, false);
+        // Paced with 2 ms CPU and 50 ms wall (eglSwapBuffers sleep): reports 2 ms CPU.
+        long pacedSwapSleep = FramePacer.glWorkNanos(d0, d0 + 2_000_000L, d0 + 50_000_000L, 2_000_000L, true);
+        // Paced with lazy dequeueBuffer sleep inside draw (48 ms drawWall, 2 ms CPU): reports 2 ms CPU.
+        long pacedLazyDequeue = FramePacer.glWorkNanos(d0, d0 + 48_000_000L, d0 + 50_000_000L, 2_000_000L, true);
+        // Paced with CPU time unavailable (-1): falls back to pre-swap drawWall (2 ms), not 50 ms swapWall.
+        long pacedNoCpu = FramePacer.glWorkNanos(d0, d0 + 2_000_000L, d0 + 50_000_000L, -1L, true);
+        // Fallback path (swapEnd used as swapDoneNs, swapCpuEnd used for cpuDelta): excludes lazy dequeue sleep.
+        long fallbackPaced = FramePacer.glWorkNanos(
+                d0, d0 + 48_000_000L, d0 + 48_000_000L, FramePacer.cpuDeltaNanos(10_000_000L, 12_000_000L), true);
+
+        // measureGl produces both workNs and rawWallNs from the same sample with paced/swapMeasured flags.
+        FramePacer.GlTiming mPaced = FramePacer.measureGl(0L, 2_000_000L, 50_000_000L, 2_000_000L, true, true);
+        FramePacer.GlTiming mFallback = FramePacer.measureGl(0L, 5_000_000L, 50_000_000L, 2_000_000L, true, false);
+        FramePacer.GlTiming mNonPaced = FramePacer.measureGl(0L, 2_000_000L, 50_000_000L, 2_000_000L, false, true);
+        boolean dualOk = mPaced.workNs == 2_000_000L && mPaced.rawWallNs == 50_000_000L && mPaced.paced && mPaced.swapMeasured
+                && mFallback.workNs == 2_000_000L && mFallback.rawWallNs == 5_000_000L && mFallback.paced && !mFallback.swapMeasured
+                && mNonPaced.workNs == 50_000_000L && mNonPaced.rawWallNs == 50_000_000L && !mNonPaced.paced && mNonPaced.swapMeasured;
+
+        boolean workOk = nonPaced == 50_000_000L
+                && pacedSwapSleep == 2_000_000L
+                && pacedLazyDequeue == 2_000_000L
+                && pacedNoCpu == 2_000_000L
+                && fallbackPaced == 2_000_000L;
+        check("cpuDeltaNanos, glWorkNanos & measureGl preserve backpressure, strip paced sleep, and keep raw wall",
+                cpuOk && workOk && dualOk, "cpuOk=" + cpuOk + ", workOk=" + workOk + ", dualOk=" + dualOk);
+    }
+
+    /** 23. Production FramePacer.AdpfState end-to-end: IME wake, 60 Hz cap, failed vote, gesture release, stale matrix. */
+    static void adpfTargetNanosAndTouchBoostCase() {
+        long period50ms = 50_000_000L;
+        long period33ms = 33_333_333L;
+        long period16ms = 16_666_667L;
+        long period8ms = 8_333_333L;
+        long expectedTopTarget = (long) (1e9 / 120f) * 7L / 10L;  // 5_833_333 ns
+        long expected60Target = period16ms * 7L / 10L;            // 11_666_666 ns
+        long expectedPacedTarget = period50ms * 7L / 10L;         // 35_000_000 ns
+
+        final List<Long> targets = new ArrayList<>();
+        final List<Long> actuals = new ArrayList<>();
+        FramePacer.AdpfSession sess = new FramePacer.AdpfSession() {
+            @Override public void updateTargetWorkDuration(long nanos) { targets.add(nanos); }
+            @Override public void reportActualWorkDuration(long nanos) { actuals.add(nanos); }
+        };
+
+        // 1. 20 Hz (50ms, topRate=120) touch -> wake -> IME wake (timeline still 50ms): stays 5.83ms, never 35ms.
+        FramePacer.AdpfState st = new FramePacer.AdpfState();
+        st.onSessionCreated(expectedPacedTarget, sess);
+        targets.clear();
+        actuals.clear();
+        boolean boosted = st.beginTouchBoost(true, 1_000_000_000L, period50ms, 120f);
+        st.wake(period50ms, 120f, false, true, 120f, false, sess);
+        st.wake(period50ms, 120f, false, true, 120f, false, sess); // IME wakeHints() while timeline still 50ms
+        boolean sc1 = boosted && st.boostActive
+                && targets.equals(List.of(expectedTopTarget))
+                && actuals.equals(List.of(expectedTopTarget, expectedTopTarget));
+
+        // 2. Gesture ends (touching=false) on a system-capped 60 Hz (16.67ms) 120 Hz device: clears boost -> 11.67ms.
+        targets.clear();
+        actuals.clear();
+        st.frameWorked(2_000_000L, 1_500_000L, 1_050_000_000L, period16ms, 120f, false, false, 120f, sess);
+        boolean sc2 = !st.boostActive
+                && targets.equals(List.of(expected60Target))
+                && actuals.equals(List.of(2_000_000L));
+
+        // 3. Rate lift transiently failed (pacedActive=true) while finger is still down (touching=true, 50ms):
+        //    frameWorked keeps boostActive=true (5.83ms); once finger lifts (touching=false), clears boost -> 35ms.
+        st.reset();
+        st.onSessionCreated(expectedPacedTarget, sess);
+        targets.clear();
+        actuals.clear();
+        st.beginTouchBoost(true, 2_000_000_000L, period50ms, 120f);
+        st.frameWorked(3_000_000L, 1_000_000L, 2_010_000_000L, period50ms, 120f, true, true, 20f, sess);
+        boolean keptWhileDown = st.boostActive && targets.equals(List.of(expectedTopTarget));
+        targets.clear();
+        st.frameWorked(3_000_000L, 1_000_000L, 2_020_000_000L, period50ms, 120f, true, false, 20f, sess);
+        boolean clearedOnLift = !st.boostActive && targets.equals(List.of(expectedPacedTarget));
+        boolean sc3 = keptWhileDown && clearedOnLift;
+
+        // 4. Gesture ends and high-rate vote withdrawn (touching=false, rateSaid=0) even while period stays 50ms: clears boost.
+        st.reset();
+        st.onSessionCreated(expectedPacedTarget, sess);
+        targets.clear();
+        st.beginTouchBoost(true, 3_000_000_000L, period50ms, 120f);
+        st.wake(period50ms, 120f, false, true, 120f, false, sess);
+        targets.clear();
+        st.frameWorked(2_000_000L, 1_000_000L, 3_100_000_000L, period50ms, 120f, false, false, 0f, sess);
+        boolean sc4 = !st.boostActive && targets.equals(List.of(expectedPacedTarget));
+
+        // 5. isStalePacedPeriod boundary matrix: {50ms, 33.3ms, 16.7ms, 8.3ms} x {120Hz, 90Hz, 60Hz, 0Hz}.
+        boolean sc5 = FramePacer.isStalePacedPeriod(period50ms, 120f)
+                && FramePacer.isStalePacedPeriod(period33ms, 120f)
+                && !FramePacer.isStalePacedPeriod(period16ms, 120f)
+                && !FramePacer.isStalePacedPeriod(period8ms, 120f)
+                && FramePacer.isStalePacedPeriod(period50ms, 90f)
+                && FramePacer.isStalePacedPeriod(period33ms, 90f)
+                && !FramePacer.isStalePacedPeriod(period16ms, 90f)
+                && !FramePacer.isStalePacedPeriod(period8ms, 90f)
+                && FramePacer.isStalePacedPeriod(period50ms, 60f)
+                && FramePacer.isStalePacedPeriod(period33ms, 60f)
+                && !FramePacer.isStalePacedPeriod(period16ms, 60f)
+                && !FramePacer.isStalePacedPeriod(period8ms, 60f)
+                && !FramePacer.isStalePacedPeriod(period50ms, 0f)
+                && !FramePacer.isStalePacedPeriod(period33ms, 0f)
+                && !FramePacer.isStalePacedPeriod(period16ms, 0f)
+                && !FramePacer.isStalePacedPeriod(period8ms, 0f);
+
+        // 6. Fixed 120 Hz screen (8.33ms, topRate=120) with lastFrameWorked 50 ms ago (< 250 ms):
+        //    beginTouchBoost(true) still returns true (bypasses 250 ms throttle) while keeping boostActive=false,
+        //    and wake() reports expectedTopTarget (5.83ms) without clamping.
+        st.reset();
+        st.onSessionCreated(expectedTopTarget, sess);
+        st.lastFrameWorkedNs = 4_000_000_000L;
+        targets.clear();
+        actuals.clear();
+        boolean fixedWakeAllowed = st.beginTouchBoost(true, 4_050_000_000L, period8ms, 120f);
+        st.wake(period8ms, 120f, false, true, 120f, false, sess);
+        boolean sc6 = fixedWakeAllowed && !st.boostActive
+                && targets.isEmpty()
+                && actuals.equals(List.of(expectedTopTarget));
+
+        check("AdpfState handles IME wake, 60 Hz cap, failed rate lift, vote release, stale matrix, and fixed-120 wake",
+                sc1 && sc2 && sc3 && sc4 && sc5 && sc6,
+                "sc1=" + sc1 + ", sc2=" + sc2 + ", sc3=" + sc3 + ", sc4=" + sc4 + ", sc5=" + sc5 + ", sc6=" + sc6);
+    }
+
+    /** 24. Picture-only redraw triggered from 20 Hz keeps picturedPaced even if posted recheckRate() lifts before takeRender(). */
+    static void picturedPacedSurvivesEarlyRecheckCase() {
+        Phone ph = new Phone(120, 3, true, 200_000);
+        // Enter 20 Hz paced mode.
+        long t1 = 12 * ph.period;
+        ph.pacer.wantPacedFrame();
+        ph.pacer.vsyncCame(t1, t1 + 2 * ph.period);
+        FramePacer.Taken tkInit = ph.pacer.takeRender();
+        FramePacer.Begun bInit = ph.pacer.begin(tkInit.vsyncAt, t1 + 200_000L, tkInit.external);
+        ph.pacer.applyRate(false, false, bInit.following, 20f, bInit.externalDemand);
+        ph.pacer.scheduleNext(false);
+        boolean inPaced = ph.pacer.isPacedActive();
+
+        // Picture arrives while paced: capture wasPaced, mark pictureActive, queue pictureFrame(wasPaced).
+        boolean wasPaced = ph.pacer.isPacedActive();
+        ph.pictureActive = true;
+        ph.pacer.pictureFrame(wasPaced);
+        // Simulate posted recheckRate() running on app thread BEFORE next vsync's frameOnApp().
+        ph.pacer.recheckRate();
+        boolean liftedEarly = !ph.pacer.isPacedActive() && ph.rate == 120f;
+
+        // Next vsync arrives -> takeRender() still carries picturedPaced=true so transition frame is attributed.
+        long t2 = 13 * ph.period;
+        ph.pacer.vsyncCame(t2, t2 + 2 * ph.period);
+        FramePacer.Taken tk1 = ph.pacer.takeRender();
+        boolean pacedBefore1 = ph.pacer.isPacedActive();
+        boolean ok1 = tk1.pictured && !tk1.app && tk1.picturedPaced && (pacedBefore1 || tk1.picturedPaced);
+
+        // Subsequent normal picture redraw after exit must NOT inherit picturedPaced.
+        ph.pacer.pictureFrame(ph.pacer.isPacedActive());
+        long t3 = 14 * ph.period;
+        ph.pacer.vsyncCame(t3, t3 + 2 * ph.period);
+        FramePacer.Taken tk2 = ph.pacer.takeRender();
+        boolean ok2 = tk2.pictured && !tk2.app && !tk2.picturedPaced;
+
+        check("pictureFrame from 20 Hz retains picturedPaced across early recheckRate() and clears on next frame",
+                inPaced && liftedEarly && ok1 && ok2,
+                "inPaced=" + inPaced + ", liftedEarly=" + liftedEarly + ", ok1=" + ok1 + ", ok2=" + ok2);
+    }
+
     public static void main(String[] args) throws IOException {
         motionCase("a motion of 1 ms CPU and 1 ms GPU a frame shows a new frame at every refresh", 1, 1, true);
         motionCase("a motion of 0.5 ms CPU and 7 ms GPU a frame (the GPU under a refresh) shows a new frame at every refresh", 0.5, 7, true);
@@ -1657,6 +1877,10 @@ public final class FramePacerTest {
         wantImmediateFrameClearsAheadForNextFrameCase();
         sameVsyncFireWakeAfterAskAheadDoesNotDoublePostCase();
         wantFrameBeforeFireWakeAtSameTDoesNotDoublePostCase();
+        applyRateScheduleNextEquivalenceCase();
+        cpuDeltaAndGlWorkNanosCase();
+        adpfTargetNanosAndTouchBoostCase();
+        picturedPacedSurvivesEarlyRecheckCase();
         if (args.length > 0) {
             replay(args[0], 1);
             replay(args[0], 7);

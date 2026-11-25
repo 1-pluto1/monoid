@@ -1565,21 +1565,48 @@ int32_t mb_host_reveal_file(moonbit_string_t s, int32_t go) { (void)s; (void)go;
 double mb_host_perf_size(void) { return 0; }
 moonbit_bytes_t mb_host_perf_read(void) { return moonbit_make_bytes(0, 0); }
 
-// The GL thread's time drawing the frame it drew last (MBView.drawOnGl: the commands given, not the GPU's own time;
-// -1 before any), in µs, and how many frames the app handed over were never drawn, each's place taken by a newer one
-// as it waited (FrameMail.takeDropped), since the run began: written by the GL thread, read by the app's.
+// The GL thread's work duration for the frame it drew last (in µs, -1 before any): for non-paced frames, full
+// draw + eglSwapBuffers wall time (preserving real GPU backpressure); for paced frames, GL thread CPU time (or
+// draw-end wall fallback) so intentional 20 Hz pacing sleep does not falsely trigger over_24ms/gpu_only hangs.
+// `gl_drawn_mu` serializes multi-view GL writers and `mb_host_gpu_timing` snapshots (flags: bit 0 = paced,
+// bit 1 = swap_measured), while `gl_drawn_us` stays atomic for lock-free hot-path reads in `mb_host_gpu_ms()`.
+// `gl_dropped` counts frames handed over that were replaced before being drawn (FrameMail.takeDropped).
+static pthread_mutex_t gl_drawn_mu = PTHREAD_MUTEX_INITIALIZER;
 static int64_t gl_drawn_us = -1;
+static int64_t gl_drawn_raw_wall_us = -1;
+static int32_t gl_drawn_flags = 0;
 static int32_t gl_dropped;
 
-JNIEXPORT void JNICALL Java_dev_mbui_MBView_glDrawn(JNIEnv *env, jclass c, jdouble ms, jint dropped) {
+JNIEXPORT void JNICALL Java_dev_mbui_MBView_glDrawn(
+    JNIEnv *env, jclass c, jdouble ms, jdouble raw_wall_ms, jboolean paced, jboolean swap_measured, jint dropped) {
   (void)env, (void)c;
-  __atomic_store_n(&gl_drawn_us, (int64_t)(ms * 1000.0), __ATOMIC_RELAXED);
+  int64_t work_us = (int64_t)(ms * 1000.0);
+  int64_t raw_us = (int64_t)(raw_wall_ms * 1000.0);
+  int32_t flags = (paced ? 1 : 0) | (swap_measured ? 2 : 0);
+  pthread_mutex_lock(&gl_drawn_mu);
+  __atomic_store_n(&gl_drawn_us, work_us, __ATOMIC_RELAXED);
+  gl_drawn_raw_wall_us = raw_us;
+  gl_drawn_flags = flags;
+  pthread_mutex_unlock(&gl_drawn_mu);
   if (dropped > 0) __atomic_add_fetch(&gl_dropped, (int32_t)dropped, __ATOMIC_RELAXED);
 }
 
 double mb_host_gpu_ms(void) {
   int64_t us = __atomic_load_n(&gl_drawn_us, __ATOMIC_RELAXED);
   return us < 0 ? -1 : (double)us / 1000.0;
+}
+
+// Coherent snapshot of the last drawn GL frame's (work_ms, raw_wall_ms, flags); returns 1 if valid, 0 before first frame.
+int32_t mb_host_gpu_timing(double *work_ms, double *raw_wall_ms, int32_t *flags) {
+  pthread_mutex_lock(&gl_drawn_mu);
+  int64_t work_us = __atomic_load_n(&gl_drawn_us, __ATOMIC_RELAXED);
+  int64_t raw_us = gl_drawn_raw_wall_us;
+  int32_t f = gl_drawn_flags;
+  pthread_mutex_unlock(&gl_drawn_mu);
+  if (work_ms) *work_ms = work_us < 0 ? -1.0 : (double)work_us / 1000.0;
+  if (raw_wall_ms) *raw_wall_ms = raw_us < 0 ? -1.0 : (double)raw_us / 1000.0;
+  if (flags) *flags = f;
+  return work_us >= 0 ? 1 : 0;
 }
 
 int32_t mb_host_frames_dropped(void) { return __atomic_load_n(&gl_dropped, __ATOMIC_RELAXED); }
