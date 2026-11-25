@@ -1325,15 +1325,43 @@ test("W8-F R3 P1: AgentsHost session IDs remain monotonic across SessionsProgram
   host.use(driver);
   const origUse = SessionsProgram.prototype.use;
   const capturedAgentUsers: ProgramUser[] = [];
-  SessionsProgram.prototype.use = function (user: ProgramUser) {
-    if (!user.actors) capturedAgentUsers.push(user);
+  // (every end of a SessionsProgram the agents' user hears, by program: after the one this test kills, any other is a
+  // restart that failed, which fails the test at once instead of waiting on a re-attach that never comes)
+  const ends: Array<{ program: SessionsProgram | null; code: number }> = [];
+  let activeProgram: SessionsProgram | null = null;
+  let allowKillOf: SessionsProgram | null = null;
+  let guardActive = true;
+  let rejectUnexpectedExit!: (err: Error) => void;
+  const unexpectedExit = new Promise<never>((_, reject) => {
+    rejectUnexpectedExit = reject;
+  });
+  unexpectedExit.catch(() => {});
+  const watched = new WeakSet<ProgramUser>();
+  SessionsProgram.prototype.use = function (this: SessionsProgram, user: ProgramUser) {
+    if (!user.actors) {
+      capturedAgentUsers.push(user);
+      activeProgram = this;
+      if (!watched.has(user)) {
+        watched.add(user);
+        const exited = user.exited.bind(user);
+        user.exited = (code: number) => {
+          const ended = activeProgram;
+          ends.push({ program: ended, code });
+          if (guardActive && ended !== allowKillOf) {
+            rejectUnexpectedExit(new Error(`unexpected SessionsProgram exit (${code}) before expected transition`));
+          }
+          exited(code);
+        };
+      }
+    }
     return origUse.call(this, user);
   };
+  const spawns = createSpawnTracker();
   try {
     // 1. Attach live session A (id `a`) with only agents using the SessionsProgram.
     const heardA: any[] = [];
     const heardB: any[] = [];
-    const makeFakeHosted = (n: number, out: any[]) => ({
+    const makeFakeHosted = (n: number, out: any[], onAttached: () => void = () => {}) => ({
       n,
       info: { socket: join(data, `fake-${n}.sock`), pid: 999999 },
       kind: "claude" as const,
@@ -1344,7 +1372,7 @@ test("W8-F R3 P1: AgentsHost session IDs remain monotonic across SessionsProgram
       detaching: false,
       turnNow: () => null,
       liveNow: () => null,
-      attached() {},
+      attached() { onAttached(); },
       heard(h: any) { out.push(h); },
       inTurn(fn: () => void) { fn(); },
       exited_() {},
@@ -1353,23 +1381,36 @@ test("W8-F R3 P1: AgentsHost session IDs remain monotonic across SessionsProgram
     });
 
     const idA = host.number();
-    const procA = makeFakeHosted(idA, heardA);
+    // (A's second `attached()` is AgentsHost re-attaching it to the restarted SessionsProgram: no wall-clock deadline)
+    let attachedA = 0;
+    let secondAttach!: () => void;
+    const secondAttachSeen = new Promise<void>((resolveSeen) => (secondAttach = resolveSeen));
+    const procA = makeFakeHosted(idA, heardA, () => {
+      attachedA += 1;
+      if (attachedA === 2) secondAttach();
+    });
     host.attach(procA as any);
+    assert.equal(attachedA, 1, "A attached once to the first SessionsProgram");
     const firstProg = host.program();
     assert.ok(firstProg !== null, "first SessionsProgram must be active");
+    // (the first generation really running: its Pion `--sessions` process said ready, past the `--version` probe, so
+    // the kill below ends a process rather than calling off a pending start; any exit before ready fails at once)
+    const readies = () => spawns.events.filter((e) => e.ready);
+    await Promise.race([spawns.waitUntil(() => readies().length >= 1), unexpectedExit]);
+    const first = readies()[0]!;
+    assert.equal(first.engine, "pion", "the first generation is stillfail-pion");
+    assert.ok(first.pid !== null, "the first generation has a process");
 
     // 2. Kill the underlying SessionsProgram so AgentsHost.#exited triggers a restart and re-attaches A with idA.
+    allowKillOf = firstProg;
     firstProg.kill();
-    await new Promise<void>((resolveWait) => {
-      const deadline = Date.now() + 5000;
-      const poll = () => {
-        const cur = host.program();
-        if (cur !== null && cur !== firstProg && !cur.ended) return resolveWait();
-        if (Date.now() > deadline) return resolveWait();
-        setTimeout(poll, 25);
-      };
-      poll();
-    });
+    await Promise.race([Promise.all([secondAttachSeen, spawns.waitUntil(() => readies().length >= 2)]), unexpectedExit]);
+    guardActive = false;
+    assert.equal(attachedA, 2, "A re-attached exactly once after the restart");
+    assert.deepEqual(ends.map((e) => e.program === firstProg), [true], "only the killed generation ended");
+    const second = readies()[1]!;
+    assert.equal(second.engine, "pion", "the second generation is stillfail-pion");
+    assert.ok(second.pid !== null && second.pid !== first.pid, `a second --sessions process (${second.pid}) beside the killed one (${first.pid})`);
     const secondProg = host.program();
     assert.ok(secondProg !== null && secondProg !== firstProg, "AgentsHost must restart a fresh SessionsProgram");
     const agentUser = capturedAgentUsers.at(-1);
@@ -1393,6 +1434,8 @@ test("W8-F R3 P1: AgentsHost session IDs remain monotonic across SessionsProgram
     host.forget(procA as any);
     host.forget(procB as any);
   } finally {
+    guardActive = false;
+    setSessionsSpawnObserverForTest(null);
     SessionsProgram.prototype.use = origUse;
     await host.close(driver);
     if (prev === undefined) delete process.env.STILLFAIL_READER_SESSIONS;
