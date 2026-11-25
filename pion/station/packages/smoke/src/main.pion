@@ -118,6 +118,8 @@ fn advertised_modes() -> Array[String] {
     "replica-carry",
     "usage-counter",
     "search",
+    "forward",
+    "mesh",
   ]
 }
 
@@ -1823,6 +1825,30 @@ fn main(world : World) -> Unit {
           }
           _ => usage_exit()
         }
+      }
+      Some("forward") => {
+        let shell_dir = match flag_value(argv, "--shell-dir") {
+          Some(d) => d
+          None => "."
+        }
+        let listen_fd : Option[Int] = match flag_value(argv, "--listen-fd") {
+          Some(fd_str) => Some(builders_replica::parse_int_flag(Some(fd_str), -1))
+          None => None
+        }
+        let listen_port = builders_replica::parse_int_flag(flag_value(argv, "--listen-port"), 0)
+        let to_port = builders_replica::parse_int_flag(flag_value(argv, "--to"), 0)
+        host_shim::exit_process(front::run_forward(shell_dir, listen_fd, listen_port, to_port))
+      }
+      Some("mesh") => {
+        let shell_dir = match flag_value(argv, "--shell-dir") {
+          Some(d) => d
+          None => "."
+        }
+        let socket_path = match flag_value(argv, "--socket") {
+          Some(s) => s
+          None => "mesh.sock"
+        }
+        host_shim::exit_process(front::run_mesh(shell_dir, socket_path, sql_db::stringify_json))
       }
       _ => usage_exit()
     }
