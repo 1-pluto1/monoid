@@ -67,6 +67,9 @@ test("READER_MODES strictly matches all modes in station/mb/src/reader/main.mbt 
       "people-since",
       "post-blocks",
       "recent-chat",
+      "replica-carry",
+      "replica-export",
+      "replica-restore",
       "said",
       "search",
       "search-scope",
@@ -191,9 +194,9 @@ test("environment variable STILLFAIL_READER_<UPPER_SNAKE_MODE> overrides config"
     fallback: false,
   });
 
-  const unimplEnv = resolveReaderEngine("replica-export", {
-    config: { readers: { "replica-export": "mb" } },
-    env: { STILLFAIL_READER_REPLICA_EXPORT: "pion" },
+  const unimplEnv = resolveReaderEngine("data", {
+    config: { readers: { data: "mb" } },
+    env: { STILLFAIL_READER_DATA: "pion" },
     hasPionBinary: true,
   });
   assert.equal(unimplEnv.engine, "mb");
@@ -400,6 +403,9 @@ test("every mode with pionImplemented: true is explicitly wired to resolveReader
     "people-since",
     "post-blocks",
     "recent-chat",
+    "replica-carry",
+    "replica-export",
+    "replica-restore",
     "said",
     "search",
     "search-scope",
