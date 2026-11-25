@@ -232,6 +232,41 @@ fn cmd_pick_is_stop(text : String, i : Int, line_end : Int) -> Bool {
 }
 
 ///|
+/// What a ⌘-drag over words goes by (cmd_snap_at), as its press found the keys: words (the system's, a dictionary's in
+/// Chinese) with ⌘ alone, sentences with ⇧ as well.
+// kept across runs: reset by view_forget and window_kept_ui_7
+let cmd_snap_sentences : Ref[Bool] = Ref(false)
+
+///|
+/// The unit around offset `off` of `text` a ⌘-drag widens by (cmd_snap_sentences).
+fn cmd_snap_at(text : String, off : Int) -> (Int, Int) {
+  if cmd_snap_sentences.val {
+    cmd_pick_sentence(text, off)
+  } else {
+    finger_word_at(text, off)
+  }
+}
+
+///|
+/// Whether a mouse's press now, on words of `layer`, picks by units (cmd_snap_at): the command key held over a
+/// `words_cmd_pick` scope that is enabled; which units, words or sentences, as ⇧ is held then (cmd_snap_sentences).
+fn cmd_snap_scope(layer : SelLayer) -> Bool {
+  guard pointing() is Mouse && cmd_pick_held() else { return false }
+  let on = match layer {
+    TreeScope(_, scope_id) =>
+      match cmd_pick_scopes.get(scope_id) {
+        Some(scope) => @signals.untracked(scope.enabled)
+        None => false
+      }
+    _ => false
+  }
+  if on {
+    cmd_snap_sentences.val = (mods_held() & mod_shift_key) != 0
+  }
+  on
+}
+
+///|
 /// Whether index `i` in `text` (within `[line_start, line_end)`) is a clause comma: `，` anywhere, or `,` before
 /// whitespace or EOL (so numbers like `1,000` and lists like `a,b` stay intact). A comma ends the picked clause
 /// without being part of it.
@@ -430,6 +465,8 @@ fn cmd_hover_update(laid? : Bool = true, over? : Bool = false, mods? : Int? = No
 fn cmd_hover_clear() -> Unit {
   // (as the views are forgotten: nothing left to repaint, so put back as the lets have them)
   cmd_pick_down.val = None
+  cmd_pick_snapping.val = false
+  cmd_snap_sentences.val = false
   cmd_hover.val = None
   cmd_sel_underline.val = None
 }
@@ -452,12 +489,30 @@ fn cmd_pick_press_down(x : Double, y : Double) -> Bool {
 }
 
 ///|
-/// Cancel a pending Cmd-click if the pointer moves beyond a small slop before release.
+/// A ⌘-press moved on past a small slop becomes a pick of words by units (cmd_snap_at): begun where it went down, the
+/// unit there kept whole, widened to where the pointer is as it goes (Ctx::select_press, Ctx::select_move).
+// kept across runs: reset by view_forget and window_kept_ui_7
+let cmd_pick_snapping : Ref[Bool] = Ref(false)
+
+///|
+/// A ⌘-press moved: past a small slop no click, a pick by units from where it went down instead (cmd_pick_snapping).
 fn cmd_pick_press_move(x : Double, y : Double) -> Unit {
+  if cmd_pick_snapping.val {
+    g().select_move(x, y) |> ignore
+    h_frame_owed()
+    return
+  }
   match cmd_pick_down.val {
     Some((_, x0, y0)) if (x - x0).abs() > 6.0 || (y - y0).abs() > 6.0 => {
       cmd_pick_down.val = None
       cmd_hover_set(None)
+      let c = g()
+      c.select_press(x0, y0, 1)
+      if picked.snap {
+        cmd_pick_snapping.val = true
+        c.select_move(x, y) |> ignore
+      }
+      h_frame_owed()
     }
     _ => ()
   }
@@ -466,6 +521,17 @@ fn cmd_pick_press_move(x : Double, y : Double) -> Unit {
 ///|
 /// Complete a pending Cmd-click on primary mouse up, invoking the scope's `on_click(of, text)`.
 fn cmd_pick_press_up(fire : Bool) -> Bool {
+  // (a pick by units let go: picked as far as it went, its pill over it as a drag's is)
+  if cmd_pick_snapping.val {
+    cmd_pick_snapping.val = false
+    view_held.val = None
+    picked.dragging = false
+    select_edge_stop()
+    picked_now_tell()
+    cmd_hover_update(laid=false, over=false)
+    h_frame_owed()
+    return true
+  }
   match cmd_pick_down.val {
     Some((h, _, _)) => {
       cmd_pick_down.val = None
