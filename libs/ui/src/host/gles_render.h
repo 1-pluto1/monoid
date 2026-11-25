@@ -91,7 +91,7 @@ static const char *VS =
     "  float lo = floor(clamp(rg.y, 0.0, 1.0) * 255.0 + 0.5);\n"
     "  return (hi * 256.0 + lo) / 65535.0;\n"
     "}\n"
-    "vec2 vs_ad_sample_ink(vec2 ac, float fallback_r, out vec2 capCenter, out vec2 capHalf) {\n"
+    "vec3 vs_ad_sample_ink(vec2 ac, float fallback_r, out vec2 capCenter, out vec2 capHalf) {\n"
     "  if (u_ad_n > 0) {\n"
     "    int best = -1;\n"
     "    float best_d = 1e9;\n"
@@ -115,41 +115,59 @@ static const char *VS =
     "      vec4 px = texelFetch(u_ad, ivec2(best, 0), 0);\n"
     "      capCenter = u_ad_box[best].xy;\n"
     "      capHalf = u_ad_box[best].zw;\n"
-    "      return vec2(vs_unpack16(px.rg), px.a);\n"
+    "      return vec3(vs_unpack16(px.rg), px.a, px.b);\n"
     "    }\n"
     "  }\n"
     "  capCenter = ac;\n"
     "  capHalf = vec2(0.0);\n"
     "  float bgL = vs_backdrop_luma_rect(ac, vec2(max(fallback_r, 1.0)));\n"
-    "  return vec2(1.0 - smoothstep(0.12, 0.21, bgL), bgL);\n"
+    "  return vec3(1.0 - smoothstep(0.12, 0.21, bgL), bgL, 0.0);\n"
     "}\n"
     "float vs_srgb_to_lin(float c) {\n"
     "  return c <= 0.04045 ? (c / 12.92) : pow(max((c + 0.055) / 1.055, 0.0), 2.4);\n"
+    "}\n"
+    "float vs_wcag_luma(vec3 c) {\n"
+    "  return 0.2126 * vs_srgb_to_lin(c.r) + 0.7152 * vs_srgb_to_lin(c.g) + 0.0722 * vs_srgb_to_lin(c.b);\n"
+    "}\n"
+    "float vs_backdrop_wcag_luma_rect(vec2 c, vec2 h) {\n"
+    "  float sum = 0.0;\n"
+    "  float mx1 = -1.0, mx2 = -1.0;\n"
+    "  float mn1 = 2.0, mn2 = 2.0;\n"
+    "  for (int iy = -1; iy <= 1; iy++) {\n"
+    "    float py = c.y + float(iy) * (h.y * 0.60);\n"
+    "    for (int ix = -2; ix <= 2; ix++) {\n"
+    "      float px = c.x + float(ix) * (h.x * 0.38);\n"
+    "      float y = vs_wcag_luma(vs_backdrop(vec2(px, py)));\n"
+    "      sum += y;\n"
+    "      if (y > mx1) { mx2 = mx1; mx1 = y; } else if (y > mx2) { mx2 = y; }\n"
+    "      if (y < mn1) { mn2 = mn1; mn1 = y; } else if (y < mn2) { mn2 = y; }\n"
+    "    }\n"
+    "  }\n"
+    "  return (sum - mx1 - mx2 - mn1 - mn2) / 11.0;\n"
     "}\n"
     "float vs_lin_to_srgb(float y) {\n"
     "  y = clamp(y, 0.0, 1.0);\n"
     "  return y <= 0.0031308 ? (12.92 * y) : (1.055 * pow(max(y, 0.0), 1.0 / 2.4) - 0.055);\n"
     "}\n"
-    "vec3 vs_bare_adaptive_ink_at(vec3 rgb, vec2 ac, float hr) {\n"
+    "vec3 vs_bare_adaptive_ink_at(vec3 rgb, vec2 ac, vec2 h) {\n"
     "  float ch = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);\n"
     "  if (ch > 0.08) return rgb;\n"
     "  float origL = vs_luma(rgb);\n"
-    "  float bgL = vs_backdrop_luma_rect(ac, vec2(max(hr, 1.0)));\n"
-    "  float c_bg = sqrt(max(bgL, 0.0));\n"
-    "  float Lbg = vs_srgb_to_lin(c_bg);\n"
+    "  float origY = vs_wcag_luma(rgb);\n"
+    "  float Lbg = vs_backdrop_wcag_luma_rect(ac, max(h, vec2(1.0)));\n"
     "  float target = 4.65;\n"
     "  float out_c;\n"
     "  if (Lbg >= 0.1792) {\n"
     "    float pref = origL < 0.5 ? origL : clamp(1.0 - origL, 0.02, 0.45);\n"
-    "    float y_pref = vs_srgb_to_lin(pref);\n"
+    "    float y_pref = origL < 0.5 ? origY : vs_srgb_to_lin(pref);\n"
     "    float y_max = max(0.0, (Lbg + 0.05) / target - 0.05);\n"
-    "    if (origL < 0.5 && y_pref <= y_max) return rgb;\n"
+    "    if (origL < 0.5 && origY <= y_max) return rgb;\n"
     "    out_c = vs_lin_to_srgb(min(y_pref, y_max));\n"
     "  } else {\n"
     "    float pref = origL >= 0.5 ? origL : clamp(1.06 - origL, 0.55, 0.98);\n"
-    "    float y_pref = vs_srgb_to_lin(pref);\n"
+    "    float y_pref = origL >= 0.5 ? origY : vs_srgb_to_lin(pref);\n"
     "    float y_min = min(1.0, target * (Lbg + 0.05) - 0.05);\n"
-    "    if (origL >= 0.5 && y_pref >= y_min) return rgb;\n"
+    "    if (origL >= 0.5 && origY >= y_min) return rgb;\n"
     "    out_c = vs_lin_to_srgb(max(y_pref, y_min));\n"
     "  }\n"
     "  return vec3(out_c);\n"
@@ -157,11 +175,41 @@ static const char *VS =
     "vec3 vs_adaptive_ink_at(vec3 rgb, vec2 ac, float fallback_r, vec4 rect, vec2 sample_off, bool is_icon) {\n"
     "  float ch = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);\n"
     "  float origL = vs_luma(rgb);\n"
-    "  if (ch > 0.08 || origL >= 0.5) return rgb;\n"
+    "  if (ch > 0.08) return rgb;\n"
     "  vec2 capCenter, capHalf;\n"
-    "  vec2 cap = vs_ad_sample_ink(ac, fallback_r, capCenter, capHalf);\n"
+    "  vec3 cap = vs_ad_sample_ink(ac, fallback_r, capCenter, capHalf);\n"
     "  float capsuleDarkT = cap.x;\n"
     "  float capsuleBgL = cap.y;\n"
+    "  float capsuleLatch = cap.z;\n"
+    "  if (origL >= 0.5) {\n"
+    "    if (capHalf.x <= 0.0) return rgb;\n"
+    "    int code = int(floor(clamp(capsuleLatch, 0.0, 1.0) * 255.0 + 0.5));\n"
+    "    if (code < 48 || code > 208) return rgb;\n"
+    "    if (code >= 96) {\n"
+    "      float darkL = clamp(1.0 - origL, 0.06, 0.10);\n"
+    "      return vec3(darkL);\n"
+    "    }\n"
+    "    float bgL = capsuleBgL;\n"
+    "    if (origL < 0.94 && u_uvc.z > u_uvc.x && u_uvc.w > u_uvc.y) {\n"
+    "      vec2 samplePos = rect.xy + rect.zw * 0.5 + sample_off;\n"
+    "      float stepX = is_icon ? 4.0 : 8.0;\n"
+    "      int halfN = is_icon ? 2 : 12;\n"
+    "      for (int iy = -1; iy <= 1; iy++) {\n"
+    "        float py = clamp(samplePos.y + float(iy) * 5.0, capCenter.y - capHalf.y, capCenter.y + capHalf.y);\n"
+    "        for (int ix = -12; ix <= 12; ix++) {\n"
+    "          float px = samplePos.x + float(ix) * stepX;\n"
+    "          if (abs(ix) <= halfN && px >= capCenter.x - capHalf.x && px <= capCenter.x + capHalf.x) {\n"
+    "            vec2 guv = vec2(px, py) * u_map.xy + u_map.zw;\n"
+    "            if (guv.x >= u_uvc.x && guv.x <= u_uvc.z && guv.y >= u_uvc.y && guv.y <= u_uvc.w) {\n"
+    "              bgL = max(bgL, vs_ink_luma(vs_backdrop(vec2(px, py))));\n"
+    "            }\n"
+    "          }\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    float liftW = smoothstep(0.03, 0.08, bgL);\n"
+    "    return mix(rgb, max(rgb, vec3(0.95)), liftW);\n"
+    "  }\n"
     "  float darkT = capsuleDarkT;\n"
     "  float localBoost = 0.0;\n"
     "  bool is_large = (capHalf.x >= 140.0 && capHalf.y >= 19.0);\n"
@@ -222,10 +270,12 @@ static const char *VS =
     "#if MB_VS_ADAPTIVE\n"
     "  if (kind == 7) {\n"
     "    v_color.rgb = a_pad.w < 0.0\n"
-    "      ? vs_bare_adaptive_ink_at(a_color.rgb, a_pad.yz, -a_pad.w * 0.5)\n"
+    "      ? vs_bare_adaptive_ink_at(a_color.rgb, a_rect.xy + a_rect.zw * 0.5, vec2(max(-a_pad.w, a_rect.z), max(max(-a_pad.w * 0.5, a_rect.w), 1.0)))\n"
     "      : vs_adaptive_ink_at(a_color.rgb, a_pad.yz, a_pad.w * 0.5, a_rect, a_p.zw, false);\n"
-    "  } else if ((kind == 10 || kind == 11) && a_pad.w > 0.0) {\n"
-    "    v_color.rgb = vs_adaptive_ink_at(a_color.rgb, a_pad.yz, a_pad.w * 0.5, a_rect, kind == 10 ? vec2(0.0) : a_p.zw, true);\n"
+    "  } else if ((kind == 10 || kind == 11) && a_pad.w != 0.0) {\n"
+    "    v_color.rgb = a_pad.w < 0.0\n"
+    "      ? vs_bare_adaptive_ink_at(a_color.rgb, kind == 10 ? (a_rect.xy + a_rect.zw * 0.5) : (a_rect.xy + a_rect.zw * 0.5 + a_p.zw), vec2(max(-a_pad.w * 0.5, 1.0)))\n"
+    "      : vs_adaptive_ink_at(a_color.rgb, a_pad.yz, a_pad.w * 0.5, a_rect, kind == 10 ? vec2(0.0) : a_p.zw, true);\n"
     "  } else if (kind == 0 && a_pad.w < 0.0) {\n"
     "    float ch = max(max(a_color.r, a_color.g), a_color.b) - min(min(a_color.r, a_color.g), a_color.b);\n"
     "    vec2 capCenter, capHalf;\n"
@@ -449,11 +499,16 @@ static const char *FS =
     "      }\n"
     "    }\n"
     "    if (best >= 0) {\n"
-    "      return mb_unpack16(texelFetch(u_ad, ivec2(best, 0), 0).rg);\n"
+    "      vec4 px = texelFetch(u_ad, ivec2(best, 0), 0);\n"
+    "      if (is_dark_glass) {\n"
+    "        int code = int(floor(clamp(px.b, 0.0, 1.0) * 255.0 + 0.5));\n"
+    "        if (code >= 48 && code <= 208) return (code >= 96) ? 1.0 : 0.0;\n"
+    "      }\n"
+    "      return mb_unpack16(px.rg);\n"
     "    }\n"
     "  }\n"
     "  float bgL = mb_backdrop_luma_rect(ac, vec2(max(fallback_r, 1.0)));\n"
-    "  return is_dark_glass ? smoothstep(0.35, 0.85, bgL) : (1.0 - smoothstep(0.12, 0.21, bgL));\n"
+    "  return is_dark_glass ? smoothstep(0.20, 0.26, bgL) : (1.0 - smoothstep(0.12, 0.21, bgL));\n"
     "}\n"
     "#endif\n"
     "// how much of the pixel at p its rounded clip keeps (r: the corners' radii, top left, then clockwise; s: how smooth\n"
@@ -759,6 +814,7 @@ static const char *FS =
     "    float glintFaceGain;\n"
     "    float glintVib;\n"
     "    float fogT = 0.0;\n"
+    "    float darkAdGlareW = 0.0;\n"
     "    float darkMixSaved = 0.0;\n"
     "    float regExtra = 0.0;\n"
     "    if (is_clear) {\n"
@@ -786,18 +842,22 @@ static const char *FS =
     "      float val = ad_sample(ac, ar, is_dark);\n"
     "      float baseDens = mix(0.404, col.a, smoothstep(0.405, 0.46, col.a));\n"
     "      if (is_dark) {\n"
-    "        float brightT = val * solidFade;\n"
+    "        float extra = clamp((baseDens - 0.404) / (1.0 - 0.404), 0.0, 1.0);\n"
+    "        float brightT = val * solidFade * (1.0 - extra);\n"
     "        fogT = brightT;\n"
-    "        float dens = max(baseDens, mix(baseDens, 0.45, brightT));\n"
-    "        float extra = clamp((dens - 0.404) / (1.0 - 0.404), 0.0, 1.0);\n"
     "        regExtra = extra;\n"
     "        float darkPow = pow(extra, 1.00);\n"
     "        float darkCPow = pow(extra, 1.05);\n"
     "        float darkBump = 3.5 * smoothstep(0.0, 0.16, extra) * (1.0 - smoothstep(0.22, 0.38, extra));\n"
-    "        emission = mix(vec3((34.0 + darkBump) / 255.0), col.rgb, pow(extra, 1.5));\n"
-    "        transmittance = mix(0.59, 0.0, darkPow);\n"
-    "        lift = mix(0.55, 0.0, extra);\n"
-    "        chromaGain = mix(1.05, 0.0, darkCPow);\n"
+    "        vec3 darkEm = mix(vec3((34.0 + darkBump) / 255.0), col.rgb, pow(extra, 1.5));\n"
+    "        float darkTrans = mix(0.59, 0.0, darkPow);\n"
+    "        float darkLift = mix(0.55, 0.0, extra);\n"
+    "        float darkChroma = mix(1.05, 0.0, darkCPow);\n"
+    "        emission = mix(darkEm, vec3(0.495), brightT);\n"
+    "        transmittance = mix(darkTrans, 0.187, brightT);\n"
+    "        lift = mix(darkLift, 0.04, brightT);\n"
+    "        chromaGain = mix(darkChroma, 0.45, brightT);\n"
+    "        darkAdGlareW = (1.0 - brightT) * (1.0 - extra);\n"
     "        contourStr = 0.88; contourDirAmt = 1.0; bevelShadowStr = 0.036;\n"
     "        glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
     "      } else {\n"
@@ -904,6 +964,22 @@ static const char *FS =
     "    float darkKS = pow(kDenom, -0.075);\n"
     "    float kneeScale = 1.0 + (darkKS - 1.0) * darkKneeW + (dInv - 1.0) * lightKneeW;\n"
     "    vec3 chromaVec = (refractColor - vec3(Y)) * (chromaGain * v_p.z * kneeScale);\n"
+    "    if (darkAdGlareW > 0.001) {\n"
+    "      if (baseLum > 0.18) {\n"
+    "        float over = baseLum - 0.18;\n"
+    "        float capped = 0.18 + 0.115 * (over / (over + 0.115));\n"
+    "        float newLum = mix(baseLum, capped, darkAdGlareW);\n"
+    "        chromaVec *= (newLum / max(baseLum, 0.0001));\n"
+    "        baseLum = newLum;\n"
+    "      }\n"
+    "      vec3 testRaw = emission + vec3(baseLum) + chromaVec;\n"
+    "      float peak = max(testRaw.r, max(testRaw.g, testRaw.b));\n"
+    "      if (peak > 0.44) {\n"
+    "        float lum0 = luma(emission) + baseLum;\n"
+    "        float s = clamp((0.44 - lum0) / max(peak - lum0, 0.0001), 0.0, 1.0);\n"
+    "        chromaVec *= mix(1.0, s, darkAdGlareW);\n"
+    "      }\n"
+    "    }\n"
     "    vec3 transmittedColor = vec3(baseLum) + chromaVec;\n"
     "    vec3 rawBase = emission + transmittedColor;\n"
     "    // Exact Wave 3 legacy mapping for zero-veil lenses (col.a == 0); channel-clamped saturation for Clear glass\n"
@@ -1620,9 +1696,16 @@ static const char *AD_FS =
     "  float prevT = mb_unpack16(prev.rg);\n"
     "  float is_dark = u_param.x, is_new = u_param.y, dt = u_param.z;\n"
     "  float latch, target;\n"
-    "  if (is_dark > 0.5) {\n"
-    "    target = smoothstep(0.35, 0.85, bgL);\n"
-    "    latch = target;\n"
+    "  if (is_dark > 1.5) {\n"
+    "    target = 0.0;\n"
+    "    latch = 64.0 / 255.0;\n"
+    "  } else if (is_dark > 0.5) {\n"
+    "    int code = int(floor(clamp(prev.b, 0.0, 1.0) * 255.0 + 0.5));\n"
+    "    bool had_dark = (is_new <= 0.5) && (code >= 48 && code <= 208);\n"
+    "    bool prev_on = had_dark && (code >= 96);\n"
+    "    bool on = prev_on ? (bgL > 0.20) : (bgL >= 0.26);\n"
+    "    target = on ? 1.0 : 0.0;\n"
+    "    latch = on ? (128.0 / 255.0) : (64.0 / 255.0);\n"
     "  } else {\n"
     "    if (is_new > 0.5) latch = (bgL < 0.14) ? 1.0 : 0.0;\n"
     "    else if (prev.b > 0.5) latch = (bgL > 0.21) ? 0.0 : 1.0;\n"
@@ -2666,26 +2749,35 @@ static int grab_of(Grab *m, const float *f, int32_t start, int32_t end, int32_t 
     if (bx1 > x1) x1 = bx1;
     if (by1 > y1) y1 = by1;
   }
-  if (kind == 5 || unmerged_liquid) {
-    for (int32_t i = end; i < count; i++) {
-      const float *b = f + i * MB_INST;
-      int bk = (int)(b[5] + 0.5f);
-      if ((bk == 5 || bk == 6) && b[20] < 0.0f && b[20] != a[20]) break;
-      if (bk == 7 && b[23] < 0.0f) {
-        float hr = -b[23] * 0.5f;
-        if (b[21] - hr < x0) x0 = b[21] - hr;
-        if (b[22] - hr < y0) y0 = b[22] - hr;
-        if (b[21] + hr > x1) x1 = b[21] + hr;
-        if (b[22] + hr > y1) y1 = b[22] + hr;
+  float cap_x0 = x0, cap_y0 = y0, cap_x1 = x1, cap_y1 = y1;
+  for (int32_t i = end; i < count; i++) {
+    const float *b = f + i * MB_INST;
+    int bk = (int)(b[5] + 0.5f);
+    if ((bk == 5 || bk == 6) && b[20] < 0.0f && b[20] != a[20]) break;
+    if ((bk == 7 || bk == 10 || bk == 11) && b[23] < 0.0f) {
+      float cx, cy, hx, hy;
+      if (bk == 7) {
+        cx = b[0] + b[2] * 0.5f; cy = b[1] + b[3] * 0.5f;
+        hx = fmaxf(-b[23], b[2]); hy = fmaxf(fmaxf(-b[23] * 0.5f, b[3]), 1.0f);
+      } else if (bk == 10) {
+        cx = b[0] + b[2] * 0.5f; cy = b[1] + b[3] * 0.5f;
+        hx = hy = fmaxf(-b[23] * 0.5f, 1.0f);
+      } else {
+        cx = b[0] + b[2] * 0.5f + b[6]; cy = b[1] + b[3] * 0.5f + b[7];
+        hx = hy = fmaxf(-b[23] * 0.5f, 1.0f);
       }
+      if (cx - hx < cap_x0) cap_x0 = cx - hx;
+      if (cy - hy < cap_y0) cap_y0 = cy - hy;
+      if (cx + hx > cap_x1) cap_x1 = cx + hx;
+      if (cy + hy > cap_y1) cap_y1 = cy + hy;
     }
   }
   m->gb[0] = x0 - 2; m->gb[1] = y0 - 2; m->gb[2] = x1 + 2; m->gb[3] = y1 + 2;
   float sc = (float)cur_scale;
   // in the surface's pixels, from its foot (GL's way up)
   int top = vy0 + vhp;
-  int px0 = (int)floorf((x0 - margin) * sc), px1 = (int)ceilf((x1 + margin) * sc);
-  int pb0 = top - (int)ceilf((y1 + margin) * sc), pb1 = top - (int)floorf((y0 - margin) * sc);
+  int px0 = (int)floorf((cap_x0 - margin) * sc), px1 = (int)ceilf((cap_x1 + margin) * sc);
+  int pb0 = top - (int)ceilf((cap_y1 + margin) * sc), pb1 = top - (int)floorf((cap_y0 - margin) * sc);
   if (px0 < 0) px0 = 0;
   if (px1 > fb_w) px1 = fb_w;
   if (pb0 < vy0) pb0 = vy0;
@@ -2964,6 +3056,7 @@ typedef struct {
   int active;
   float cx, cy, hx, hy;
   int is_dark;
+  GLuint last_bd;
   double settle_left;
   uint64_t settle_serial;
   uint64_t updated_serial;
@@ -3095,7 +3188,8 @@ typedef struct {
 } gl_ad_pend;
 
 static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int32_t count, const Grab *m,
-                                int backdrop_changed, double dt, uint64_t serial, gl_ad_pend out[MB_ADAPTIVE_MAX]) {
+                                int backdrop_changed, GLuint cur_bd, double dt, uint64_t serial,
+                                gl_ad_pend out[MB_ADAPTIVE_MAX]) {
   (void)end;
   if (ad_mode <= 0 || dt < 0.0) return 0;
   const float *a = f + (size_t)start * MB_INST;
@@ -3113,7 +3207,7 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
       items[ni].cy = (m->gb[1] + m->gb[3]) * 0.5f;
       items[ni].hx = fmaxf((m->gb[2] - m->gb[0]) * 0.5f, 1.0f);
       items[ni].hy = fmaxf((m->gb[3] - m->gb[1]) * 0.5f, 1.0f);
-      items[ni].is_dark = (a[11] >= 0.05f && lum < 0.35f) ? 1 : 0;
+      items[ni].is_dark = (a[11] >= 0.05f && lum < 0.35f) ? (a[11] > 0.42f ? 2 : 1) : 0;
       ni++;
     }
   } else {
@@ -3130,18 +3224,19 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
       items[ni].cy = b[1] + b[3] * 0.5f;
       items[ni].hx = fmaxf(b[2] * 0.5f, 1.0f);
       items[ni].hy = fmaxf(b[3] * 0.5f, 1.0f);
-      items[ni].is_dark = (b[11] >= 0.05f && lum < 0.35f) ? 1 : 0;
+      items[ni].is_dark = (b[11] >= 0.05f && lum < 0.35f) ? (b[11] > 0.42f ? 2 : 1) : 0;
       ni++;
     }
   }
   int n_upd = 0;
   for (int k = 0; k < ni; k++) {
-    int sid = -1, is_new = 0;
+    int sid = -1, is_new = 0, mode_changed = 0;
     for (int i = 0; i < MB_ADAPTIVE_MAX; i++) {
       mb_ad_slot *s = &ad_slots[i];
-      if (s->active && s->seen_serial == serial && s->is_dark == items[k].is_dark &&
+      if (s->active && s->seen_serial == serial && ((s->is_dark > 0) == (items[k].is_dark > 0)) &&
           hypotf(items[k].cx - s->cx, items[k].cy - s->cy) <= 2.0f) {
         sid = i;
+        if (s->is_dark != items[k].is_dark) { s->is_dark = items[k].is_dark; mode_changed = 1; }
         break;
       }
     }
@@ -3149,7 +3244,7 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
       float best_d = (float)MB_AD_MATCH_DIST + 1e-3f;
       for (int i = 0; i < MB_ADAPTIVE_MAX; i++) {
         mb_ad_slot *s = &ad_slots[i];
-        if (!s->active || s->seen_serial == serial || s->is_dark != items[k].is_dark) continue;
+        if (!s->active || s->seen_serial == serial || ((s->is_dark > 0) != (items[k].is_dark > 0))) continue;
         float d = hypotf(items[k].cx - s->cx, items[k].cy - s->cy);
         if (d <= best_d) { best_d = d; sid = i; }
       }
@@ -3171,6 +3266,9 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
         memset(&ad_slots[sid], 0, sizeof ad_slots[sid]);
         ad_slots[sid].active = 1;
         ad_slots[sid].is_dark = items[k].is_dark;
+      } else if (ad_slots[sid].is_dark != items[k].is_dark) {
+        ad_slots[sid].is_dark = items[k].is_dark;
+        mode_changed = 1;
       }
       ad_slots[sid].cx = items[k].cx;
       ad_slots[sid].cy = items[k].cy;
@@ -3179,22 +3277,24 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
       ad_slots[sid].seen_serial = serial;
     }
     mb_ad_slot *s = &ad_slots[sid];
-    if (!is_new && s->updated_serial == serial) continue;
-    if (!is_new && !backdrop_changed && s->settle_left > 0.0 && ad_conv_serial[sid] >= s->settle_serial) {
+    if (!is_new && !mode_changed && s->updated_serial == serial) continue;
+    int slot_changed = backdrop_changed || mode_changed || (s->last_bd != cur_bd);
+    if (!is_new && !slot_changed && s->settle_left > 0.0 && ad_conv_serial[sid] >= s->settle_serial) {
       s->settle_left = 0.0;
     }
-    int need = is_new || backdrop_changed || s->settle_left > 0.0;
+    int need = is_new || slot_changed || s->settle_left > 0.0;
     if (need) {
       if (is_new) {
         s->settle_left = 0.0;
         s->settle_serial = serial;
-      } else if (backdrop_changed) {
+      } else if (slot_changed) {
         s->settle_left = MB_AD_SETTLE_SEC;
         s->settle_serial = serial;
       } else {
         s->settle_left -= dt;
         if (s->settle_left <= 0.0) s->settle_left = 0.0;
       }
+      s->last_bd = cur_bd;
       s->updated_serial = serial;
       out[n_upd++] = (gl_ad_pend){sid, is_new, s->is_dark, s->cx, s->cy, s->hx, s->hy};
     }
@@ -3501,7 +3601,7 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
       float tid = bi[20];
       int k = (int)(bi[5] + 0.5f);
       int is_glass = tid < 0.0f;
-      int is_ad = k == 7 || ((k == 10 || k == 11) && bi[23] > 0.0f);
+      int is_ad = k == 7 || ((k == 10 || k == 11) && bi[23] != 0.0f);
       if (!is_glass && !is_ad) continue;
       int32_t run = i;
       if (is_glass) {
@@ -3559,9 +3659,24 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
           if (ey1 > dep[3]) { dep[3] = ey1; grew = 1; }
         }
       } else {
-        float rad = fabsf(bi[23]) + 4.0f;
-        float ex0 = bi[21] - rad, ey0 = bi[22] - rad;
-        float ex1 = bi[21] + rad, ey1 = bi[22] + rad;
+        float ex0, ey0, ex1, ey1;
+        if (bi[23] < 0.0f) {
+          float cx, cy, hx, hy;
+          if (k == 7) {
+            cx = bi[0] + bi[2] * 0.5f; cy = bi[1] + bi[3] * 0.5f;
+            hx = fmaxf(-bi[23], bi[2]) + 4.0f; hy = fmaxf(fmaxf(-bi[23] * 0.5f, bi[3]), 1.0f) + 4.0f;
+          } else if (k == 10) {
+            cx = bi[0] + bi[2] * 0.5f; cy = bi[1] + bi[3] * 0.5f;
+            hx = hy = fmaxf(-bi[23] * 0.5f, 1.0f) + 4.0f;
+          } else {
+            cx = bi[0] + bi[2] * 0.5f + bi[6]; cy = bi[1] + bi[3] * 0.5f + bi[7];
+            hx = hy = fmaxf(-bi[23] * 0.5f, 1.0f) + 4.0f;
+          }
+          ex0 = cx - hx; ey0 = cy - hy; ex1 = cx + hx; ey1 = cy + hy;
+        } else {
+          float rad = fabsf(bi[23]) + 4.0f;
+          ex0 = bi[21] - rad; ey0 = bi[22] - rad; ex1 = bi[21] + rad; ey1 = bi[22] + rad;
+        }
         if (ex0 < dep[0]) { dep[0] = ex0; grew = 1; }
         if (ey0 < dep[1]) { dep[1] = ey0; grew = 1; }
         if (ex1 > dep[2]) { dep[2] = ex1; grew = 1; }
@@ -3791,7 +3906,7 @@ static int capture(const float *f, int32_t start, int32_t end, int32_t count, in
     kept_ok = s->valid;
     slot_show(&m, s);
     gl_ad_pend ad_pend[MB_ADAPTIVE_MAX];
-    int ad_n_upd = ad_collect_and_match(f, start, end, count, &m, reblurred, ad_cur_dt, ad_frame_serial, ad_pend);
+    int ad_n_upd = ad_collect_and_match(f, start, end, count, &m, reblurred, s->bt, ad_cur_dt, ad_frame_serial, ad_pend);
     if (ad_n_upd > 0) {
       switched = 1;
       ad_run_updates(ad_pend, ad_n_upd, ad_cur_dt);
@@ -4358,7 +4473,7 @@ static void draw_into_rects(GLuint fb, const int (*rects)[4], int n_rects) {
                     }
                     if (skind == 6 && pre_n < MB_ADAPTIVE_MAX) {
                       gl_ad_pend tmp[MB_ADAPTIVE_MAX];
-                      int nu = ad_collect_and_match(fbuf, s0, e0, count, &gm, 0, ad_cur_dt, ad_frame_serial, tmp);
+                      int nu = ad_collect_and_match(fbuf, s0, e0, count, &gm, 0, sl->bt, ad_cur_dt, ad_frame_serial, tmp);
                       if (nu > 0) {
                         float map[4], uvc[4];
                         grab_map_uvc(&gm, sl->bw, sl->bh, map, uvc);

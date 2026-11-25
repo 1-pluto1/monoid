@@ -508,7 +508,7 @@
     float lo = floor(clamp(rg.y, 0.0, 1.0) * 255.0 + 0.5);
     return (hi * 256.0 + lo) / 65535.0;
   }
-  vec2 vs_ad_sample_ink(vec2 ac, float fallback_r, out vec2 capCenter, out vec2 capHalf) {
+  vec3 vs_ad_sample_ink(vec2 ac, float fallback_r, out vec2 capCenter, out vec2 capHalf) {
     if (u_ad_n > 0) {
       int best = -1;
       float best_d = 1e9;
@@ -532,41 +532,59 @@
         vec4 px = texelFetch(u_ad, ivec2(best, 0), 0);
         capCenter = u_ad_box[best].xy;
         capHalf = u_ad_box[best].zw;
-        return vec2(vs_unpack16(px.rg), px.a);
+        return vec3(vs_unpack16(px.rg), px.a, px.b);
       }
     }
     capCenter = ac;
     capHalf = vec2(0.0);
     float bgL = vs_backdrop_luma_rect(ac, vec2(max(fallback_r, 1.0)));
-    return vec2(1.0 - smoothstep(0.12, 0.21, bgL), bgL);
+    return vec3(1.0 - smoothstep(0.12, 0.21, bgL), bgL, 0.0);
   }
   float vs_srgb_to_lin(float c) {
     return c <= 0.04045 ? (c / 12.92) : pow(max((c + 0.055) / 1.055, 0.0), 2.4);
+  }
+  float vs_wcag_luma(vec3 c) {
+    return 0.2126 * vs_srgb_to_lin(c.r) + 0.7152 * vs_srgb_to_lin(c.g) + 0.0722 * vs_srgb_to_lin(c.b);
+  }
+  float vs_backdrop_wcag_luma_rect(vec2 c, vec2 h) {
+    float sum = 0.0;
+    float mx1 = -1.0, mx2 = -1.0;
+    float mn1 = 2.0, mn2 = 2.0;
+    for (int iy = -1; iy <= 1; iy++) {
+      float py = c.y + float(iy) * (h.y * 0.60);
+      for (int ix = -2; ix <= 2; ix++) {
+        float px = c.x + float(ix) * (h.x * 0.38);
+        float y = vs_wcag_luma(vs_backdrop(vec2(px, py)));
+        sum += y;
+        if (y > mx1) { mx2 = mx1; mx1 = y; } else if (y > mx2) { mx2 = y; }
+        if (y < mn1) { mn2 = mn1; mn1 = y; } else if (y < mn2) { mn2 = y; }
+      }
+    }
+    return (sum - mx1 - mx2 - mn1 - mn2) / 11.0;
   }
   float vs_lin_to_srgb(float y) {
     y = clamp(y, 0.0, 1.0);
     return y <= 0.0031308 ? (12.92 * y) : (1.055 * pow(max(y, 0.0), 1.0 / 2.4) - 0.055);
   }
-  vec3 vs_bare_adaptive_ink_at(vec3 rgb, vec2 ac, float hr) {
+  vec3 vs_bare_adaptive_ink_at(vec3 rgb, vec2 ac, vec2 h) {
     float ch = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);
     if (ch > 0.08) return rgb;
     float origL = vs_luma(rgb);
-    float bgL = vs_backdrop_luma_rect(ac, vec2(max(hr, 1.0)));
-    float c_bg = sqrt(max(bgL, 0.0));
-    float Lbg = vs_srgb_to_lin(c_bg);
+    float origY = vs_wcag_luma(rgb);
+    float Lbg = vs_backdrop_wcag_luma_rect(ac, max(h, vec2(1.0)));
     float target = 4.65;
     float out_c;
     if (Lbg >= 0.1792) {
       float pref = origL < 0.5 ? origL : clamp(1.0 - origL, 0.02, 0.45);
-      float y_pref = vs_srgb_to_lin(pref);
+      float y_pref = origL < 0.5 ? origY : vs_srgb_to_lin(pref);
       float y_max = max(0.0, (Lbg + 0.05) / target - 0.05);
-      if (origL < 0.5 && y_pref <= y_max) return rgb;
+      if (origL < 0.5 && origY <= y_max) return rgb;
       out_c = vs_lin_to_srgb(min(y_pref, y_max));
     } else {
       float pref = origL >= 0.5 ? origL : clamp(1.06 - origL, 0.55, 0.98);
-      float y_pref = vs_srgb_to_lin(pref);
+      float y_pref = origL >= 0.5 ? origY : vs_srgb_to_lin(pref);
       float y_min = min(1.0, target * (Lbg + 0.05) - 0.05);
-      if (origL >= 0.5 && y_pref >= y_min) return rgb;
+      if (origL >= 0.5 && origY >= y_min) return rgb;
       out_c = vs_lin_to_srgb(max(y_pref, y_min));
     }
     return vec3(out_c);
@@ -574,11 +592,41 @@
   vec3 vs_adaptive_ink_at(vec3 rgb, vec2 ac, float fallback_r, vec4 rect, vec2 sample_off, bool is_icon) {
     float ch = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);
     float origL = vs_luma(rgb);
-    if (ch > 0.08 || origL >= 0.5) return rgb;
+    if (ch > 0.08) return rgb;
     vec2 capCenter, capHalf;
-    vec2 cap = vs_ad_sample_ink(ac, fallback_r, capCenter, capHalf);
+    vec3 cap = vs_ad_sample_ink(ac, fallback_r, capCenter, capHalf);
     float capsuleDarkT = cap.x;
     float capsuleBgL = cap.y;
+    float capsuleLatch = cap.z;
+    if (origL >= 0.5) {
+      if (capHalf.x <= 0.0) return rgb;
+      int code = int(floor(clamp(capsuleLatch, 0.0, 1.0) * 255.0 + 0.5));
+      if (code < 48 || code > 208) return rgb;
+      if (code >= 96) {
+        float darkL = clamp(1.0 - origL, 0.06, 0.10);
+        return vec3(darkL);
+      }
+      float bgL = capsuleBgL;
+      if (origL < 0.94 && u_uvc.z > u_uvc.x && u_uvc.w > u_uvc.y) {
+        vec2 samplePos = rect.xy + rect.zw * 0.5 + sample_off;
+        float stepX = is_icon ? 4.0 : 8.0;
+        int halfN = is_icon ? 2 : 12;
+        for (int iy = -1; iy <= 1; iy++) {
+          float py = clamp(samplePos.y + float(iy) * 5.0, capCenter.y - capHalf.y, capCenter.y + capHalf.y);
+          for (int ix = -12; ix <= 12; ix++) {
+            float px = samplePos.x + float(ix) * stepX;
+            if (abs(ix) <= halfN && px >= capCenter.x - capHalf.x && px <= capCenter.x + capHalf.x) {
+              vec2 guv = vec2(px, py) * u_map.xy + u_map.zw;
+              if (guv.x >= u_uvc.x && guv.x <= u_uvc.z && guv.y >= u_uvc.y && guv.y <= u_uvc.w) {
+                bgL = max(bgL, vs_ink_luma(vs_backdrop(vec2(px, py))));
+              }
+            }
+          }
+        }
+      }
+      float liftW = smoothstep(0.03, 0.08, bgL);
+      return mix(rgb, max(rgb, vec3(0.95)), liftW);
+    }
     float darkT = capsuleDarkT;
     float localBoost = 0.0;
     bool is_large = (capHalf.x >= 140.0 && capHalf.y >= 19.0);
@@ -639,10 +687,12 @@
     #if MB_VS_ADAPTIVE
     if (kind == 7) {
       v_color.rgb = a_pad.w < 0.0
-        ? vs_bare_adaptive_ink_at(a_color.rgb, a_pad.yz, -a_pad.w * 0.5)
+        ? vs_bare_adaptive_ink_at(a_color.rgb, a_rect.xy + a_rect.zw * 0.5, vec2(max(-a_pad.w, a_rect.z), max(max(-a_pad.w * 0.5, a_rect.w), 1.0)))
         : vs_adaptive_ink_at(a_color.rgb, a_pad.yz, a_pad.w * 0.5, a_rect, a_p.zw, false);
-    } else if ((kind == 10 || kind == 11) && a_pad.w > 0.0) {
-      v_color.rgb = vs_adaptive_ink_at(a_color.rgb, a_pad.yz, a_pad.w * 0.5, a_rect, kind == 10 ? vec2(0.0) : a_p.zw, true);
+    } else if ((kind == 10 || kind == 11) && a_pad.w != 0.0) {
+      v_color.rgb = a_pad.w < 0.0
+        ? vs_bare_adaptive_ink_at(a_color.rgb, kind == 10 ? (a_rect.xy + a_rect.zw * 0.5) : (a_rect.xy + a_rect.zw * 0.5 + a_p.zw), vec2(max(-a_pad.w * 0.5, 1.0)))
+        : vs_adaptive_ink_at(a_color.rgb, a_pad.yz, a_pad.w * 0.5, a_rect, kind == 10 ? vec2(0.0) : a_p.zw, true);
     } else if (kind == 0 && a_pad.w < 0.0) {
       float ch = max(max(a_color.r, a_color.g), a_color.b) - min(min(a_color.r, a_color.g), a_color.b);
       vec2 capCenter, capHalf;
@@ -1152,11 +1202,16 @@
         }
       }
       if (best >= 0) {
-        return mb_unpack16(texelFetch(u_ad, ivec2(best, 0), 0).rg);
+        vec4 px = texelFetch(u_ad, ivec2(best, 0), 0);
+        if (is_dark_glass) {
+          int code = int(floor(clamp(px.b, 0.0, 1.0) * 255.0 + 0.5));
+          if (code >= 48 && code <= 208) return (code >= 96) ? 1.0 : 0.0;
+        }
+        return mb_unpack16(px.rg);
       }
     }
     float bgL = mb_backdrop_luma_rect(ac, vec2(max(fallback_r, 1.0)));
-    return is_dark_glass ? smoothstep(0.35, 0.85, bgL) : (1.0 - smoothstep(0.12, 0.21, bgL));
+    return is_dark_glass ? smoothstep(0.20, 0.26, bgL) : (1.0 - smoothstep(0.12, 0.21, bgL));
   }
   #endif
   // how much of the pixel at p its rounded clip keeps (r: the corners' radii, top left, then clockwise; s: how smooth
@@ -1453,6 +1508,7 @@
       float glintFaceGain;
       float glintVib;
       float fogT = 0.0;
+      float darkAdGlareW = 0.0;
       float darkMixSaved = 0.0;
       float regExtra = 0.0;
       if (is_clear) {
@@ -1480,18 +1536,22 @@
         float val = ad_sample(ac, ar, is_dark);
         float baseDens = mix(0.404, col.a, smoothstep(0.405, 0.46, col.a));
         if (is_dark) {
-          float brightT = val * solidFade;
+          float extra = clamp((baseDens - 0.404) / (1.0 - 0.404), 0.0, 1.0);
+          float brightT = val * solidFade * (1.0 - extra);
           fogT = brightT;
-          float dens = max(baseDens, mix(baseDens, 0.45, brightT));
-          float extra = clamp((dens - 0.404) / (1.0 - 0.404), 0.0, 1.0);
           regExtra = extra;
           float darkPow = pow(extra, 1.00);
           float darkCPow = pow(extra, 1.05);
           float darkBump = 3.5 * smoothstep(0.0, 0.16, extra) * (1.0 - smoothstep(0.22, 0.38, extra));
-          emission = mix(vec3((34.0 + darkBump) / 255.0), col.rgb, pow(extra, 1.5));
-          transmittance = mix(0.59, 0.0, darkPow);
-          lift = mix(0.55, 0.0, extra);
-          chromaGain = mix(1.05, 0.0, darkCPow);
+          vec3 darkEm = mix(vec3((34.0 + darkBump) / 255.0), col.rgb, pow(extra, 1.5));
+          float darkTrans = mix(0.59, 0.0, darkPow);
+          float darkLift = mix(0.55, 0.0, extra);
+          float darkChroma = mix(1.05, 0.0, darkCPow);
+          emission = mix(darkEm, vec3(0.495), brightT);
+          transmittance = mix(darkTrans, 0.187, brightT);
+          lift = mix(darkLift, 0.04, brightT);
+          chromaGain = mix(darkChroma, 0.45, brightT);
+          darkAdGlareW = (1.0 - brightT) * (1.0 - extra);
           contourStr = 0.88; contourDirAmt = 1.0; bevelShadowStr = 0.036;
           glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;
         } else {
@@ -1598,6 +1658,22 @@
       float darkKS = pow(kDenom, -0.075);
       float kneeScale = 1.0 + (darkKS - 1.0) * darkKneeW + (dInv - 1.0) * lightKneeW;
       vec3 chromaVec = (refractColor - vec3(Y)) * (chromaGain * v_p.z * kneeScale);
+      if (darkAdGlareW > 0.001) {
+        if (baseLum > 0.18) {
+          float over = baseLum - 0.18;
+          float capped = 0.18 + 0.115 * (over / (over + 0.115));
+          float newLum = mix(baseLum, capped, darkAdGlareW);
+          chromaVec *= (newLum / max(baseLum, 0.0001));
+          baseLum = newLum;
+        }
+        vec3 testRaw = emission + vec3(baseLum) + chromaVec;
+        float peak = max(testRaw.r, max(testRaw.g, testRaw.b));
+        if (peak > 0.44) {
+          float lum0 = luma(emission) + baseLum;
+          float s = clamp((0.44 - lum0) / max(peak - lum0, 0.0001), 0.0, 1.0);
+          chromaVec *= mix(1.0, s, darkAdGlareW);
+        }
+      }
       vec3 transmittedColor = vec3(baseLum) + chromaVec;
       vec3 rawBase = emission + transmittedColor;
       // Exact Wave 3 legacy mapping for zero-veil lenses (col.a == 0); channel-clamped saturation for Clear glass
@@ -2303,9 +2379,16 @@
     float prevT = mb_unpack16(prev.rg);
     float is_dark = u_param.x, is_new = u_param.y, dt = u_param.z;
     float latch, target;
-    if (is_dark > 0.5) {
-      target = smoothstep(0.35, 0.85, bgL);
-      latch = target;
+    if (is_dark > 1.5) {
+      target = 0.0;
+      latch = 64.0 / 255.0;
+    } else if (is_dark > 0.5) {
+      int code = int(floor(clamp(prev.b, 0.0, 1.0) * 255.0 + 0.5));
+      bool had_dark = (is_new <= 0.5) && (code >= 48 && code <= 208);
+      bool prev_on = had_dark && (code >= 96);
+      bool on = prev_on ? (bgL > 0.20) : (bgL >= 0.26);
+      target = on ? 1.0 : 0.0;
+      latch = on ? (128.0 / 255.0) : (64.0 / 255.0);
     } else {
       if (is_new > 0.5) latch = (bgL < 0.14) ? 1.0 : 0.0;
       else if (prev.b > 0.5) latch = (bgL > 0.21) ? 0.0 : 1.0;
@@ -2561,7 +2644,7 @@
     }
     gadN = maxA;
   }
-  function adCollectAndMatch(start, count, m, backdropChanged, dt, serial) {
+  function adCollectAndMatch(start, count, m, backdropChanged, curBd, dt, serial) {
     if (adMode <= 0 || dt < 0) return [];
     const a = start * INST;
     const kind = Math.round(f32[a + 5]);
@@ -2576,7 +2659,7 @@
         items.push({
           cx: (m.gb[0] + m.gb[2]) * 0.5, cy: (m.gb[1] + m.gb[3]) * 0.5,
           hx: Math.max((m.gb[2] - m.gb[0]) * 0.5, 1.0), hy: Math.max((m.gb[3] - m.gb[1]) * 0.5, 1.0),
-          isDark: (f32[a + 11] >= 0.05 && lum < 0.35) ? 1 : 0,
+          isDark: (f32[a + 11] >= 0.05 && lum < 0.35) ? (f32[a + 11] > 0.42 ? 2 : 1) : 0,
         });
       }
     } else {
@@ -2592,24 +2675,26 @@
         items.push({
           cx: f32[b] + f32[b + 2] * 0.5, cy: f32[b + 1] + f32[b + 3] * 0.5,
           hx: Math.max(f32[b + 2] * 0.5, 1.0), hy: Math.max(f32[b + 3] * 0.5, 1.0),
-          isDark: (f32[b + 11] >= 0.05 && lum < 0.35) ? 1 : 0,
+          isDark: (f32[b + 11] >= 0.05 && lum < 0.35) ? (f32[b + 11] > 0.42 ? 2 : 1) : 0,
         });
       }
     }
     const pend = [];
     for (const it of items) {
-      let sid = -1, isNew = 0;
+      let sid = -1, isNew = 0, modeChanged = false;
       for (let i = 0; i < AD_MAX; i++) {
         const s = adSlots[i];
-        if (s.active && s.seenSerial === serial && s.isDark === it.isDark && Math.hypot(it.cx - s.cx, it.cy - s.cy) <= 2.0) {
-          sid = i; break;
+        if (s.active && s.seenSerial === serial && ((s.isDark > 0) === (it.isDark > 0)) && Math.hypot(it.cx - s.cx, it.cy - s.cy) <= 2.0) {
+          sid = i;
+          if (s.isDark !== it.isDark) { s.isDark = it.isDark; modeChanged = true; }
+          break;
         }
       }
       if (sid < 0) {
         let bestD = AD_MATCH_DIST + 1e-3;
         for (let i = 0; i < AD_MAX; i++) {
           const s = adSlots[i];
-          if (!s.active || s.seenSerial === serial || s.isDark !== it.isDark) continue;
+          if (!s.active || s.seenSerial === serial || ((s.isDark > 0) !== (it.isDark > 0))) continue;
           const d = Math.hypot(it.cx - s.cx, it.cy - s.cy);
           if (d <= bestD) { bestD = d; sid = i; }
         }
@@ -2626,17 +2711,22 @@
           }
           isNew = 1;
           const s = adSlots[sid];
-          s.active = true; s.isDark = it.isDark; s.settleLeft = 0; s.updatedSerial = 0;
+          s.active = true; s.isDark = it.isDark; s.lastBd = null; s.settleLeft = 0; s.updatedSerial = 0;
+        } else if (adSlots[sid].isDark !== it.isDark) {
+          adSlots[sid].isDark = it.isDark;
+          modeChanged = true;
         }
         const s = adSlots[sid];
         s.cx = it.cx; s.cy = it.cy; s.hx = it.hx; s.hy = it.hy; s.seenSerial = serial;
       }
       const s = adSlots[sid];
-      if (!isNew && s.updatedSerial === serial) continue;
-      if (isNew || backdropChanged || s.settleLeft > 0) {
+      if (!isNew && !modeChanged && s.updatedSerial === serial) continue;
+      const slotChanged = backdropChanged || modeChanged || (s.lastBd !== curBd);
+      if (isNew || slotChanged || s.settleLeft > 0) {
         if (isNew) s.settleLeft = 0;
-        else if (backdropChanged) s.settleLeft = AD_SETTLE_SEC;
+        else if (slotChanged) s.settleLeft = AD_SETTLE_SEC;
         else s.settleLeft = Math.max(0, s.settleLeft - dt);
+        s.lastBd = curBd;
         s.updatedSerial = serial;
         pend.push({ sid, isNew, isDark: s.isDark, cx: s.cx, cy: s.cy, hx: s.hx, hy: s.hy });
       }
@@ -2947,22 +3037,31 @@
         x1 = Math.max(x1, Math.min(f32[b] + f32[b + 2], f32[b + 18])); y1 = Math.max(y1, Math.min(f32[b + 1] + f32[b + 3], f32[b + 19]));
       }
     }
-    if (kind === 5 || unmergedLiquid) {
-      for (let i = end; i < count; i++) {
-        const b = i * INST;
-        const bk = Math.round(f32[b + 5]);
-        if ((bk === 5 || bk === 6) && f32[b + 20] < 0 && f32[b + 20] !== f32[a + 20]) break;
-        if (bk === 7 && f32[b + 23] < 0) {
-          const hr = -f32[b + 23] * 0.5;
-          x0 = Math.min(x0, f32[b + 21] - hr); y0 = Math.min(y0, f32[b + 22] - hr);
-          x1 = Math.max(x1, f32[b + 21] + hr); y1 = Math.max(y1, f32[b + 22] + hr);
+    let capX0 = x0, capY0 = y0, capX1 = x1, capY1 = y1;
+    for (let i = end; i < count; i++) {
+      const b = i * INST;
+      const bk = Math.round(f32[b + 5]);
+      if ((bk === 5 || bk === 6) && f32[b + 20] < 0 && f32[b + 20] !== f32[a + 20]) break;
+      if ((bk === 7 || bk === 10 || bk === 11) && f32[b + 23] < 0) {
+        let cx, cy, hx, hy;
+        if (bk === 7) {
+          cx = f32[b] + f32[b + 2] * 0.5; cy = f32[b + 1] + f32[b + 3] * 0.5;
+          hx = Math.max(-f32[b + 23], f32[b + 2]); hy = Math.max(Math.max(-f32[b + 23] * 0.5, f32[b + 3]), 1.0);
+        } else if (bk === 10) {
+          cx = f32[b] + f32[b + 2] * 0.5; cy = f32[b + 1] + f32[b + 3] * 0.5;
+          hx = hy = Math.max(-f32[b + 23] * 0.5, 1.0);
+        } else {
+          cx = f32[b] + f32[b + 2] * 0.5 + f32[b + 6]; cy = f32[b + 1] + f32[b + 3] * 0.5 + f32[b + 7];
+          hx = hy = Math.max(-f32[b + 23] * 0.5, 1.0);
         }
+        capX0 = Math.min(capX0, cx - hx); capY0 = Math.min(capY0, cy - hy);
+        capX1 = Math.max(capX1, cx + hx); capY1 = Math.max(capY1, cy + hy);
       }
     }
     const W = canvas.width, Hh = canvas.height, sc = dpr;
     // in the canvas's pixels, from its foot (GL's way up)
-    const px0 = Math.max(0, Math.floor((x0 - margin) * sc)), px1 = Math.min(W, Math.ceil((x1 + margin) * sc));
-    const pb0 = Math.max(0, Hh - Math.ceil((y1 + margin) * sc)), pb1 = Math.min(Hh, Hh - Math.floor((y0 - margin) * sc));
+    const px0 = Math.max(0, Math.floor((capX0 - margin) * sc)), px1 = Math.min(W, Math.ceil((capX1 + margin) * sc));
+    const pb0 = Math.max(0, Hh - Math.ceil((capY1 + margin) * sc)), pb1 = Math.min(Hh, Hh - Math.floor((capY0 - margin) * sc));
     if (px1 <= px0 || pb1 <= pb0 || x1 <= x0 || y1 <= y0) return null;
     // (a capture outside the part drawn: neither copied nor drawn. One that meets it is in it whole: @damage)
     if (cutOn && (px1 <= cut[0] || cut[0] + cut[2] <= px0 || pb1 <= cut[1] || cut[1] + cut[3] <= pb0)) return null;
@@ -3211,7 +3310,7 @@
       const tid = f32[i * INST + 20];
       if (i > 0 && tid !== f32[(i - 1) * INST + 20]) run = i;
       const k = Math.round(f32[i * INST + 5]);
-      const sees = tid < 0 || k === 7 || ((k === 10 || k === 11) && f32[i * INST + 23] > 0);
+      const sees = tid < 0 || k === 7 || ((k === 10 || k === 11) && f32[i * INST + 23] !== 0);
       if (sees && reaches(i, run, g)) whole = i + 1;
     }
     const maxNeed = (start + (count - pieces)) * INST;
@@ -3356,7 +3455,7 @@
       if (known && !drewMissing && canKeep) slotKeep(s, m, key);
     }
     slotShow(m, s);
-    const adPend = adCollectAndMatch(start, count, m, reblurred, adCurDt, adFrameSerial);
+    const adPend = adCollectAndMatch(start, count, m, reblurred, bdTex, adCurDt, adFrameSerial);
     if (adPend.length) adRunUpdates(adPend, adCurDt);
     adFillUniforms();
     mainState();

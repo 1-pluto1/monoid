@@ -10,11 +10,12 @@ let cover_mouse_hold_ms : Double = 500.0
 let cover_drag_step_ms : Double = 16.0
 
 ///|
-fn composer_cover_tester(
+fn composer_cover_tester_src(
   pointing? : @ui.Pointing = Mouse,
   platform? : Int = 0,
   over_tall? : Double = 0.0,
-) -> @ui.Tester {
+  h? : Double = 500.0,
+) -> (@ui.Tester, Source) {
   new_run()
   let src = fixture("chat")
   let r : ChatRef = { station: "ws1/st1", session: "s-c1", title: "整理发布清单", station_name: "Willow" }
@@ -31,7 +32,7 @@ fn composer_cover_tester(
       let popup = root.box(fn(v) { v.over(Is(true)) |> ignore })
       let tips = @sf.TipLayer::new(fn() { Some(popup) })
       root.box(fn(page) {
-        page.width(Is(Some(600.0))).height(Is(Some(500.0))) |> ignore
+        page.width(Is(Some(600.0))).height(Is(Some(h))) |> ignore
         @ui.words_picked(page)
         page.scrolls_window(
           @view.Scroll::new(),
@@ -73,14 +74,24 @@ fn composer_cover_tester(
       |> ignore
     },
     w=600.0,
-    h=500.0,
+    h~,
     platform~,
     pointing~,
   )
   t.draw()
   t.ctx().blur()
   t.run_for(@sfpages.let_go_ms + @ui.move_most_ms)
-  t
+  (t, src)
+}
+
+///|
+fn composer_cover_tester(
+  pointing? : @ui.Pointing = Mouse,
+  platform? : Int = 0,
+  over_tall? : Double = 0.0,
+  h? : Double = 500.0,
+) -> @ui.Tester {
+  composer_cover_tester_src(pointing~, platform~, over_tall~, h~).0
 }
 
 ///|
@@ -246,6 +257,79 @@ test "composer adaptive glass shows its backdrop fade only when expanded and kee
 }
 
 ///|
+test "tall multiline composer taller than the viewport stays covered to its bottom edge by its backdrop blur" {
+  let (t, src) = composer_cover_tester_src(h=600.0)
+  let (lx, ly) = composer_cover_line_hit(t)
+  t.tap(lx, ly)
+  t.run_for(@ui.move_most_ms)
+  assert_true(composer_focused())
+  // Reuses a kept 20-line (560-char) draft from src/sfkept so the test emits zero kept-answers-ask entries.
+  let buf = StringBuilder()
+  for _ in 0..<20 {
+    buf.write_string("这是一段很长的输入，需要在键盘弹出时仍能看到发送按钮。\n")
+  }
+  t.type_text(buf.to_string())
+  t.run_for(@ui.move_most_ms)
+  let draft = @sfbase.writing(src, "ws1/st1:s-c1")
+  for i in 0..<42 {
+    @sfbase.writing_quote(src, draft, {
+      "author": "Claude",
+      "text": "其余的行按估计的高度占位",
+      "ts": Json::string("ts\{i}"),
+    })
+    t.run_for(@ui.move_most_ms)
+  }
+  let (_, gy, _, gh) = composer_cover_glass_box(t)
+  guard composer_cover_backdrop(t) is [a, ..] else {
+    fail("expected backdrop blur behind tall multiline composer")
+  }
+  assert_true(gh > 2720.0, msg="expected unbounded tall composer (>2720pt), got \{gh}")
+  assert_true(gy < 0.0, msg="expected composer top above viewport (<0), got \{gy}")
+  assert_true(
+    a[1] + a[3] >= gy + gh,
+    msg="expected backdrop bottom (\{a[1] + a[3]}) >= composer bottom (\{gy + gh})",
+  )
+  assert_true(
+    a[1] + a[3] >= 600.0,
+    msg="expected backdrop bottom (\{a[1] + a[3]}) to reach viewport bottom (600)",
+  )
+  // Sending a tall multiline+quoted draft on keyboard/mouse must keep the blur covering the drawn glass bottom
+  // on the send frame, +16.7ms, and +50ms while sent_over animates the composer back down.
+  tap_send(t)
+  assert_eq(draft.quotes.get().length(), 0, msg="expected quotes cleared on send")
+  let check_send_cover = fn(label : String) raise {
+    let glasses = t.drawn_glass().filter(fn(g) { g.4 == 6 })
+    assert_true(glasses.length() > 0, msg="\{label}: expected drawn composer glass during tall send flight")
+    let mut drawn_bottom = glasses[0].1 + glasses[0].3
+    for g in glasses {
+      if g.1 + g.3 > drawn_bottom {
+        drawn_bottom = g.1 + g.3
+      }
+    }
+    guard composer_cover_backdrop(t) is [sa, ..] else {
+      fail("\{label}: expected backdrop blur during tall send flight")
+    }
+    assert_true(
+      sa[1] + sa[3] >= drawn_bottom,
+      msg="\{label}: expected backdrop bottom (\{sa[1] + sa[3]}) >= drawn glass bottom (\{drawn_bottom})",
+    )
+    assert_true(
+      sa[1] + sa[3] >= 600.0,
+      msg="\{label}: expected backdrop bottom (\{sa[1] + sa[3]}) >= viewport bottom (600)",
+    )
+  }
+  check_send_cover("send-0ms")
+  t.frame()
+  check_send_cover("send-16ms")
+  t.frame()
+  t.frame()
+  check_send_cover("send-50ms")
+  t.ctx().blur()
+  t.run_for(@sfpages.let_go_ms + @ui.move_most_ms)
+  assert_eq(composer_cover_backdrop(t).length(), 0, msg="expected backdrop gone once collapsed after send")
+}
+
+///|
 test "composer backdrop fade stays off when compact and tight above the composer when an over_it capsule row sits above it" {
   let t = composer_cover_tester(over_tall=36.0)
   assert_eq(composer_cover_backdrop(t).length(), 0, msg="expected no backdrop fade on compact capsule with over_it")
@@ -273,13 +357,29 @@ test "composer backdrop fade stays off when compact and tight above the composer
 test "the messages fade behind the composer only while the soft keyboard is up, eased in and out" {
   let t = composer_cover_tester(pointing=Finger, platform=2)
   assert_eq(composer_cover_backdrop(t).length(), 0, msg="none with the keyboard down")
-  assert_eq(
-    t.drawn_glass().filter(fn(g) { g.4 == 5 && g.1 > 100.0 }).length(),
-    0,
-    msg="expected zero bottom scroll-edge glass on single-line phone composer at rest",
-  )
+  let bottom_prog = fn() {
+    t.drawn_instances().filter(fn(a) { a.length() >= 56 && a[5] == 5.0 && a[1] > 100.0 && a[22] == -1.0 })
+  }
+  let check_single = fn(phase : String) raise {
+    let cur = bottom_prog()
+    assert_eq(cur.length(), 1, msg="\{phase}: expected strictly 1 bottom progressive blur, got \{cur.length()}")
+    assert_true(cur[0][15] > 0.99, msg="\{phase}: expected full alpha > 0.99, got \{cur[0][15]}")
+    assert_eq(cur[0][11], 0.0, msg="\{phase}: expected zero tint alpha")
+    assert_eq(cur[0][6], 1.0, msg="\{phase}: expected saturation 1.0")
+  }
+  check_single("closed")
   t.set_ime_inset(300.0)
+  t.frame()
+  check_single("ime-up-0ms")
+  t.run_for(@sfpages.composer_backdrop_in_ms / 2.0)
+  check_single("ime-up-mid")
+  let mid_up = bottom_prog()
+  assert_true(
+    mid_up[0][53] > 18.0 && mid_up[0][53] < 64.0,
+    msg="ime-up-mid: expected interpolated fade height in (18, 64), got \{mid_up[0][53]}",
+  )
   t.run_for(@ui.move_most_ms)
+  check_single("ime-up-end")
   let (_, gy, _, _) = composer_cover_glass_box(t)
   guard composer_cover_backdrop(t) is [a, ..] else {
     fail("no fade behind the composer with the keyboard up")
@@ -290,8 +390,18 @@ test "the messages fade behind the composer only while the soft keyboard is up, 
     msg="expected fade top ~16pt above composer with soft keyboard up (gy=\{gy}, fade_y=\{a[1]})",
   )
   t.set_ime_inset(0.0)
+  t.frame()
+  check_single("ime-down-0ms")
+  t.run_for(@sfpages.composer_backdrop_out_ms / 2.0)
+  check_single("ime-down-mid")
+  let mid_dn = bottom_prog()
+  assert_true(
+    mid_dn[0][53] > 18.0 && mid_dn[0][53] < 64.0,
+    msg="ime-down-mid: expected interpolated fade height in (18, 64), got \{mid_dn[0][53]}",
+  )
   t.run_for(@ui.move_most_ms)
   assert_eq(composer_cover_backdrop(t).length(), 0, msg="gone as the keyboard goes")
+  check_single("ime-down-end")
 }
 
 ///|

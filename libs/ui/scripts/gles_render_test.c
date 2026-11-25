@@ -120,6 +120,12 @@ static int failed;
 #define S 2
 
 // An instance: a rect at x, y, w × h of colour (r, g, b), kind `kind`, image `tid`, its clip the window's.
+static double wcag_luma_u8(int r, int g, int b) {
+  double c[3] = {r / 255.0, g / 255.0, b / 255.0};
+  for (int i = 0; i < 3; i++) c[i] = c[i] <= 0.04045 ? (c[i] / 12.92) : pow((c[i] + 0.055) / 1.055, 2.4);
+  return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+}
+
 static void rect_at(double *d, double x, double y, double w, double h, int kind, double r, double g, double b,
                     double tid) {
   memset(d, 0, MB_INST * sizeof(double));
@@ -1007,7 +1013,9 @@ int main(void) {
 
   // Wave 7: adaptive liquid glass (slot 14 = -1.0) + adaptive kind 10 neutral/chromatic ink:
   // 0: light glass over white (bg=1.0), 1: light glass over black (bg=0.0),
-  // 2: light glass over a linear ~50% mid-tone (bg=0.72), 3: dark glass (0x20202067) over white (bg=1.0).
+  // 2: light glass over a linear ~50% mid-tone (bg=0.72),
+  // 3: dark glass (0x20202067) over white (bg=1.0) -> smoked glass surface stays dark-tinted, while light ink
+  //    flips dark when composited backdrop luma >= 0.55 so contrast stays >= 3:1 (measured ~8.44:1).
   {
     double ad[4 * MB_INST];
     // 4: light glass over Apple blue #007AFF -> dark ink flips white (sRGB luma 0.414 sat on the dark edge;
@@ -1083,7 +1091,7 @@ int main(void) {
         CHECK(n_lum < 0.25);
       } else if (ci == 3) {
         CHECK(g_lum >= 0.55 && g_lum <= 0.78);
-        CHECK(n_lum > 0.85);
+        CHECK(n_lum < 0.25);
       } else if (ci == 4) {
         CHECK(g_lum > 0.55);
         CHECK(n_lum < 0.25);
@@ -2349,6 +2357,948 @@ int main(void) {
                cpx[cidx + 0], cpx[cidx + 1], cpx[cidx + 2], lum);
         CHECK(lum >= 0.90);
         free(cpx);
+      }
+      // Bare kind==10 (line) & kind==11 (shape bands with p.zw unified center) + kind==7 on #F00080 exact WCAG luma
+      {
+        struct { double r, g, b; const char *name; } bg_cases[4] = {
+          { 0.96, 0.96, 0.96, "light" },
+          { 0.12, 0.12, 0.12, "dark" },
+          { 0.50, 0.50, 0.50, "mid50" },
+          { 240.0 / 255.0, 0.0, 128.0 / 255.0, "#F00080" },
+        };
+        double inks[2] = { 0.11, 0.95 };
+        for (int bi_i = 0; bi_i < 4; bi_i++) {
+          double br = bg_cases[bi_i].r, bgc = bg_cases[bi_i].g, bb = bg_cases[bi_i].b;
+          double bg_lin = 0.2126 * (br <= 0.04045 ? br / 12.92 : pow((br + 0.055) / 1.055, 2.4))
+                        + 0.7152 * (bgc <= 0.04045 ? bgc / 12.92 : pow((bgc + 0.055) / 1.055, 2.4))
+                        + 0.0722 * (bb <= 0.04045 ? bb / 12.92 : pow((bb + 0.055) / 1.055, 2.4));
+          for (int ii = 0; ii < 2; ii++) {
+            double ink = inks[ii];
+            double sc[6 * MB_INST];
+            rect_at(sc, 0, 0, W, H, 0, br, bgc, bb, 0);
+            rect_at(sc + MB_INST, 0, 0, W, 68.0, 5, 1.0, 1.0, 1.0, -47);
+            sc[MB_INST + 6] = 1.0; sc[MB_INST + 7] = 8.5; sc[MB_INST + 11] = 0.0; sc[MB_INST + 15] = 1.0;
+            sc[MB_INST + 22] = -1.0; sc[MB_INST + 54] = 68.0; sc[MB_INST + 55] = 40.0;
+            // kind 7 bare glyph at (20, 18)
+            rect_at(sc + 2 * MB_INST, 14, 12, 12, 12, 7, ink, ink, ink, 0);
+            sc[2 * MB_INST + 12] = 16.0; sc[2 * MB_INST + 13] = 16.0;
+            sc[2 * MB_INST + 14] = 16.0; sc[2 * MB_INST + 15] = 16.0;
+            sc[2 * MB_INST + 21] = 20.0; sc[2 * MB_INST + 22] = 18.0; sc[2 * MB_INST + 23] = -12.0;
+            // kind 10 bare line at (50, 18)
+            rect_at(sc + 3 * MB_INST, 42, 12, 16, 12, 10, ink, ink, ink, 0);
+            sc[3 * MB_INST + 4] = 4.0;
+            sc[3 * MB_INST + 12] = 0.1; sc[3 * MB_INST + 13] = 0.5;
+            sc[3 * MB_INST + 14] = 0.9; sc[3 * MB_INST + 15] = 0.5;
+            sc[3 * MB_INST + 21] = 50.0; sc[3 * MB_INST + 22] = 18.0; sc[3 * MB_INST + 23] = -12.0;
+            // kind 11 bare shape at (80, 18)
+            rect_at(sc + 4 * MB_INST, 72, 12, 16, 12, 11, ink, ink, ink, 0);
+            sc[4 * MB_INST + 4] = 4.0;
+            sc[4 * MB_INST + 6] = 0.0; sc[4 * MB_INST + 7] = 0.0;
+            sc[4 * MB_INST + 12] = 0.0; sc[4 * MB_INST + 13] = 1.0;
+            sc[4 * MB_INST + 21] = 80.0; sc[4 * MB_INST + 22] = 18.0; sc[4 * MB_INST + 23] = -12.0;
+            memset(sc + 5 * MB_INST, 0, MB_INST * sizeof(double));
+            sc[5 * MB_INST + 0] = 0.1; sc[5 * MB_INST + 1] = 0.5;
+            sc[5 * MB_INST + 2] = 0.9; sc[5 * MB_INST + 3] = 0.5;
+            sc[5 * MB_INST + 5] = 12.0;
+            glass_forget();
+            gl_present(sc, 6, br, bgc, bb);
+            unsigned char *spx = pixels_of_fb(pb_fb);
+            int xs[3] = { 20, 50, 80 };
+            int kinds[3] = { 7, 10, 11 };
+            for (int ki = 0; ki < 3; ki++) {
+              int py = 18 * (int)cur_scale;
+              int row = fb_h - 1 - py;
+              int px_x = xs[ki] * (int)cur_scale;
+              int idx = (row * fb_w + px_x) * 4;
+              double tr = spx[idx + 0] / 255.0, tg = spx[idx + 1] / 255.0, tb = spx[idx + 2] / 255.0;
+              double rl = 0.2126 * (tr <= 0.04045 ? tr / 12.92 : pow((tr + 0.055) / 1.055, 2.4))
+                        + 0.7152 * (tg <= 0.04045 ? tg / 12.92 : pow((tg + 0.055) / 1.055, 2.4))
+                        + 0.0722 * (tb <= 0.04045 ? tb / 12.92 : pow((tb + 0.055) / 1.055, 2.4));
+              double hi = rl > bg_lin ? rl : bg_lin, lo = rl > bg_lin ? bg_lin : rl;
+              double cr = (hi + 0.05) / (lo + 0.05);
+              printf("gles_render: bare k=%d bg=%s ink=%.2f -> rgb=(%d,%d,%d) cr=%.2f\n",
+                     kinds[ki], bg_cases[bi_i].name, ink, spx[idx + 0], spx[idx + 1], spx[idx + 2], cr);
+              CHECK(cr >= 4.5);
+              if (bi_i == 3) { CHECK(rl < 0.05); } // #F00080 exact WCAG Lbg=0.2008 >= 0.1792 -> picks dark ink
+            }
+            free(spx);
+          }
+        }
+      }
+      // 300pt-wide bare title straddling bright (left) / dark (right) boundary: per-glyph local sampling
+      {
+        int w_save = cur_w, h_save = cur_h, fbw_save = fb_w, fbh_save = fb_h;
+        double sc_save = cur_scale;
+        GLuint wt_tex = 0, wt_fb = 0;
+        glGenTextures(1, &wt_tex);
+        glBindTexture(GL_TEXTURE_2D, wt_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 400, 120, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glGenFramebuffers(1, &wt_fb);
+        glBindFramebuffer(GL_FRAMEBUFFER, wt_fb);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, wt_tex, 0);
+        target_fb = wt_fb; fb_w = 400; fb_h = 120; cur_w = 400; cur_h = 120; cur_scale = 1.0;
+
+        double wt[5 * MB_INST];
+        rect_at(wt, 0, 0, 200, 120, 0, 0.96, 0.96, 0.96, 0);
+        rect_at(wt + MB_INST, 200, 0, 200, 120, 0, 0.10, 0.10, 0.10, 0);
+        rect_at(wt + 2 * MB_INST, 0, 0, 400, 68.0, 5, 1.0, 1.0, 1.0, -48);
+        wt[2 * MB_INST + 6] = 1.0; wt[2 * MB_INST + 7] = 8.5; wt[2 * MB_INST + 11] = 0.0; wt[2 * MB_INST + 15] = 1.0;
+        wt[2 * MB_INST + 22] = -1.0; wt[2 * MB_INST + 54] = 68.0; wt[2 * MB_INST + 55] = 40.0;
+        // Same pad.yz=(200,20) for both glyphs spanning 300pt: left glyph at x=70, right glyph at x=330
+        rect_at(wt + 3 * MB_INST, 64, 14, 12, 12, 7, 0.11, 0.11, 0.11, 0);
+        wt[3 * MB_INST + 12] = 16.0; wt[3 * MB_INST + 13] = 16.0; wt[3 * MB_INST + 14] = 16.0; wt[3 * MB_INST + 15] = 16.0;
+        wt[3 * MB_INST + 21] = 200.0; wt[3 * MB_INST + 22] = 20.0; wt[3 * MB_INST + 23] = -16.0;
+        rect_at(wt + 4 * MB_INST, 324, 14, 12, 12, 7, 0.11, 0.11, 0.11, 0);
+        wt[4 * MB_INST + 12] = 16.0; wt[4 * MB_INST + 13] = 16.0; wt[4 * MB_INST + 14] = 16.0; wt[4 * MB_INST + 15] = 16.0;
+        wt[4 * MB_INST + 21] = 200.0; wt[4 * MB_INST + 22] = 20.0; wt[4 * MB_INST + 23] = -16.0;
+        for (int i = 0; i < 5; i++) { wt[i * MB_INST + 18] = 400.0; wt[i * MB_INST + 19] = 120.0; }
+        glass_forget();
+        gl_present(wt, 5, 0.10, 0.10, 0.10);
+        unsigned char *wpx = pixels_of_fb(wt_fb);
+        int row = fb_h - 1 - 20;
+        unsigned char *pl = wpx + (row * fb_w + 70) * 4;
+        unsigned char *pr = wpx + (row * fb_w + 330) * 4;
+        double ll = (0.2126 * pl[0] + 0.7152 * pl[1] + 0.0722 * pl[2]) / 255.0;
+        double lr = (0.2126 * pr[0] + 0.7152 * pr[1] + 0.0722 * pr[2]) / 255.0;
+        printf("gles_render: bare 300pt title split: left_lum=%.3f right_lum=%.3f\n", ll, lr);
+        CHECK(ll <= 0.30);
+        CHECK(lr >= 0.70);
+        free(wpx);
+
+        // Vertical split multiline bare kind==7: same column, top row y=14..26 over light 0.96, bottom row y=84..96 over dark 0.10,
+        // shared ancestor pad.yz=(100, 55) -> both rows must sample their own rect.y + rect.h*0.5 and reach CR >= 4.5
+        {
+          double ml[5 * MB_INST];
+          rect_at(ml, 0, 0, 400, 60, 0, 0.96, 0.96, 0.96, 0);
+          rect_at(ml + MB_INST, 0, 60, 400, 60, 0, 0.10, 0.10, 0.10, 0);
+          rect_at(ml + 2 * MB_INST, 0, 0, 400, 120.0, 5, 1.0, 1.0, 1.0, -52);
+          ml[2 * MB_INST + 6] = 1.0; ml[2 * MB_INST + 7] = 4.0; ml[2 * MB_INST + 11] = 0.0; ml[2 * MB_INST + 15] = 1.0;
+          ml[2 * MB_INST + 22] = -1.0; ml[2 * MB_INST + 54] = 120.0; ml[2 * MB_INST + 55] = 20.0;
+          rect_at(ml + 3 * MB_INST, 94, 14, 12, 12, 7, 0.11, 0.11, 0.11, 0);
+          ml[3 * MB_INST + 12] = 16.0; ml[3 * MB_INST + 13] = 16.0; ml[3 * MB_INST + 14] = 16.0; ml[3 * MB_INST + 15] = 16.0;
+          ml[3 * MB_INST + 21] = 100.0; ml[3 * MB_INST + 22] = 55.0; ml[3 * MB_INST + 23] = -16.0;
+          rect_at(ml + 4 * MB_INST, 94, 84, 12, 12, 7, 0.11, 0.11, 0.11, 0);
+          ml[4 * MB_INST + 12] = 16.0; ml[4 * MB_INST + 13] = 16.0; ml[4 * MB_INST + 14] = 16.0; ml[4 * MB_INST + 15] = 16.0;
+          ml[4 * MB_INST + 21] = 100.0; ml[4 * MB_INST + 22] = 55.0; ml[4 * MB_INST + 23] = -16.0;
+          for (int i = 0; i < 5; i++) { ml[i * MB_INST + 18] = 400.0; ml[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(ml, 5, 0.10, 0.10, 0.10);
+          unsigned char *mpx = pixels_of_fb(wt_fb);
+          unsigned char *pt = mpx + ((fb_h - 1 - 20) * fb_w + 100) * 4;
+          unsigned char *pb2 = mpx + ((fb_h - 1 - 90) * fb_w + 100) * 4;
+          double yt = wcag_luma_u8(pt[0], pt[1], pt[2]);
+          double yb = wcag_luma_u8(pb2[0], pb2[1], pb2[2]);
+          double bg_top = wcag_luma_u8(245, 245, 245), bg_bot = wcag_luma_u8(26, 26, 26);
+          double cr_top = ((yt > bg_top ? yt : bg_top) + 0.05) / ((yt > bg_top ? bg_top : yt) + 0.05);
+          double cr_bot = ((yb > bg_bot ? yb : bg_bot) + 0.05) / ((yb > bg_bot ? bg_bot : yb) + 0.05);
+          printf("gles_render: bare multiline k=7 top_cr=%.2f bot_cr=%.2f\n", cr_top, cr_bot);
+          CHECK(cr_top >= 4.5 && cr_bot >= 4.5);
+          free(mpx);
+        }
+
+        // Single-band bare kind==11 with legal p.zw=(0,0) at x=80 over light 0.96, ancestor pad.yz=(340,20) over dark 0.10
+        {
+          double s11[5 * MB_INST];
+          rect_at(s11, 0, 0, 200, 120, 0, 0.96, 0.96, 0.96, 0);
+          rect_at(s11 + MB_INST, 200, 0, 200, 120, 0, 0.10, 0.10, 0.10, 0);
+          rect_at(s11 + 2 * MB_INST, 0, 0, 400, 68.0, 5, 1.0, 1.0, 1.0, -53);
+          s11[2 * MB_INST + 6] = 1.0; s11[2 * MB_INST + 7] = 4.0; s11[2 * MB_INST + 11] = 0.0; s11[2 * MB_INST + 15] = 1.0;
+          s11[2 * MB_INST + 22] = -1.0; s11[2 * MB_INST + 54] = 68.0; s11[2 * MB_INST + 55] = 20.0;
+          rect_at(s11 + 3 * MB_INST, 72, 12, 16, 16, 11, 0.93, 0.93, 0.93, 0);
+          s11[3 * MB_INST + 4] = 0.0; s11[3 * MB_INST + 6] = 0.0; s11[3 * MB_INST + 7] = 0.0;
+          s11[3 * MB_INST + 12] = 0.0; s11[3 * MB_INST + 13] = 4.0; s11[3 * MB_INST + 14] = 0.0;
+          s11[3 * MB_INST + 21] = 340.0; s11[3 * MB_INST + 22] = 20.0; s11[3 * MB_INST + 23] = -12.0;
+          memset(s11 + 4 * MB_INST, 0, MB_INST * sizeof(double));
+          s11[4 * MB_INST + 5] = 12.0;
+          s11[4 * MB_INST + 0] = 0.0; s11[4 * MB_INST + 1] = 0.0; s11[4 * MB_INST + 2] = 1.0; s11[4 * MB_INST + 3] = 0.0;
+          s11[4 * MB_INST + 8] = 1.0; s11[4 * MB_INST + 9] = 0.0; s11[4 * MB_INST + 10] = 1.0; s11[4 * MB_INST + 11] = 1.0;
+          s11[4 * MB_INST + 12] = 1.0; s11[4 * MB_INST + 13] = 1.0; s11[4 * MB_INST + 14] = 0.0; s11[4 * MB_INST + 15] = 1.0;
+          s11[4 * MB_INST + 16] = 0.0; s11[4 * MB_INST + 17] = 1.0; s11[4 * MB_INST + 18] = 0.0; s11[4 * MB_INST + 19] = 0.0;
+          for (int i = 0; i < 4; i++) { s11[i * MB_INST + 18] = 400.0; s11[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(s11, 5, 0.10, 0.10, 0.10);
+          unsigned char *p11 = pixels_of_fb(wt_fb);
+          unsigned char *c11 = p11 + ((fb_h - 1 - 20) * fb_w + 80) * 4;
+          double y11 = wcag_luma_u8(c11[0], c11[1], c11[2]);
+          double bg_l = wcag_luma_u8(245, 245, 245);
+          double cr11 = ((bg_l > y11 ? bg_l : y11) + 0.05) / ((bg_l > y11 ? y11 : bg_l) + 0.05);
+          printf("gles_render: bare k=11 zero-offset rgb=(%d,%d,%d) cr=%.2f\n", c11[0], c11[1], c11[2], cr11);
+          CHECK(y11 < 0.20 && cr11 >= 4.5);
+          free(p11);
+        }
+
+        // Merged liquid glass (pad.w=8.0) on left light 0.96 + bare kind==10 icon on right dark 0.10: grab_of must expand capture
+        {
+          double mlq[4 * MB_INST];
+          rect_at(mlq, 0, 0, 200, 120, 0, 0.96, 0.96, 0.96, 0);
+          rect_at(mlq + MB_INST, 200, 0, 200, 120, 0, 0.10, 0.10, 0.10, 0);
+          rect_at(mlq + 2 * MB_INST, 10, 10, 40, 28, 6, 253.0/255.0, 252.0/255.0, 253.0/255.0, -54);
+          mlq[2 * MB_INST + 4] = 14.0; mlq[2 * MB_INST + 6] = 1.0; mlq[2 * MB_INST + 7] = 2.0;
+          mlq[2 * MB_INST + 11] = 0x67 / 255.0; mlq[2 * MB_INST + 14] = -1.0; mlq[2 * MB_INST + 15] = 1.0;
+          mlq[2 * MB_INST + 23] = 8.0; // merged_liquid
+          rect_at(mlq + 3 * MB_INST, 300, 14, 16, 12, 10, 0.11, 0.11, 0.11, 0);
+          mlq[3 * MB_INST + 4] = 4.0;
+          mlq[3 * MB_INST + 12] = 0.1; mlq[3 * MB_INST + 13] = 0.5; mlq[3 * MB_INST + 14] = 0.9; mlq[3 * MB_INST + 15] = 0.5;
+          mlq[3 * MB_INST + 21] = 308.0; mlq[3 * MB_INST + 22] = 20.0; mlq[3 * MB_INST + 23] = -12.0;
+          for (int i = 0; i < 4; i++) { mlq[i * MB_INST + 18] = 400.0; mlq[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(mlq, 4, 0.10, 0.10, 0.10);
+          unsigned char *pm = pixels_of_fb(wt_fb);
+          unsigned char *cm = pm + ((fb_h - 1 - 20) * fb_w + 308) * 4;
+          double ym = wcag_luma_u8(cm[0], cm[1], cm[2]);
+          double bg_d = wcag_luma_u8(26, 26, 26);
+          double crm = ((ym > bg_d ? ym : bg_d) + 0.05) / ((ym > bg_d ? bg_d : ym) + 0.05);
+          printf("gles_render: bare k=10 after merged_liquid rgb=(%d,%d,%d) cr=%.2f\n", cm[0], cm[1], cm[2], crm);
+          CHECK(ym > 0.55 && crm >= 4.5);
+          free(pm);
+        }
+
+        // Warm-cache vs cold-cache parity (fixed clear color; changing patch strictly outside 2nd glass capture box,
+        // inside bare kind==10 icon sample rect): verify control frame cache hit, cold_before != cold_after (>=30),
+        // and warm_after == cold_after (<=1)
+        {
+          double hc[6 * MB_INST];
+          rect_at(hc, 0, 0, 200, 120, 0, 0.96, 0.96, 0.96, 0);
+          rect_at(hc + MB_INST, 200, 0, 200, 120, 0, 0.40, 0.40, 0.40, 0);
+          // Changing patch at x=266..293 (width 27 -> reaches right=295, strictly outside 2nd glass reaches left=295,
+          // covers bare icon leftmost sample 306 - 2*0.38*20 = 290.8)
+          rect_at(hc + 2 * MB_INST, 266, 0, 27, 120, 0, 0.10, 0.10, 0.10, 0);
+          rect_at(hc + 3 * MB_INST, 10, 10, 40, 28, 6, 253.0/255.0, 252.0/255.0, 253.0/255.0, -49);
+          hc[3 * MB_INST + 4] = 14.0; hc[3 * MB_INST + 6] = 1.0; hc[3 * MB_INST + 7] = 2.0;
+          hc[3 * MB_INST + 11] = 0x67 / 255.0; hc[3 * MB_INST + 14] = -1.0; hc[3 * MB_INST + 15] = 1.0;
+          // Bare icon x=298..314 (center 306, pad.w=-40 -> half-width 20, right edge 310..314 under 2nd glass)
+          rect_at(hc + 4 * MB_INST, 298, 14, 16, 12, 10, 0.11, 0.11, 0.11, 0);
+          hc[4 * MB_INST + 4] = 4.0;
+          hc[4 * MB_INST + 12] = 0.1; hc[4 * MB_INST + 13] = 0.5; hc[4 * MB_INST + 14] = 0.9; hc[4 * MB_INST + 15] = 0.5;
+          hc[4 * MB_INST + 21] = 306.0; hc[4 * MB_INST + 22] = 20.0; hc[4 * MB_INST + 23] = -40.0;
+          // 2nd glass x=310..350 (blur=4.0, margin=14 -> capture left=296)
+          rect_at(hc + 5 * MB_INST, 310, 6, 40, 32, 5, 1.0, 1.0, 1.0, -50);
+          hc[5 * MB_INST + 6] = 1.0; hc[5 * MB_INST + 7] = 4.0; hc[5 * MB_INST + 11] = 0.10; hc[5 * MB_INST + 15] = 1.0;
+          for (int i = 0; i < 6; i++) { hc[i * MB_INST + 18] = 400.0; hc[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(hc, 6, 0.40, 0.40, 0.40);
+          unsigned char *cold_before = pixels_of_fb(wt_fb);
+          // Unchanged control frame: verifies cache hit with 0 diff
+          gl_present(hc, 6, 0.40, 0.40, 0.40);
+          unsigned char *ctrl_px = pixels_of_fb(wt_fb);
+          int ctrl_diff = 0;
+          for (int y = 6; y < 38; y++) {
+            for (int x = 310; x < 350; x++) {
+              int idx = ((fb_h - 1 - y) * fb_w + x) * 4;
+              for (int c = 0; c < 3; c++) {
+                int d = abs((int)cold_before[idx + c] - (int)ctrl_px[idx + c]);
+                if (d > ctrl_diff) ctrl_diff = d;
+              }
+            }
+          }
+          // Now flip ONLY the patch outside 2nd glass capture box (clear color stays fixed 0.40)
+          hc[2 * MB_INST + 8] = 1.0; hc[2 * MB_INST + 9] = 1.0; hc[2 * MB_INST + 10] = 1.0;
+          gl_present(hc, 6, 0.40, 0.40, 0.40);
+          unsigned char *warm_after = pixels_of_fb(wt_fb);
+          glass_forget();
+          gl_present(hc, 6, 0.40, 0.40, 0.40);
+          unsigned char *cold_after = pixels_of_fb(wt_fb);
+          int delta_cold = 0, max_diff = 0;
+          for (int y = 6; y < 38; y++) {
+            for (int x = 310; x < 350; x++) {
+              int idx = ((fb_h - 1 - y) * fb_w + x) * 4;
+              for (int c = 0; c < 3; c++) {
+                int dc = abs((int)cold_before[idx + c] - (int)cold_after[idx + c]);
+                if (dc > delta_cold) delta_cold = dc;
+                int dw = abs((int)warm_after[idx + c] - (int)cold_after[idx + c]);
+                if (dw > max_diff) max_diff = dw;
+              }
+            }
+          }
+          printf("gles_render: bare k=10 warm vs cold 2nd-glass ctrl_diff=%d cold_delta=%d warm_vs_cold=%d\n",
+                 ctrl_diff, delta_cold, max_diff);
+          CHECK(ctrl_diff == 0 && delta_cold >= 30 && max_diff <= 1);
+          free(cold_before); free(ctrl_px); free(warm_after); free(cold_after);
+        }
+
+        // Dark-mode adaptive=true pill (0x20202067) full grayscale round-trip sweep (ascending & descending):
+        // verifies hysteresis latch in b-channel keeps CR >= 3.0 at EVERY gray level including #B8B8B8/#B9B9B9
+        {
+          const double grays[] = {
+            0.0, 0.25, 0x80/255.0, 0x99/255.0, 0xA8/255.0, 0xB8/255.0, 0xB9/255.0, 0xCC/255.0, 1.0,
+            0xCC/255.0, 0xB9/255.0, 0xB8/255.0, 0xA8/255.0, 0x99/255.0, 0x80/255.0, 0.25, 0.0
+          };
+          int ng = (int)(sizeof(grays) / sizeof(grays[0]));
+          double dp[3 * MB_INST];
+          rect_at(dp, 0, 0, 400, 120, 0, 0.0, 0.0, 0.0, 0);
+          rect_at(dp + MB_INST, 150, 20, 100, 36, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -51);
+          dp[MB_INST + 4] = 18.0; dp[MB_INST + 6] = 1.0; dp[MB_INST + 7] = 1.2;
+          dp[MB_INST + 11] = 0x67 / 255.0; dp[MB_INST + 12] = 0.6; dp[MB_INST + 13] = 14.0;
+          dp[MB_INST + 14] = -1.0; dp[MB_INST + 15] = 1.0;
+          dp[MB_INST + 21] = 20.0; dp[MB_INST + 22] = 0.06; dp[MB_INST + 23] = 0.0;
+          rect_at(dp + 2 * MB_INST, 192, 32, 16, 12, 10, 0.93, 0.93, 0.93, 0);
+          dp[2 * MB_INST + 4] = 4.0;
+          dp[2 * MB_INST + 12] = 0.1; dp[2 * MB_INST + 13] = 0.5; dp[2 * MB_INST + 14] = 0.9; dp[2 * MB_INST + 15] = 0.5;
+          dp[2 * MB_INST + 21] = 200.0; dp[2 * MB_INST + 22] = 38.0; dp[2 * MB_INST + 23] = 18.0;
+          for (int i = 0; i < 3; i++) { dp[i * MB_INST + 18] = 400.0; dp[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          double prev_dt = ad_fixed_dt;
+          ad_fixed_dt = 1.0;
+          double min_cr = 999.0;
+          for (int gi = 0; gi < ng; gi++) {
+            double gv = grays[gi];
+            dp[8] = gv; dp[9] = gv; dp[10] = gv;
+            gl_present(dp, 3, gv, gv, gv);
+            unsigned char *dpx = pixels_of_fb(wt_fb);
+            int r38 = fb_h - 1 - 38;
+            unsigned char *gp2 = dpx + (r38 * fb_w + 170) * 4;
+            unsigned char *ip2 = dpx + (r38 * fb_w + 200) * 4;
+            double gl2 = wcag_luma_u8(gp2[0], gp2[1], gp2[2]);
+            double il2 = wcag_luma_u8(ip2[0], ip2[1], ip2[2]);
+            double dcr = ((il2 > gl2 ? il2 : gl2) + 0.05) / ((il2 > gl2 ? gl2 : il2) + 0.05);
+            if (dcr < min_cr) min_cr = dcr;
+            if (dcr < 4.5) {
+              printf("gles_render: FAIL dark pill step=%d gray=#%02X glass=(%d,%d,%d) icon=(%d,%d,%d) cr=%.2f\n",
+                     gi, (int)(gv * 255.0 + 0.5), gp2[0], gp2[1], gp2[2], ip2[0], ip2[1], ip2[2], dcr);
+            }
+            CHECK(dcr >= 4.5);
+            free(dpx);
+          }
+          ad_fixed_dt = prev_dt;
+          printf("gles_render: dark adaptive pill round-trip grayscale sweep (%d steps) min_cr=%.2f\n", ng, min_cr);
+        }
+
+        // Dark-mode adaptive pill straddling left dark (0.08) + right coral (0.95, 0.65, 0.55):
+        // same-pixel glass vs icon contrast must be >= 4.5
+        {
+          double sc_p[4 * MB_INST];
+          rect_at(sc_p, 0, 0, 180, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(sc_p + MB_INST, 180, 0, 220, 120, 0, 0.95, 0.65, 0.55, 0);
+          rect_at(sc_p + 2 * MB_INST, 152, 18, 48, 40, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -55);
+          sc_p[2 * MB_INST + 4] = 20.0; sc_p[2 * MB_INST + 6] = 1.0; sc_p[2 * MB_INST + 7] = 1.2;
+          sc_p[2 * MB_INST + 11] = 0x67 / 255.0; sc_p[2 * MB_INST + 12] = 0.6; sc_p[2 * MB_INST + 13] = 14.0;
+          sc_p[2 * MB_INST + 14] = -1.0; sc_p[2 * MB_INST + 15] = 1.0;
+          sc_p[2 * MB_INST + 21] = 20.0; sc_p[2 * MB_INST + 22] = 0.06; sc_p[2 * MB_INST + 23] = 0.0;
+          rect_at(sc_p + 3 * MB_INST, 184, 32, 12, 12, 10, 0.93, 0.93, 0.93, 0);
+          sc_p[3 * MB_INST + 4] = 4.0;
+          sc_p[3 * MB_INST + 12] = 0.1; sc_p[3 * MB_INST + 13] = 0.5; sc_p[3 * MB_INST + 14] = 0.9; sc_p[3 * MB_INST + 15] = 0.5;
+          sc_p[3 * MB_INST + 21] = 176.0; sc_p[3 * MB_INST + 22] = 38.0; sc_p[3 * MB_INST + 23] = 20.0;
+          for (int i = 0; i < 4; i++) { sc_p[i * MB_INST + 18] = 400.0; sc_p[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(sc_p, 3, 0.08, 0.08, 0.08);
+          unsigned char *bgx = pixels_of_fb(wt_fb);
+          glass_forget();
+          gl_present(sc_p, 4, 0.08, 0.08, 0.08);
+          unsigned char *spx = pixels_of_fb(wt_fb);
+          int r38 = fb_h - 1 - 38;
+          unsigned char *gp3 = bgx + (r38 * fb_w + 190) * 4;
+          unsigned char *ip3 = spx + (r38 * fb_w + 190) * 4;
+          double gl3 = wcag_luma_u8(gp3[0], gp3[1], gp3[2]);
+          double il3 = wcag_luma_u8(ip3[0], ip3[1], ip3[2]);
+          double scr = ((il3 > gl3 ? il3 : gl3) + 0.05) / ((il3 > gl3 ? gl3 : il3) + 0.05);
+          printf("gles_render: dark adaptive straddle dark+coral: glass=(%d,%d,%d) icon=(%d,%d,%d) cr=%.2f\n",
+                 gp3[0], gp3[1], gp3[2], ip3[0], ip3[1], ip3[2], scr);
+          CHECK(scr >= 4.5);
+          free(bgx); free(spx);
+        }
+
+        // R3-1A: Dark capsule straddling left white (1.0) + right dark gray (0.08), icon in right dark zone -> stays bright white (CR >= 4.5)
+        {
+          double wd_p[4 * MB_INST];
+          rect_at(wd_p, 0, 0, 172, 120, 0, 1.0, 1.0, 1.0, 0);
+          rect_at(wd_p + MB_INST, 172, 0, 228, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(wd_p + 2 * MB_INST, 152, 18, 48, 40, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -56);
+          wd_p[2 * MB_INST + 4] = 20.0; wd_p[2 * MB_INST + 6] = 1.0; wd_p[2 * MB_INST + 7] = 1.2;
+          wd_p[2 * MB_INST + 11] = 0x67 / 255.0; wd_p[2 * MB_INST + 12] = 0.6; wd_p[2 * MB_INST + 13] = 14.0;
+          wd_p[2 * MB_INST + 14] = -1.0; wd_p[2 * MB_INST + 15] = 1.0;
+          wd_p[2 * MB_INST + 21] = 20.0; wd_p[2 * MB_INST + 22] = 0.06; wd_p[2 * MB_INST + 23] = 0.0;
+          rect_at(wd_p + 3 * MB_INST, 184, 32, 12, 12, 10, 0.93, 0.93, 0.93, 0);
+          wd_p[3 * MB_INST + 4] = 4.0;
+          wd_p[3 * MB_INST + 12] = 0.1; wd_p[3 * MB_INST + 13] = 0.5; wd_p[3 * MB_INST + 14] = 0.9; wd_p[3 * MB_INST + 15] = 0.5;
+          wd_p[3 * MB_INST + 21] = 176.0; wd_p[3 * MB_INST + 22] = 38.0; wd_p[3 * MB_INST + 23] = 20.0;
+          for (int i = 0; i < 4; i++) { wd_p[i * MB_INST + 18] = 400.0; wd_p[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(wd_p, 3, 0.08, 0.08, 0.08);
+          unsigned char *bgx = pixels_of_fb(wt_fb);
+          glass_forget();
+          gl_present(wd_p, 4, 0.08, 0.08, 0.08);
+          unsigned char *px = pixels_of_fb(wt_fb);
+          unsigned char *gp = bgx + ((fb_h - 1 - 38) * fb_w + 190) * 4;
+          unsigned char *ip = px + ((fb_h - 1 - 38) * fb_w + 190) * 4;
+          double gl = wcag_luma_u8(gp[0], gp[1], gp[2]), il = wcag_luma_u8(ip[0], ip[1], ip[2]);
+          double cr = ((il > gl ? il : gl) + 0.05) / ((il > gl ? gl : il) + 0.05);
+          printf("gles_render: dark adaptive straddle white+dark right-icon: glass=(%d,%d,%d) icon=(%d,%d,%d) cr=%.2f\n",
+                 gp[0], gp[1], gp[2], ip[0], ip[1], ip[2], cr);
+          CHECK(cr >= 4.5);
+          free(bgx); free(px);
+        }
+
+        // R3-1B: Light adaptive capsule on uniform dark gray (0.08) + light neutral icon -> stays bright white (no b-channel collision)
+        {
+          double ld_p[3 * MB_INST];
+          rect_at(ld_p, 0, 0, 400, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(ld_p + MB_INST, 150, 20, 100, 36, 6, 253.0/255.0, 252.0/255.0, 253.0/255.0, -57);
+          ld_p[MB_INST + 4] = 18.0; ld_p[MB_INST + 6] = 1.0; ld_p[MB_INST + 7] = 1.2;
+          ld_p[MB_INST + 11] = 0x67 / 255.0; ld_p[MB_INST + 12] = 0.6; ld_p[MB_INST + 13] = 14.0;
+          ld_p[MB_INST + 14] = -1.0; ld_p[MB_INST + 15] = 1.0;
+          ld_p[MB_INST + 21] = 20.0; ld_p[MB_INST + 22] = 0.06; ld_p[MB_INST + 23] = 0.0;
+          rect_at(ld_p + 2 * MB_INST, 192, 32, 16, 12, 10, 0.93, 0.93, 0.93, 0);
+          ld_p[2 * MB_INST + 4] = 4.0;
+          ld_p[2 * MB_INST + 12] = 0.1; ld_p[2 * MB_INST + 13] = 0.5; ld_p[2 * MB_INST + 14] = 0.9; ld_p[2 * MB_INST + 15] = 0.5;
+          ld_p[2 * MB_INST + 21] = 200.0; ld_p[2 * MB_INST + 22] = 38.0; ld_p[2 * MB_INST + 23] = 18.0;
+          for (int i = 0; i < 3; i++) { ld_p[i * MB_INST + 18] = 400.0; ld_p[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(ld_p, 3, 0.08, 0.08, 0.08);
+          unsigned char *px = pixels_of_fb(wt_fb);
+          unsigned char *gp = px + ((fb_h - 1 - 38) * fb_w + 170) * 4;
+          unsigned char *ip = px + ((fb_h - 1 - 38) * fb_w + 200) * 4;
+          double gl = wcag_luma_u8(gp[0], gp[1], gp[2]), il = wcag_luma_u8(ip[0], ip[1], ip[2]);
+          double cr = ((il > gl ? il : gl) + 0.05) / ((il > gl ? gl : il) + 0.05);
+          printf("gles_render: light adaptive on dark + light icon: glass=(%d,%d,%d) icon=(%d,%d,%d) cr=%.2f\n",
+                 gp[0], gp[1], gp[2], ip[0], ip[1], ip[2], cr);
+          CHECK(il > 0.70 && cr >= 4.5);
+          free(px);
+        }
+
+        // R3-1C: 4-frame hysteresis jitter test (zero flicker): (1) #9A/#9B straddle, (2) #7A/#7B inside [0.20, 0.26] band
+        {
+          double jt[4 * MB_INST];
+          rect_at(jt, 0, 0, 180, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(jt + MB_INST, 180, 0, 220, 120, 0, 0x9A/255.0, 0x9A/255.0, 0x9A/255.0, 0);
+          rect_at(jt + 2 * MB_INST, 152, 18, 48, 40, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -58);
+          jt[2 * MB_INST + 4] = 20.0; jt[2 * MB_INST + 6] = 1.0; jt[2 * MB_INST + 7] = 1.2;
+          jt[2 * MB_INST + 11] = 0x67 / 255.0; jt[2 * MB_INST + 12] = 0.6; jt[2 * MB_INST + 13] = 14.0;
+          jt[2 * MB_INST + 14] = -1.0; jt[2 * MB_INST + 15] = 1.0;
+          jt[2 * MB_INST + 21] = 20.0; jt[2 * MB_INST + 22] = 0.06; jt[2 * MB_INST + 23] = 0.0;
+          rect_at(jt + 3 * MB_INST, 184, 32, 12, 12, 10, 0.93, 0.93, 0.93, 0);
+          jt[3 * MB_INST + 4] = 4.0;
+          jt[3 * MB_INST + 12] = 0.1; jt[3 * MB_INST + 13] = 0.5; jt[3 * MB_INST + 14] = 0.9; jt[3 * MB_INST + 15] = 0.5;
+          jt[3 * MB_INST + 21] = 176.0; jt[3 * MB_INST + 22] = 38.0; jt[3 * MB_INST + 23] = 20.0;
+          for (int i = 0; i < 4; i++) { jt[i * MB_INST + 18] = 400.0; jt[i * MB_INST + 19] = 120.0; }
+          const double seq1[4] = { 0x9A/255.0, 0x9B/255.0, 0x9A/255.0, 0x9B/255.0 };
+          glass_forget();
+          unsigned char ref1[3] = {0, 0, 0};
+          int max_j1 = 0;
+          for (int f = 0; f < 4; f++) {
+            jt[MB_INST + 8] = seq1[f]; jt[MB_INST + 9] = seq1[f]; jt[MB_INST + 10] = seq1[f];
+            gl_present(jt, 4, 0.08, 0.08, 0.08);
+            unsigned char *px = pixels_of_fb(wt_fb);
+            unsigned char *ip = px + ((fb_h - 1 - 38) * fb_w + 190) * 4;
+            if (f == 0) { ref1[0] = ip[0]; ref1[1] = ip[1]; ref1[2] = ip[2]; }
+            else for (int c = 0; c < 3; c++) { int d = abs((int)ip[c] - (int)ref1[c]); if (d > max_j1) max_j1 = d; }
+            free(px);
+          }
+          // Case 2: warm up dark (0.08 -> b2=0), then 4-frame 1-LSB oscillation inside [0.20, 0.26] (#7A <-> #7B)
+          const double seq2[4] = { 0x7A/255.0, 0x7B/255.0, 0x7A/255.0, 0x7B/255.0 };
+          glass_forget();
+          jt[MB_INST + 8] = 0.08; jt[MB_INST + 9] = 0.08; jt[MB_INST + 10] = 0.08;
+          gl_present(jt, 4, 0.08, 0.08, 0.08);
+          unsigned char ref2[3] = {0, 0, 0};
+          int max_j2 = 0;
+          for (int f = 0; f < 4; f++) {
+            jt[MB_INST + 8] = seq2[f]; jt[MB_INST + 9] = seq2[f]; jt[MB_INST + 10] = seq2[f];
+            gl_present(jt, 4, 0.08, 0.08, 0.08);
+            unsigned char *px = pixels_of_fb(wt_fb);
+            unsigned char *ip = px + ((fb_h - 1 - 38) * fb_w + 190) * 4;
+            if (f == 0) { ref2[0] = ip[0]; ref2[1] = ip[1]; ref2[2] = ip[2]; }
+            else for (int c = 0; c < 3; c++) { int d = abs((int)ip[c] - (int)ref2[c]); if (d > max_j2) max_j2 = d; }
+            free(px);
+          }
+          printf("gles_render: dark adaptive 4-frame jitter #9A/#9B diff=%d #7A/#7B diff=%d\n", max_j1, max_j2);
+          CHECK(max_j1 == 0 && max_j2 == 0);
+        }
+
+        // R3-1D: Text glyphs (kind==7, is_icon==false) inside dark capsule straddling light/dark -> uniform word ink AND CR >= 4.5 on BOTH halves
+        {
+          double tx_p[5 * MB_INST];
+          rect_at(tx_p, 0, 0, 180, 120, 0, 1.0, 1.0, 1.0, 0);
+          rect_at(tx_p + MB_INST, 180, 0, 220, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(tx_p + 2 * MB_INST, 100, 20, 160, 36, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -59);
+          tx_p[2 * MB_INST + 4] = 18.0; tx_p[2 * MB_INST + 6] = 1.0; tx_p[2 * MB_INST + 7] = 1.2;
+          tx_p[2 * MB_INST + 11] = 0x67 / 255.0; tx_p[2 * MB_INST + 12] = 0.6; tx_p[2 * MB_INST + 13] = 14.0;
+          tx_p[2 * MB_INST + 14] = -1.0; tx_p[2 * MB_INST + 15] = 1.0;
+          tx_p[2 * MB_INST + 21] = 20.0; tx_p[2 * MB_INST + 22] = 0.06; tx_p[2 * MB_INST + 23] = 0.0;
+          rect_at(tx_p + 3 * MB_INST, 124, 32, 12, 12, 7, 0.93, 0.93, 0.93, 0);
+          tx_p[3 * MB_INST + 12] = 16.0; tx_p[3 * MB_INST + 13] = 16.0; tx_p[3 * MB_INST + 14] = 16.0; tx_p[3 * MB_INST + 15] = 16.0;
+          tx_p[3 * MB_INST + 21] = 180.0; tx_p[3 * MB_INST + 22] = 38.0; tx_p[3 * MB_INST + 23] = 18.0;
+          rect_at(tx_p + 4 * MB_INST, 224, 32, 12, 12, 7, 0.93, 0.93, 0.93, 0);
+          tx_p[4 * MB_INST + 12] = 16.0; tx_p[4 * MB_INST + 13] = 16.0; tx_p[4 * MB_INST + 14] = 16.0; tx_p[4 * MB_INST + 15] = 16.0;
+          tx_p[4 * MB_INST + 21] = 180.0; tx_p[4 * MB_INST + 22] = 38.0; tx_p[4 * MB_INST + 23] = 18.0;
+          for (int i = 0; i < 5; i++) { tx_p[i * MB_INST + 18] = 400.0; tx_p[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(tx_p, 3, 0.08, 0.08, 0.08);
+          unsigned char *bgx = pixels_of_fb(wt_fb);
+          glass_forget();
+          gl_present(tx_p, 5, 0.08, 0.08, 0.08);
+          unsigned char *px = pixels_of_fb(wt_fb);
+          int r38 = fb_h - 1 - 38;
+          unsigned char *bg_l = bgx + (r38 * fb_w + 130) * 4;
+          unsigned char *bg_r = bgx + (r38 * fb_w + 230) * 4;
+          unsigned char *gl_l = px + (r38 * fb_w + 130) * 4;
+          unsigned char *gl_r = px + (r38 * fb_w + 230) * 4;
+          int word_diff = 0;
+          for (int c = 0; c < 3; c++) { int d = abs((int)gl_l[c] - (int)gl_r[c]); if (d > word_diff) word_diff = d; }
+          double ybl = wcag_luma_u8(bg_l[0], bg_l[1], bg_l[2]), yil = wcag_luma_u8(gl_l[0], gl_l[1], gl_l[2]);
+          double ybr = wcag_luma_u8(bg_r[0], bg_r[1], bg_r[2]), yir = wcag_luma_u8(gl_r[0], gl_r[1], gl_r[2]);
+          double cr_l = ((yil > ybl ? yil : ybl) + 0.05) / ((yil > ybl ? ybl : yil) + 0.05);
+          double cr_r = ((yir > ybr ? yir : ybr) + 0.05) / ((yir > ybr ? ybr : yir) + 0.05);
+          printf("gles_render: dark adaptive straddle text uniform left_cr=%.2f right_cr=%.2f diff=%d\n", cr_l, cr_r, word_diff);
+          CHECK(word_diff <= 1 && cr_l >= 4.5 && cr_r >= 4.5);
+          free(bgx); free(px);
+        }
+
+        // R4-1E: Wide capsule (x=100..260, split x=216, icon at (238,38)) both directions -> same-pixel CR >= 4.5
+        for (int dir = 0; dir < 2; dir++) {
+          double lv = dir == 0 ? 1.0 : 0.08;
+          double rv = dir == 0 ? 0.08 : 1.0;
+          double wc[4 * MB_INST];
+          rect_at(wc, 0, 0, 216, 120, 0, lv, lv, lv, 0);
+          rect_at(wc + MB_INST, 216, 0, 184, 120, 0, rv, rv, rv, 0);
+          rect_at(wc + 2 * MB_INST, 100, 20, 160, 36, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -60 - dir);
+          wc[2 * MB_INST + 4] = 18.0; wc[2 * MB_INST + 6] = 1.0; wc[2 * MB_INST + 7] = 1.2;
+          wc[2 * MB_INST + 11] = 0x67 / 255.0; wc[2 * MB_INST + 12] = 0.6; wc[2 * MB_INST + 13] = 14.0;
+          wc[2 * MB_INST + 14] = -1.0; wc[2 * MB_INST + 15] = 1.0;
+          wc[2 * MB_INST + 21] = 20.0; wc[2 * MB_INST + 22] = 0.06; wc[2 * MB_INST + 23] = 0.0;
+          rect_at(wc + 3 * MB_INST, 232, 32, 12, 12, 10, 0.93, 0.93, 0.93, 0);
+          wc[3 * MB_INST + 4] = 4.0;
+          wc[3 * MB_INST + 12] = 0.1; wc[3 * MB_INST + 13] = 0.5; wc[3 * MB_INST + 14] = 0.9; wc[3 * MB_INST + 15] = 0.5;
+          wc[3 * MB_INST + 21] = 180.0; wc[3 * MB_INST + 22] = 38.0; wc[3 * MB_INST + 23] = 18.0;
+          for (int i = 0; i < 4; i++) { wc[i * MB_INST + 18] = 400.0; wc[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(wc, 3, rv, rv, rv);
+          unsigned char *bgx = pixels_of_fb(wt_fb);
+          glass_forget();
+          gl_present(wc, 4, rv, rv, rv);
+          unsigned char *px = pixels_of_fb(wt_fb);
+          int r38 = fb_h - 1 - 38;
+          unsigned char *gp = bgx + (r38 * fb_w + 238) * 4;
+          unsigned char *ip = px + (r38 * fb_w + 238) * 4;
+          double gl = wcag_luma_u8(gp[0], gp[1], gp[2]), il = wcag_luma_u8(ip[0], ip[1], ip[2]);
+          double cr = ((il > gl ? il : gl) + 0.05) / ((il > gl ? gl : il) + 0.05);
+          printf("gles_render: dark adaptive wide off-center dir=%d glass=(%d,%d,%d) icon=(%d,%d,%d) cr=%.2f\n",
+                 dir, gp[0], gp[1], gp[2], ip[0], ip[1], ip[2], cr);
+          CHECK(cr >= 4.5);
+          free(bgx); free(px);
+        }
+
+        // R5-1: 60 Hz straddling word transition (right=#141414, left #141414 -> white, dt=1/60, 15 frames):
+        // every frame 1..15 must keep left_cr >= 4.5, right_cr >= 4.5, and word_diff <= 1
+        {
+          double tr[5 * MB_INST];
+          rect_at(tr, 0, 0, 180, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(tr + MB_INST, 180, 0, 220, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(tr + 2 * MB_INST, 100, 20, 160, 36, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -62);
+          tr[2 * MB_INST + 4] = 18.0; tr[2 * MB_INST + 6] = 1.0; tr[2 * MB_INST + 7] = 1.2;
+          tr[2 * MB_INST + 11] = 0x67 / 255.0; tr[2 * MB_INST + 12] = 0.6; tr[2 * MB_INST + 13] = 14.0;
+          tr[2 * MB_INST + 14] = -1.0; tr[2 * MB_INST + 15] = 1.0;
+          tr[2 * MB_INST + 21] = 20.0; tr[2 * MB_INST + 22] = 0.06; tr[2 * MB_INST + 23] = 0.0;
+          rect_at(tr + 3 * MB_INST, 124, 32, 12, 12, 7, 0.93, 0.93, 0.93, 0);
+          tr[3 * MB_INST + 12] = 16.0; tr[3 * MB_INST + 13] = 16.0; tr[3 * MB_INST + 14] = 16.0; tr[3 * MB_INST + 15] = 16.0;
+          tr[3 * MB_INST + 21] = 180.0; tr[3 * MB_INST + 22] = 38.0; tr[3 * MB_INST + 23] = 18.0;
+          rect_at(tr + 4 * MB_INST, 224, 32, 12, 12, 7, 0.93, 0.93, 0.93, 0);
+          tr[4 * MB_INST + 12] = 16.0; tr[4 * MB_INST + 13] = 16.0; tr[4 * MB_INST + 14] = 16.0; tr[4 * MB_INST + 15] = 16.0;
+          tr[4 * MB_INST + 21] = 180.0; tr[4 * MB_INST + 22] = 38.0; tr[4 * MB_INST + 23] = 18.0;
+          for (int i = 0; i < 5; i++) { tr[i * MB_INST + 18] = 400.0; tr[i * MB_INST + 19] = 120.0; }
+          double prev_dt = ad_fixed_dt;
+          ad_fixed_dt = 1.0 / 60.0;
+          // Capture settled white-left glass-only background for same-pixel CR reference
+          tr[8] = 1.0; tr[9] = 1.0; tr[10] = 1.0;
+          glass_forget();
+          gl_present(tr, 3, 0.08, 0.08, 0.08);
+          unsigned char *bgx = pixels_of_fb(wt_fb);
+          // Start dark-left frame 0, then flip left to white for frames 1..15
+          tr[8] = 0.08; tr[9] = 0.08; tr[10] = 0.08;
+          glass_forget();
+          gl_present(tr, 5, 0.08, 0.08, 0.08);
+          tr[8] = 1.0; tr[9] = 1.0; tr[10] = 1.0;
+          double min_l = 999.0, min_r = 999.0;
+          int max_wd = 0;
+          int r38 = fb_h - 1 - 38;
+          unsigned char *bg_l = bgx + (r38 * fb_w + 130) * 4;
+          unsigned char *bg_r = bgx + (r38 * fb_w + 230) * 4;
+          double ybl = wcag_luma_u8(bg_l[0], bg_l[1], bg_l[2]);
+          double ybr = wcag_luma_u8(bg_r[0], bg_r[1], bg_r[2]);
+          for (int fr = 1; fr <= 15; fr++) {
+            gl_present(tr, 5, 0.08, 0.08, 0.08);
+            unsigned char *px = pixels_of_fb(wt_fb);
+            unsigned char *gl_l = px + (r38 * fb_w + 130) * 4;
+            unsigned char *gl_r = px + (r38 * fb_w + 230) * 4;
+            int wd = 0;
+            for (int c = 0; c < 3; c++) { int d = abs((int)gl_l[c] - (int)gl_r[c]); if (d > wd) wd = d; }
+            if (wd > max_wd) max_wd = wd;
+            double yil = wcag_luma_u8(gl_l[0], gl_l[1], gl_l[2]);
+            double yir = wcag_luma_u8(gl_r[0], gl_r[1], gl_r[2]);
+            double cr_l = ((yil > ybl ? yil : ybl) + 0.05) / ((yil > ybl ? ybl : yil) + 0.05);
+            double cr_r = ((yir > ybr ? yir : ybr) + 0.05) / ((yir > ybr ? ybr : yir) + 0.05);
+            if (cr_l < min_l) min_l = cr_l;
+            if (cr_r < min_r) min_r = cr_r;
+            CHECK(wd <= 1 && cr_l >= 4.5 && cr_r >= 4.5);
+            free(px);
+          }
+          ad_fixed_dt = prev_dt;
+          printf("gles_render: dark adaptive 60Hz transition (15 frames) min_left_cr=%.2f min_right_cr=%.2f max_wd=%d\n",
+                 min_l, min_r, max_wd);
+          free(bgx);
+        }
+
+        // R5-2: p.muted (#A8AAAE) on dark-left/white-right & primary (#EDEDED) on dark-left/pure-red-right
+        for (int tc = 0; tc < 2; tc++) {
+          double mr[4 * MB_INST];
+          rect_at(mr, 0, 0, 216, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(mr + MB_INST, 216, 0, 184, 120, 0, 1.0, tc == 0 ? 1.0 : 0.0, tc == 0 ? 1.0 : 0.0, 0);
+          rect_at(mr + 2 * MB_INST, 100, 20, 160, 36, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -63 - tc);
+          mr[2 * MB_INST + 4] = 18.0; mr[2 * MB_INST + 6] = 1.0; mr[2 * MB_INST + 7] = 1.2;
+          mr[2 * MB_INST + 11] = 0x67 / 255.0; mr[2 * MB_INST + 12] = 0.6; mr[2 * MB_INST + 13] = 14.0;
+          mr[2 * MB_INST + 14] = -1.0; mr[2 * MB_INST + 15] = 1.0;
+          mr[2 * MB_INST + 21] = 20.0; mr[2 * MB_INST + 22] = 0.06; mr[2 * MB_INST + 23] = 0.0;
+          rect_at(mr + 3 * MB_INST, 232, 32, 12, 12, 10,
+                  tc == 0 ? (0xA8/255.0) : 0.93, tc == 0 ? (0xAA/255.0) : 0.93, tc == 0 ? (0xAE/255.0) : 0.93, 0);
+          mr[3 * MB_INST + 4] = 4.0;
+          mr[3 * MB_INST + 12] = 0.1; mr[3 * MB_INST + 13] = 0.5; mr[3 * MB_INST + 14] = 0.9; mr[3 * MB_INST + 15] = 0.5;
+          mr[3 * MB_INST + 21] = 180.0; mr[3 * MB_INST + 22] = 38.0; mr[3 * MB_INST + 23] = 18.0;
+          for (int i = 0; i < 4; i++) { mr[i * MB_INST + 18] = 400.0; mr[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(mr, 3, 0.08, 0.08, 0.08);
+          unsigned char *bgx = pixels_of_fb(wt_fb);
+          glass_forget();
+          gl_present(mr, 4, 0.08, 0.08, 0.08);
+          unsigned char *px = pixels_of_fb(wt_fb);
+          int r38 = fb_h - 1 - 38;
+          unsigned char *gp = bgx + (r38 * fb_w + 238) * 4;
+          unsigned char *ip = px + (r38 * fb_w + 238) * 4;
+          double gl = wcag_luma_u8(gp[0], gp[1], gp[2]), il = wcag_luma_u8(ip[0], ip[1], ip[2]);
+          double cr = ((il > gl ? il : gl) + 0.05) / ((il > gl ? gl : il) + 0.05);
+          printf("gles_render: dark adaptive %s glass=(%d,%d,%d) icon=(%d,%d,%d) cr=%.2f\n",
+                 tc == 0 ? "p.muted-white" : "pure-red", gp[0], gp[1], gp[2], ip[0], ip[1], ip[2], cr);
+          CHECK(cr >= 4.5);
+          free(bgx); free(px);
+        }
+
+        // R5-3: High tint alpha 0xA8 and 0xCC wide capsule (white-left + dark-right) -> stays dark glass + light ink, CR >= 4.5
+        for (int ti = 0; ti < 2; ti++) {
+          double alpha = ti == 0 ? (0xA8 / 255.0) : (0xCC / 255.0);
+          double ht[4 * MB_INST];
+          rect_at(ht, 0, 0, 216, 120, 0, 1.0, 1.0, 1.0, 0);
+          rect_at(ht + MB_INST, 216, 0, 184, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(ht + 2 * MB_INST, 100, 20, 160, 36, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -65 - ti);
+          ht[2 * MB_INST + 4] = 18.0; ht[2 * MB_INST + 6] = 1.0; ht[2 * MB_INST + 7] = 1.2;
+          ht[2 * MB_INST + 11] = alpha; ht[2 * MB_INST + 12] = 0.6; ht[2 * MB_INST + 13] = 14.0;
+          ht[2 * MB_INST + 14] = -1.0; ht[2 * MB_INST + 15] = 1.0;
+          ht[2 * MB_INST + 21] = 20.0; ht[2 * MB_INST + 22] = 0.06; ht[2 * MB_INST + 23] = 0.0;
+          rect_at(ht + 3 * MB_INST, 232, 32, 12, 12, 10, 0.93, 0.93, 0.93, 0);
+          ht[3 * MB_INST + 4] = 4.0;
+          ht[3 * MB_INST + 12] = 0.1; ht[3 * MB_INST + 13] = 0.5; ht[3 * MB_INST + 14] = 0.9; ht[3 * MB_INST + 15] = 0.5;
+          ht[3 * MB_INST + 21] = 180.0; ht[3 * MB_INST + 22] = 38.0; ht[3 * MB_INST + 23] = 18.0;
+          for (int i = 0; i < 4; i++) { ht[i * MB_INST + 18] = 400.0; ht[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(ht, 3, 0.08, 0.08, 0.08);
+          unsigned char *bgx = pixels_of_fb(wt_fb);
+          glass_forget();
+          gl_present(ht, 4, 0.08, 0.08, 0.08);
+          unsigned char *px = pixels_of_fb(wt_fb);
+          int r38 = fb_h - 1 - 38;
+          unsigned char *gp = bgx + (r38 * fb_w + 238) * 4;
+          unsigned char *ip = px + (r38 * fb_w + 238) * 4;
+          double gl = wcag_luma_u8(gp[0], gp[1], gp[2]), il = wcag_luma_u8(ip[0], ip[1], ip[2]);
+          double cr = ((il > gl ? il : gl) + 0.05) / ((il > gl ? gl : il) + 0.05);
+          printf("gles_render: dark adaptive high-alpha=0x%02X glass=(%d,%d,%d) icon=(%d,%d,%d) cr=%.2f\n",
+                 ti == 0 ? 0xA8 : 0xCC, gp[0], gp[1], gp[2], ip[0], ip[1], ip[2], cr);
+          CHECK(il > 0.70 && cr >= 4.5);
+          free(bgx); free(px);
+        }
+
+        // R5-4: Dark -> White -> Dark 50-frame round-trip cache hit (fixed clear color):
+        // returning to cached dark blur slot must re-run fad and restore dark glass (< 70) + white icon (> 200) + settling == 0
+        {
+          double rt[3 * MB_INST];
+          rect_at(rt, 0, 0, 400, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(rt + MB_INST, 150, 20, 100, 36, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -67);
+          rt[MB_INST + 4] = 18.0; rt[MB_INST + 6] = 1.0; rt[MB_INST + 7] = 1.2;
+          rt[MB_INST + 11] = 0x67 / 255.0; rt[MB_INST + 12] = 0.6; rt[MB_INST + 13] = 14.0;
+          rt[MB_INST + 14] = -1.0; rt[MB_INST + 15] = 1.0;
+          rt[MB_INST + 21] = 20.0; rt[MB_INST + 22] = 0.06; rt[MB_INST + 23] = 0.0;
+          rect_at(rt + 2 * MB_INST, 192, 32, 16, 12, 10, 0.93, 0.93, 0.93, 0);
+          rt[2 * MB_INST + 4] = 4.0;
+          rt[2 * MB_INST + 12] = 0.1; rt[2 * MB_INST + 13] = 0.5; rt[2 * MB_INST + 14] = 0.9; rt[2 * MB_INST + 15] = 0.5;
+          rt[2 * MB_INST + 21] = 200.0; rt[2 * MB_INST + 22] = 38.0; rt[2 * MB_INST + 23] = 18.0;
+          for (int i = 0; i < 3; i++) { rt[i * MB_INST + 18] = 400.0; rt[i * MB_INST + 19] = 120.0; }
+          double prev_dt = ad_fixed_dt;
+          ad_fixed_dt = 1.0 / 60.0;
+          glass_forget();
+          for (int ph = 0; ph < 3; ph++) {
+            double v = (ph == 1) ? 1.0 : 0.08;
+            rt[8] = v; rt[9] = v; rt[10] = v;
+            for (int f = 0; f < 50; f++) gl_present(rt, 3, 0.08, 0.08, 0.08);
+          }
+          ad_fixed_dt = prev_dt;
+          unsigned char *px = pixels_of_fb(wt_fb);
+          int r38 = fb_h - 1 - 38;
+          unsigned char *gp = px + (r38 * fb_w + 170) * 4;
+          unsigned char *ip = px + (r38 * fb_w + 200) * 4;
+          int settling = ad_settling;
+          printf("gles_render: dark adaptive 50x3 round-trip cache-hit glass=(%d,%d,%d) icon=(%d,%d,%d) settling=%d\n",
+                 gp[0], gp[1], gp[2], ip[0], ip[1], ip[2], settling);
+          CHECK(gp[0] < 70 && ip[0] > 200 && settling == 0);
+          free(px);
+        }
+
+        // R6-1: Same capsule raises tint alpha 0x67 -> 0xA8 under partial dirty (98,16,164,42) across 50 frames:
+        // must reuse the same adaptive slot immediately (no duplicate concentric slot, every frame CR >= 4.5)
+        {
+          double pa[4 * MB_INST];
+          rect_at(pa, 0, 0, 216, 120, 0, 1.0, 1.0, 1.0, 0);
+          rect_at(pa + MB_INST, 216, 0, 184, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(pa + 2 * MB_INST, 100, 20, 160, 36, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -68);
+          pa[2 * MB_INST + 4] = 18.0; pa[2 * MB_INST + 6] = 1.0; pa[2 * MB_INST + 7] = 1.2;
+          pa[2 * MB_INST + 11] = 0x67 / 255.0; pa[2 * MB_INST + 12] = 0.6; pa[2 * MB_INST + 13] = 14.0;
+          pa[2 * MB_INST + 14] = -1.0; pa[2 * MB_INST + 15] = 1.0;
+          pa[2 * MB_INST + 21] = 20.0; pa[2 * MB_INST + 22] = 0.06; pa[2 * MB_INST + 23] = 0.0;
+          rect_at(pa + 3 * MB_INST, 232, 32, 12, 12, 10, 0.93, 0.93, 0.93, 0);
+          pa[3 * MB_INST + 4] = 4.0;
+          pa[3 * MB_INST + 12] = 0.1; pa[3 * MB_INST + 13] = 0.5; pa[3 * MB_INST + 14] = 0.9; pa[3 * MB_INST + 15] = 0.5;
+          pa[3 * MB_INST + 21] = 180.0; pa[3 * MB_INST + 22] = 38.0; pa[3 * MB_INST + 23] = 18.0;
+          for (int i = 0; i < 4; i++) { pa[i * MB_INST + 18] = 400.0; pa[i * MB_INST + 19] = 120.0; }
+          // Capture 0xA8 glass background without icon
+          pa[2 * MB_INST + 11] = 0xA8 / 255.0;
+          glass_forget();
+          gl_present(pa, 3, 0.08, 0.08, 0.08);
+          unsigned char *bgx = pixels_of_fb(wt_fb);
+          // Prime 2 frames at 0x67, then switch to 0xA8 with partial dirty (98,16,164,42) for 50 frames
+          pa[2 * MB_INST + 11] = 0x67 / 255.0;
+          glass_forget();
+          gl_present(pa, 4, 0.08, 0.08, 0.08);
+          mb_host_render_dirty(98, 16, 164, 42);
+          gl_present(pa, 4, 0.08, 0.08, 0.08);
+          pa[2 * MB_INST + 11] = 0xA8 / 255.0;
+          int r38 = fb_h - 1 - 38;
+          unsigned char *gp = bgx + (r38 * fb_w + 238) * 4;
+          double gl = wcag_luma_u8(gp[0], gp[1], gp[2]);
+          double min_cr = 999.0;
+          for (int f = 0; f < 50; f++) {
+            mb_host_render_dirty(98, 16, 164, 42);
+            gl_present(pa, 4, 0.08, 0.08, 0.08);
+            unsigned char *px = pixels_of_fb(wt_fb);
+            unsigned char *ip = px + (r38 * fb_w + 238) * 4;
+            double il = wcag_luma_u8(ip[0], ip[1], ip[2]);
+            double cr = ((il > gl ? il : gl) + 0.05) / ((il > gl ? gl : il) + 0.05);
+            if (cr < min_cr) min_cr = cr;
+            CHECK(il > 0.70 && cr >= 4.5);
+            free(px);
+          }
+          printf("gles_render: dark adaptive 0x67->0xA8 partial-dirty 50f min_cr=%.2f\n", min_cr);
+          free(bgx);
+        }
+
+        // R6-2: Narrow bright edge (split x=242, capsule 100..260) + p.muted (#A8AAAE) icon at (250,38) -> CR >= 4.5
+        {
+          double nm[4 * MB_INST];
+          rect_at(nm, 0, 0, 242, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(nm + MB_INST, 242, 0, 158, 120, 0, 1.0, 1.0, 1.0, 0);
+          rect_at(nm + 2 * MB_INST, 100, 20, 160, 36, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -69);
+          nm[2 * MB_INST + 4] = 18.0; nm[2 * MB_INST + 6] = 1.0; nm[2 * MB_INST + 7] = 1.2;
+          nm[2 * MB_INST + 11] = 0x67 / 255.0; nm[2 * MB_INST + 12] = 0.6; nm[2 * MB_INST + 13] = 14.0;
+          nm[2 * MB_INST + 14] = -1.0; nm[2 * MB_INST + 15] = 1.0;
+          nm[2 * MB_INST + 21] = 20.0; nm[2 * MB_INST + 22] = 0.06; nm[2 * MB_INST + 23] = 0.0;
+          rect_at(nm + 3 * MB_INST, 244, 32, 12, 12, 10, 0xA8/255.0, 0xAA/255.0, 0xAE/255.0, 0);
+          nm[3 * MB_INST + 4] = 4.0;
+          nm[3 * MB_INST + 12] = 0.1; nm[3 * MB_INST + 13] = 0.5; nm[3 * MB_INST + 14] = 0.9; nm[3 * MB_INST + 15] = 0.5;
+          nm[3 * MB_INST + 21] = 180.0; nm[3 * MB_INST + 22] = 38.0; nm[3 * MB_INST + 23] = 18.0;
+          for (int i = 0; i < 4; i++) { nm[i * MB_INST + 18] = 400.0; nm[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(nm, 3, 0.08, 0.08, 0.08);
+          unsigned char *bgx = pixels_of_fb(wt_fb);
+          glass_forget();
+          gl_present(nm, 4, 0.08, 0.08, 0.08);
+          unsigned char *px = pixels_of_fb(wt_fb);
+          int r38 = fb_h - 1 - 38;
+          unsigned char *gp = bgx + (r38 * fb_w + 250) * 4;
+          unsigned char *ip = px + (r38 * fb_w + 250) * 4;
+          double gl = wcag_luma_u8(gp[0], gp[1], gp[2]), il = wcag_luma_u8(ip[0], ip[1], ip[2]);
+          double cr = ((il > gl ? il : gl) + 0.05) / ((il > gl ? gl : il) + 0.05);
+          printf("gles_render: dark adaptive narrow-bright p.muted glass=(%d,%d,%d) icon=(%d,%d,%d) cr=%.2f\n",
+                 gp[0], gp[1], gp[2], ip[0], ip[1], ip[2], cr);
+          CHECK(cr >= 4.5);
+          free(bgx); free(px);
+        }
+
+        // R7-1: Narrow bright edge (split x=242, capsule 100..260) + short muted word (p.muted #A8AAAE)
+        // whose glyphs have word-center sample_off pointing to x=222 (dark side): BOTH ends stay uniform & CR >= 4.5
+        {
+          double mw[5 * MB_INST];
+          rect_at(mw, 0, 0, 242, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(mw + MB_INST, 242, 0, 158, 120, 0, 1.0, 1.0, 1.0, 0);
+          rect_at(mw + 2 * MB_INST, 100, 20, 160, 36, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -70);
+          mw[2 * MB_INST + 4] = 18.0; mw[2 * MB_INST + 6] = 1.0; mw[2 * MB_INST + 7] = 1.2;
+          mw[2 * MB_INST + 11] = 0x67 / 255.0; mw[2 * MB_INST + 12] = 0.6; mw[2 * MB_INST + 13] = 14.0;
+          mw[2 * MB_INST + 14] = -1.0; mw[2 * MB_INST + 15] = 1.0;
+          mw[2 * MB_INST + 21] = 20.0; mw[2 * MB_INST + 22] = 0.06; mw[2 * MB_INST + 23] = 0.0;
+          // Left glyph at center (200, 38) with word-center offset +22 -> x=222
+          rect_at(mw + 3 * MB_INST, 194, 32, 12, 12, 7, 0xA8/255.0, 0xAA/255.0, 0xAE/255.0, 0);
+          mw[3 * MB_INST + 6] = 22.0; mw[3 * MB_INST + 7] = 0.0;
+          mw[3 * MB_INST + 12] = 16.0; mw[3 * MB_INST + 13] = 16.0; mw[3 * MB_INST + 14] = 16.0; mw[3 * MB_INST + 15] = 16.0;
+          mw[3 * MB_INST + 21] = 180.0; mw[3 * MB_INST + 22] = 38.0; mw[3 * MB_INST + 23] = 18.0;
+          // Right glyph at center (251, 38) with word-center offset -29 -> x=222 (strictly in white strip x>242)
+          rect_at(mw + 4 * MB_INST, 245, 32, 12, 12, 7, 0xA8/255.0, 0xAA/255.0, 0xAE/255.0, 0);
+          mw[4 * MB_INST + 6] = -29.0; mw[4 * MB_INST + 7] = 0.0;
+          mw[4 * MB_INST + 12] = 16.0; mw[4 * MB_INST + 13] = 16.0; mw[4 * MB_INST + 14] = 16.0; mw[4 * MB_INST + 15] = 16.0;
+          mw[4 * MB_INST + 21] = 180.0; mw[4 * MB_INST + 22] = 38.0; mw[4 * MB_INST + 23] = 18.0;
+          for (int i = 0; i < 5; i++) { mw[i * MB_INST + 18] = 400.0; mw[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(mw, 3, 0.08, 0.08, 0.08);
+          unsigned char *bgx = pixels_of_fb(wt_fb);
+          glass_forget();
+          gl_present(mw, 5, 0.08, 0.08, 0.08);
+          unsigned char *px = pixels_of_fb(wt_fb);
+          int r38 = fb_h - 1 - 38;
+          unsigned char *bgl = bgx + (r38 * fb_w + 200) * 4, *bgr = bgx + (r38 * fb_w + 251) * 4;
+          unsigned char *fgl = px + (r38 * fb_w + 200) * 4, *fgr = px + (r38 * fb_w + 251) * 4;
+          double ll = wcag_luma_u8(bgl[0], bgl[1], bgl[2]), fl = wcag_luma_u8(fgl[0], fgl[1], fgl[2]);
+          double lr = wcag_luma_u8(bgr[0], bgr[1], bgr[2]), fr = wcag_luma_u8(fgr[0], fgr[1], fgr[2]);
+          double crl = ((fl > ll ? fl : ll) + 0.05) / ((fl > ll ? ll : fl) + 0.05);
+          double crr = ((fr > lr ? fr : lr) + 0.05) / ((fr > lr ? lr : fr) + 0.05);
+          int wd = 0;
+          for (int c = 0; c < 3; c++) { int d = abs((int)fgl[c] - (int)fgr[c]); if (d > wd) wd = d; }
+          printf("gles_render: dark adaptive narrow-bright muted-word left_cr=%.2f right_cr=%.2f diff=%d\n", crl, crr, wd);
+          CHECK(wd <= 1 && crl >= 4.5 && crr >= 4.5);
+          free(bgx); free(px);
+        }
+
+        // R8-1: Wide 320pt capsule (40..360) with 16pt white stripe sweeping across icon (238,38) and
+        // short muted word (center 212, last glyph 239): every stripe position keeps CR >= 4.5 & word_diff <= 1
+        {
+          double sw[6 * MB_INST];
+          rect_at(sw, 0, 0, 400, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(sw + MB_INST, 224, 0, 16, 120, 0, 1.0, 1.0, 1.0, 0);
+          rect_at(sw + 2 * MB_INST, 40, 20, 320, 36, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -71);
+          sw[2 * MB_INST + 4] = 18.0; sw[2 * MB_INST + 6] = 1.0; sw[2 * MB_INST + 7] = 1.2;
+          sw[2 * MB_INST + 11] = 0x67 / 255.0; sw[2 * MB_INST + 12] = 0.6; sw[2 * MB_INST + 13] = 14.0;
+          sw[2 * MB_INST + 14] = -1.0; sw[2 * MB_INST + 15] = 1.0;
+          sw[2 * MB_INST + 21] = 20.0; sw[2 * MB_INST + 22] = 0.06; sw[2 * MB_INST + 23] = 0.0;
+          // Muted icon at (238, 38)
+          rect_at(sw + 3 * MB_INST, 232, 32, 12, 12, 10, 0xA8/255.0, 0xAA/255.0, 0xAE/255.0, 0);
+          sw[3 * MB_INST + 4] = 4.0;
+          sw[3 * MB_INST + 12] = 0.1; sw[3 * MB_INST + 13] = 0.5; sw[3 * MB_INST + 14] = 0.9; sw[3 * MB_INST + 15] = 0.5;
+          sw[3 * MB_INST + 21] = 200.0; sw[3 * MB_INST + 22] = 38.0; sw[3 * MB_INST + 23] = 18.0;
+          // Muted short word glyphs: left (185, 38) and right (239, 38), both with sample_off pointing to word center 212
+          rect_at(sw + 4 * MB_INST, 179, 32, 12, 12, 7, 0xA8/255.0, 0xAA/255.0, 0xAE/255.0, 0);
+          sw[4 * MB_INST + 6] = 27.0; sw[4 * MB_INST + 7] = 0.0;
+          sw[4 * MB_INST + 12] = 16.0; sw[4 * MB_INST + 13] = 16.0; sw[4 * MB_INST + 14] = 16.0; sw[4 * MB_INST + 15] = 16.0;
+          sw[4 * MB_INST + 21] = 200.0; sw[4 * MB_INST + 22] = 38.0; sw[4 * MB_INST + 23] = 18.0;
+          rect_at(sw + 5 * MB_INST, 233, 32, 12, 12, 7, 0xA8/255.0, 0xAA/255.0, 0xAE/255.0, 0);
+          sw[5 * MB_INST + 6] = -27.0; sw[5 * MB_INST + 7] = 0.0;
+          sw[5 * MB_INST + 12] = 16.0; sw[5 * MB_INST + 13] = 16.0; sw[5 * MB_INST + 14] = 16.0; sw[5 * MB_INST + 15] = 16.0;
+          sw[5 * MB_INST + 21] = 200.0; sw[5 * MB_INST + 22] = 38.0; sw[5 * MB_INST + 23] = 18.0;
+          for (int i = 0; i < 6; i++) { sw[i * MB_INST + 18] = 400.0; sw[i * MB_INST + 19] = 120.0; }
+          int r38 = fb_h - 1 - 38;
+          double min_icr = 999.0, min_wcr = 999.0;
+          int max_wd = 0;
+          for (int sx = 224; sx <= 240; sx += 4) {
+            sw[MB_INST + 0] = (double)sx;
+            glass_forget();
+            gl_present(sw, 3, 0.08, 0.08, 0.08);
+            unsigned char *bgx = pixels_of_fb(wt_fb);
+            glass_forget();
+            gl_present(sw, 4, 0.08, 0.08, 0.08);
+            unsigned char *ipx = pixels_of_fb(wt_fb);
+            unsigned char *bg_i = bgx + (r38 * fb_w + 238) * 4, *fg_i = ipx + (r38 * fb_w + 238) * 4;
+            double li = wcag_luma_u8(bg_i[0], bg_i[1], bg_i[2]), fi = wcag_luma_u8(fg_i[0], fg_i[1], fg_i[2]);
+            double icr = ((fi > li ? fi : li) + 0.05) / ((fi > li ? li : fi) + 0.05);
+            if (icr < min_icr) min_icr = icr;
+            CHECK(icr >= 4.5);
+            free(ipx);
+            // Word (draw sw[0..2] + sw[4..5] by copying sw[4..5] into slots 3..4 temporarily via separate array)
+            double sww[5 * MB_INST];
+            memcpy(sww, sw, 3 * MB_INST * sizeof(double));
+            memcpy(sww + 3 * MB_INST, sw + 4 * MB_INST, 2 * MB_INST * sizeof(double));
+            glass_forget();
+            gl_present(sww, 5, 0.08, 0.08, 0.08);
+            unsigned char *wpx = pixels_of_fb(wt_fb);
+            unsigned char *bgl = bgx + (r38 * fb_w + 185) * 4, *bgr = bgx + (r38 * fb_w + 239) * 4;
+            unsigned char *fgl = wpx + (r38 * fb_w + 185) * 4, *fgr = wpx + (r38 * fb_w + 239) * 4;
+            double ll = wcag_luma_u8(bgl[0], bgl[1], bgl[2]), fl = wcag_luma_u8(fgl[0], fgl[1], fgl[2]);
+            double lr = wcag_luma_u8(bgr[0], bgr[1], bgr[2]), fr = wcag_luma_u8(fgr[0], fgr[1], fgr[2]);
+            double crl = ((fl > ll ? fl : ll) + 0.05) / ((fl > ll ? ll : fl) + 0.05);
+            double crr = ((fr > lr ? fr : lr) + 0.05) / ((fr > lr ? lr : fr) + 0.05);
+            if (crl < min_wcr) min_wcr = crl;
+            if (crr < min_wcr) min_wcr = crr;
+            for (int c = 0; c < 3; c++) { int d = abs((int)fgl[c] - (int)fgr[c]); if (d > max_wd) max_wd = d; }
+            CHECK(crl >= 4.5 && crr >= 4.5 && max_wd <= 1);
+            free(wpx); free(bgx);
+          }
+          printf("gles_render: dark adaptive 320pt 16pt-stripe sweep min_icon_cr=%.2f min_word_cr=%.2f max_wd=%d\n",
+                 min_icr, min_wcr, max_wd);
+        }
+
+        // R9-1: Wide 144pt muted 12-char word ("Environments", word center x=208, last glyph x=271 over stripe x=268..284)
+        // AND R9-2: Off-center muted icon at (200,28) inside 56pt-tall capsule (y=20..76, center y=48) over bright patch [188,212)x[20,32)
+        {
+          double ew[5 * MB_INST];
+          rect_at(ew, 0, 0, 400, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(ew + MB_INST, 268, 0, 16, 120, 0, 1.0, 1.0, 1.0, 0);
+          rect_at(ew + 2 * MB_INST, 40, 20, 320, 36, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -72);
+          ew[2 * MB_INST + 4] = 18.0; ew[2 * MB_INST + 6] = 1.0; ew[2 * MB_INST + 7] = 1.2;
+          ew[2 * MB_INST + 11] = 0x67 / 255.0; ew[2 * MB_INST + 12] = 0.6; ew[2 * MB_INST + 13] = 14.0;
+          ew[2 * MB_INST + 14] = -1.0; ew[2 * MB_INST + 15] = 1.0;
+          ew[2 * MB_INST + 21] = 20.0; ew[2 * MB_INST + 22] = 0.06; ew[2 * MB_INST + 23] = 0.0;
+          rect_at(ew + 3 * MB_INST, 139, 32, 12, 12, 7, 0xA8/255.0, 0xAA/255.0, 0xAE/255.0, 0);
+          ew[3 * MB_INST + 6] = 63.0; ew[3 * MB_INST + 7] = 0.0;
+          ew[3 * MB_INST + 12] = 16.0; ew[3 * MB_INST + 13] = 16.0; ew[3 * MB_INST + 14] = 16.0; ew[3 * MB_INST + 15] = 16.0;
+          ew[3 * MB_INST + 21] = 200.0; ew[3 * MB_INST + 22] = 38.0; ew[3 * MB_INST + 23] = 18.0;
+          rect_at(ew + 4 * MB_INST, 265, 32, 12, 12, 7, 0xA8/255.0, 0xAA/255.0, 0xAE/255.0, 0);
+          ew[4 * MB_INST + 6] = -63.0; ew[4 * MB_INST + 7] = 0.0;
+          ew[4 * MB_INST + 12] = 16.0; ew[4 * MB_INST + 13] = 16.0; ew[4 * MB_INST + 14] = 16.0; ew[4 * MB_INST + 15] = 16.0;
+          ew[4 * MB_INST + 21] = 200.0; ew[4 * MB_INST + 22] = 38.0; ew[4 * MB_INST + 23] = 18.0;
+          for (int i = 0; i < 5; i++) { ew[i * MB_INST + 18] = 400.0; ew[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(ew, 3, 0.08, 0.08, 0.08);
+          unsigned char *bgx = pixels_of_fb(wt_fb);
+          glass_forget();
+          gl_present(ew, 5, 0.08, 0.08, 0.08);
+          unsigned char *px = pixels_of_fb(wt_fb);
+          int r38 = fb_h - 1 - 38;
+          unsigned char *bgl = bgx + (r38 * fb_w + 145) * 4, *bgr = bgx + (r38 * fb_w + 271) * 4;
+          unsigned char *fgl = px + (r38 * fb_w + 145) * 4, *fgr = px + (r38 * fb_w + 271) * 4;
+          double ll = wcag_luma_u8(bgl[0], bgl[1], bgl[2]), fl = wcag_luma_u8(fgl[0], fgl[1], fgl[2]);
+          double lr = wcag_luma_u8(bgr[0], bgr[1], bgr[2]), fr = wcag_luma_u8(fgr[0], fgr[1], fgr[2]);
+          double crl = ((fl > ll ? fl : ll) + 0.05) / ((fl > ll ? ll : fl) + 0.05);
+          double crr = ((fr > lr ? fr : lr) + 0.05) / ((fr > lr ? lr : fr) + 0.05);
+          int wd = 0;
+          for (int c = 0; c < 3; c++) { int d = abs((int)fgl[c] - (int)fgr[c]); if (d > wd) wd = d; }
+          printf("gles_render: dark adaptive 144pt-word left_cr=%.2f right_cr=%.2f diff=%d\n", crl, crr, wd);
+          CHECK(wd <= 1 && crl >= 4.5 && crr >= 4.5);
+          free(bgx); free(px);
+
+          // R9-2: Off-center icon at (200, 28) in 56pt-tall capsule (y=20..76, center y=48)
+          double oc[4 * MB_INST];
+          rect_at(oc, 0, 0, 400, 120, 0, 0.08, 0.08, 0.08, 0);
+          rect_at(oc + MB_INST, 188, 20, 24, 12, 0, 1.0, 1.0, 1.0, 0);
+          rect_at(oc + 2 * MB_INST, 120, 20, 160, 56, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -73);
+          oc[2 * MB_INST + 4] = 28.0; oc[2 * MB_INST + 6] = 1.0; oc[2 * MB_INST + 7] = 1.2;
+          oc[2 * MB_INST + 11] = 0x67 / 255.0; oc[2 * MB_INST + 12] = 0.6; oc[2 * MB_INST + 13] = 14.0;
+          oc[2 * MB_INST + 14] = -1.0; oc[2 * MB_INST + 15] = 1.0;
+          oc[2 * MB_INST + 21] = 20.0; oc[2 * MB_INST + 22] = 0.06; oc[2 * MB_INST + 23] = 0.0;
+          rect_at(oc + 3 * MB_INST, 194, 22, 12, 12, 10, 0xA8/255.0, 0xAA/255.0, 0xAE/255.0, 0);
+          oc[3 * MB_INST + 4] = 4.0;
+          oc[3 * MB_INST + 12] = 0.1; oc[3 * MB_INST + 13] = 0.5; oc[3 * MB_INST + 14] = 0.9; oc[3 * MB_INST + 15] = 0.5;
+          oc[3 * MB_INST + 21] = 200.0; oc[3 * MB_INST + 22] = 48.0; oc[3 * MB_INST + 23] = 28.0;
+          for (int i = 0; i < 4; i++) { oc[i * MB_INST + 18] = 400.0; oc[i * MB_INST + 19] = 120.0; }
+          glass_forget();
+          gl_present(oc, 3, 0.08, 0.08, 0.08);
+          bgx = pixels_of_fb(wt_fb);
+          glass_forget();
+          gl_present(oc, 4, 0.08, 0.08, 0.08);
+          px = pixels_of_fb(wt_fb);
+          int r28 = fb_h - 1 - 28;
+          unsigned char *gp = bgx + (r28 * fb_w + 200) * 4, *ip = px + (r28 * fb_w + 200) * 4;
+          double gl = wcag_luma_u8(gp[0], gp[1], gp[2]), il = wcag_luma_u8(ip[0], ip[1], ip[2]);
+          double cr = ((il > gl ? il : gl) + 0.05) / ((il > gl ? gl : il) + 0.05);
+          printf("gles_render: dark adaptive offcenter-56pt icon glass=(%d,%d,%d) icon=(%d,%d,%d) cr=%.2f\n",
+                 gp[0], gp[1], gp[2], ip[0], ip[1], ip[2], cr);
+          CHECK(cr >= 4.5);
+          free(bgx); free(px);
+        }
+
+        target_fb = pb_fb; fb_w = fbw_save; fb_h = fbh_save; cur_w = w_save; cur_h = h_save; cur_scale = sc_save;
+        glBindFramebuffer(GL_FRAMEBUFFER, target_fb);
+        glDeleteFramebuffers(1, &wt_fb);
+        glDeleteTextures(1, &wt_tex);
       }
     }
     if (pb_fb) glDeleteFramebuffers(1, &pb_fb);

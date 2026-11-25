@@ -104,6 +104,7 @@ struct MBAdSlot {
   int active;
   float cx, cy, hx, hy;
   int is_dark;
+  uintptr_t last_bd;
   double settle_left;
   uint64_t updated_serial;
   uint64_t seen_serial;
@@ -277,7 +278,7 @@ static const char *shader_src =
     "  float lo = floor(saturate(rg.y) * 255.0 + 0.5);\n"
     "  return (hi * 256.0 + lo) / 65535.0;\n"
     "}\n"
-    "float2 ad_sample_ink(float2 ac, float fallback_r, out float2 capCenter, out float2 capHalf) {\n"
+    "float3 ad_sample_ink(float2 ac, float fallback_r, out float2 capCenter, out float2 capHalf) {\n"
     "  int ad_n = int(gad_meta.x + 0.5);\n"
     "  [branch] if (ad_n > 0) {\n"
     "    int best = -1;\n"
@@ -302,41 +303,59 @@ static const char *shader_src =
     "      float4 px = ad_tex.Load(int3(best, 0, 0));\n"
     "      capCenter = gad_box[best].xy;\n"
     "      capHalf = gad_box[best].zw;\n"
-    "      return float2(mb_unpack16(px.rg), px.a);\n"
+    "      return float3(mb_unpack16(px.rg), px.a, px.b);\n"
     "    }\n"
     "  }\n"
     "  capCenter = ac;\n"
     "  capHalf = float2(0.0, 0.0);\n"
     "  float bgL = mb_backdrop_luma_rect(ac, float2(max(fallback_r, 1.0), max(fallback_r, 1.0)));\n"
-    "  return float2(1.0 - smoothstep(0.12, 0.21, bgL), bgL);\n"
+    "  return float3(1.0 - smoothstep(0.12, 0.21, bgL), bgL, 0.0);\n"
     "}\n"
     "float mb_srgb_to_lin(float c) {\n"
     "  return c <= 0.04045 ? (c / 12.92) : pow(max((c + 0.055) / 1.055, 0.0), 2.4);\n"
+    "}\n"
+    "float mb_wcag_luma(float3 c) {\n"
+    "  return 0.2126 * mb_srgb_to_lin(c.r) + 0.7152 * mb_srgb_to_lin(c.g) + 0.0722 * mb_srgb_to_lin(c.b);\n"
+    "}\n"
+    "float mb_backdrop_wcag_luma_rect(float2 c, float2 h) {\n"
+    "  float sum = 0.0;\n"
+    "  float mx1 = -1.0, mx2 = -1.0;\n"
+    "  float mn1 = 2.0, mn2 = 2.0;\n"
+    "  [unroll] for (int iy = -1; iy <= 1; iy++) {\n"
+    "    float py = c.y + float(iy) * (h.y * 0.60);\n"
+    "    [unroll] for (int ix = -2; ix <= 2; ix++) {\n"
+    "      float px = c.x + float(ix) * (h.x * 0.38);\n"
+    "      float y = mb_wcag_luma(backdrop(float2(px, py)));\n"
+    "      sum += y;\n"
+    "      if (y > mx1) { mx2 = mx1; mx1 = y; } else if (y > mx2) { mx2 = y; }\n"
+    "      if (y < mn1) { mn2 = mn1; mn1 = y; } else if (y < mn2) { mn2 = y; }\n"
+    "    }\n"
+    "  }\n"
+    "  return (sum - mx1 - mx2 - mn1 - mn2) / 11.0;\n"
     "}\n"
     "float mb_lin_to_srgb(float y) {\n"
     "  y = clamp(y, 0.0, 1.0);\n"
     "  return y <= 0.0031308 ? (12.92 * y) : (1.055 * pow(max(y, 0.0), 1.0 / 2.4) - 0.055);\n"
     "}\n"
-    "float3 mb_bare_adaptive_ink_at(float3 rgb, float2 ac, float hr) {\n"
+    "float3 mb_bare_adaptive_ink_at(float3 rgb, float2 ac, float2 h) {\n"
     "  float ch = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);\n"
     "  if (ch > 0.08) return rgb;\n"
     "  float origL = luma(rgb);\n"
-    "  float bgL = mb_backdrop_luma_rect(ac, float2(max(hr, 1.0), max(hr, 1.0)));\n"
-    "  float c_bg = sqrt(max(bgL, 0.0));\n"
-    "  float Lbg = mb_srgb_to_lin(c_bg);\n"
+    "  float origY = mb_wcag_luma(rgb);\n"
+    "  float Lbg = mb_backdrop_wcag_luma_rect(ac, max(h, float2(1.0, 1.0)));\n"
     "  float target = 4.65;\n"
     "  float out_c;\n"
     "  if (Lbg >= 0.1792) {\n"
     "    float pref = origL < 0.5 ? origL : clamp(1.0 - origL, 0.02, 0.45);\n"
-    "    float y_pref = mb_srgb_to_lin(pref);\n"
+    "    float y_pref = origL < 0.5 ? origY : mb_srgb_to_lin(pref);\n"
     "    float y_max = max(0.0, (Lbg + 0.05) / target - 0.05);\n"
-    "    if (origL < 0.5 && y_pref <= y_max) return rgb;\n"
+    "    if (origL < 0.5 && origY <= y_max) return rgb;\n"
     "    out_c = mb_lin_to_srgb(min(y_pref, y_max));\n"
     "  } else {\n"
     "    float pref = origL >= 0.5 ? origL : clamp(1.06 - origL, 0.55, 0.98);\n"
-    "    float y_pref = mb_srgb_to_lin(pref);\n"
+    "    float y_pref = origL >= 0.5 ? origY : mb_srgb_to_lin(pref);\n"
     "    float y_min = min(1.0, target * (Lbg + 0.05) - 0.05);\n"
-    "    if (origL >= 0.5 && y_pref >= y_min) return rgb;\n"
+    "    if (origL >= 0.5 && origY >= y_min) return rgb;\n"
     "    out_c = mb_lin_to_srgb(max(y_pref, y_min));\n"
     "  }\n"
     "  return float3(out_c, out_c, out_c);\n"
@@ -344,11 +363,41 @@ static const char *shader_src =
     "float3 mb_adaptive_ink_at(float3 rgb, float2 ac, float fallback_r, float4 rect, float2 sample_off, bool is_icon) {\n"
     "  float ch = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);\n"
     "  float origL = luma(rgb);\n"
-    "  if (ch > 0.08 || origL >= 0.5) return rgb;\n"
+    "  if (ch > 0.08) return rgb;\n"
     "  float2 capCenter, capHalf;\n"
-    "  float2 cap = ad_sample_ink(ac, fallback_r, capCenter, capHalf);\n"
+    "  float3 cap = ad_sample_ink(ac, fallback_r, capCenter, capHalf);\n"
     "  float capsuleDarkT = cap.x;\n"
     "  float capsuleBgL = cap.y;\n"
+    "  float capsuleLatch = cap.z;\n"
+    "  if (origL >= 0.5) {\n"
+    "    if (capHalf.x <= 0.0) return rgb;\n"
+    "    int code = int(floor(saturate(capsuleLatch) * 255.0 + 0.5));\n"
+    "    if (code < 48 || code > 208) return rgb;\n"
+    "    if (code >= 96) {\n"
+    "      float darkL = clamp(1.0 - origL, 0.06, 0.10);\n"
+    "      return float3(darkL, darkL, darkL);\n"
+    "    }\n"
+    "    float bgL = capsuleBgL;\n"
+    "    [branch] if (origL < 0.94 && guvc.z > guvc.x && guvc.w > guvc.y) {\n"
+    "      float2 samplePos = rect.xy + rect.zw * 0.5 + sample_off;\n"
+    "      float stepX = is_icon ? 4.0 : 8.0;\n"
+    "      int halfN = is_icon ? 2 : 12;\n"
+    "      [unroll] for (int iy = -1; iy <= 1; iy++) {\n"
+    "        float py = clamp(samplePos.y + float(iy) * 5.0, capCenter.y - capHalf.y, capCenter.y + capHalf.y);\n"
+    "        [loop] for (int ix = -12; ix <= 12; ix++) {\n"
+    "          float px = samplePos.x + float(ix) * stepX;\n"
+    "          if (abs(ix) <= halfN && px >= capCenter.x - capHalf.x && px <= capCenter.x + capHalf.x) {\n"
+    "            float2 guv = float2(px, py) * gmap.xy + gmap.zw;\n"
+    "            if (guv.x >= guvc.x && guv.x <= guvc.z && guv.y >= guvc.y && guv.y <= guvc.w) {\n"
+    "              bgL = max(bgL, mb_ink_luma(backdrop(float2(px, py))));\n"
+    "            }\n"
+    "          }\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    float liftW = smoothstep(0.03, 0.08, bgL);\n"
+    "    return lerp(rgb, max(rgb, float3(0.95, 0.95, 0.95)), liftW);\n"
+    "  }\n"
     "  float darkT = capsuleDarkT;\n"
     "  float localBoost = 0.0;\n"
     "  bool is_large = (capHalf.x >= 140.0 && capHalf.y >= 19.0);\n"
@@ -401,12 +450,16 @@ static const char *shader_src =
     "  float4 col = I.color;\n"
     "  if (kind == 7) {\n"
     "    col.rgb = I.pd.w < 0.0\n"
-    "      ? mb_bare_adaptive_ink_at(col.rgb, I.pd.yz, -I.pd.w * 0.5)\n"
+    "      ? mb_bare_adaptive_ink_at(col.rgb, I.rect.xy + I.rect.zw * 0.5, float2(max(-I.pd.w, I.rect.z), max(max(-I.pd.w * 0.5, I.rect.w), 1.0)))\n"
     "      : mb_adaptive_ink_at(col.rgb, I.pd.yz, I.pd.w * 0.5, I.rect, I.p.zw, false);\n"
-    "  } else if (kind == 10 && I.pd.w > 0.0) {\n"
-    "    col.rgb = mb_adaptive_ink_at(col.rgb, I.pd.yz, I.pd.w * 0.5, I.rect, float2(0.0, 0.0), true);\n"
-    "  } else if (kind == 11 && I.pd.w > 0.0) {\n"
-    "    col.rgb = mb_adaptive_ink_at(col.rgb, I.pd.yz, I.pd.w * 0.5, I.rect, I.p.zw, true);\n"
+    "  } else if (kind == 10 && I.pd.w != 0.0) {\n"
+    "    col.rgb = I.pd.w < 0.0\n"
+    "      ? mb_bare_adaptive_ink_at(col.rgb, I.rect.xy + I.rect.zw * 0.5, float2(max(-I.pd.w * 0.5, 1.0), max(-I.pd.w * 0.5, 1.0)))\n"
+    "      : mb_adaptive_ink_at(col.rgb, I.pd.yz, I.pd.w * 0.5, I.rect, float2(0.0, 0.0), true);\n"
+    "  } else if (kind == 11 && I.pd.w != 0.0) {\n"
+    "    col.rgb = I.pd.w < 0.0\n"
+    "      ? mb_bare_adaptive_ink_at(col.rgb, I.rect.xy + I.rect.zw * 0.5 + I.p.zw, float2(max(-I.pd.w * 0.5, 1.0), max(-I.pd.w * 0.5, 1.0)))\n"
+    "      : mb_adaptive_ink_at(col.rgb, I.pd.yz, I.pd.w * 0.5, I.rect, I.p.zw, true);\n"
     "  } else if (kind == 0 && I.pd.w < 0.0) {\n"
     "    float ch = max(max(col.r, col.g), col.b) - min(min(col.r, col.g), col.b);\n"
     "    float2 capCenter, capHalf;\n"
@@ -547,11 +600,16 @@ static const char *shader_src =
     "      }\n"
     "    }\n"
     "    if (best >= 0) {\n"
-    "      return mb_unpack16(ad_tex.Load(int3(best, 0, 0)).rg);\n"
+    "      float4 px = ad_tex.Load(int3(best, 0, 0));\n"
+    "      if (is_dark_glass) {\n"
+    "        int code = int(floor(saturate(px.b) * 255.0 + 0.5));\n"
+    "        if (code >= 48 && code <= 208) return (code >= 96) ? 1.0 : 0.0;\n"
+    "      }\n"
+    "      return mb_unpack16(px.rg);\n"
     "    }\n"
     "  }\n"
     "  float bgL = mb_backdrop_luma_rect(ac, float2(max(fallback_r, 1.0), max(fallback_r, 1.0)));\n"
-    "  return is_dark_glass ? smoothstep(0.35, 0.85, bgL) : (1.0 - smoothstep(0.12, 0.21, bgL));\n"
+    "  return is_dark_glass ? smoothstep(0.20, 0.26, bgL) : (1.0 - smoothstep(0.12, 0.21, bgL));\n"
     "}\n"
     "// how much of the pixel at p its rounded clip keeps (r: the corners' radii, top left, then clockwise; s: how smooth\n"
     "// each is), its edge covered as a box's own (0.5 - d * scale), so what it cuts meets the ground of the box that cuts\n"
@@ -890,6 +948,7 @@ static const char *shader_src =
     "    float glintFaceGain;\n"
     "    float glintVib;\n"
     "    float fogT = 0.0;\n"
+    "    float darkAdGlareW = 0.0;\n"
     "    float darkMixSaved = 0.0;\n"
     "    float regExtra = 0.0;\n"
     "    if (is_clear) {\n"
@@ -918,19 +977,23 @@ static const char *shader_src =
     "        float val = ad_sample(ac, ar, is_dark);\n"
     "        float baseDens = lerp(0.404, col.a, smoothstep(0.405, 0.46, col.a));\n"
     "        if (is_dark) {\n"
-    "          float brightT = val * solidFade;\n"
+    "          float extra = saturate((baseDens - 0.404) / (1.0 - 0.404));\n"
+    "          float brightT = val * solidFade * (1.0 - extra);\n"
     "          fogT = brightT;\n"
-    "          float dens = max(baseDens, lerp(baseDens, 0.45, brightT));\n"
-    "          float extra = saturate((dens - 0.404) / (1.0 - 0.404));\n"
     "          regExtra = extra;\n"
     "          float darkPow = pow(extra, 1.00);\n"
     "          float darkCPow = pow(extra, 1.05);\n"
     "          float darkBump = 3.5 * smoothstep(0.0, 0.16, extra) * (1.0 - smoothstep(0.22, 0.38, extra));\n"
     "          float emBase = (34.0 + darkBump) / 255.0;\n"
-    "          emission = lerp(float3(emBase, emBase, emBase), col.rgb, pow(extra, 1.5));\n"
-    "          transmittance = lerp(0.59, 0.0, darkPow);\n"
-    "          lift = lerp(0.55, 0.0, extra);\n"
-    "          chromaGain = lerp(1.05, 0.0, darkCPow);\n"
+    "          float3 darkEm = lerp(float3(emBase, emBase, emBase), col.rgb, pow(extra, 1.5));\n"
+    "          float darkTrans = lerp(0.59, 0.0, darkPow);\n"
+    "          float darkLift = lerp(0.55, 0.0, extra);\n"
+    "          float darkChroma = lerp(1.05, 0.0, darkCPow);\n"
+    "          emission = lerp(darkEm, float3(0.495, 0.495, 0.495), brightT);\n"
+    "          transmittance = lerp(darkTrans, 0.187, brightT);\n"
+    "          lift = lerp(darkLift, 0.04, brightT);\n"
+    "          chromaGain = lerp(darkChroma, 0.45, brightT);\n"
+    "          darkAdGlareW = (1.0 - brightT) * (1.0 - extra);\n"
     "          contourStr = 0.88; contourDirAmt = 1.0; bevelShadowStr = 0.036;\n"
     "          glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
     "        } else {\n"
@@ -1040,6 +1103,22 @@ static const char *shader_src =
     "    float darkKS = pow(kDenom, -0.075);\n"
     "    float kneeScale = 1.0 + (darkKS - 1.0) * darkKneeW + (dInv - 1.0) * lightKneeW;\n"
     "    float3 chromaVec = (refractColor - Y.xxx) * (chromaGain * I.prm.z * kneeScale);\n"
+    "    if (darkAdGlareW > 0.001) {\n"
+    "      if (baseLum > 0.18) {\n"
+    "        float over = baseLum - 0.18;\n"
+    "        float capped = 0.18 + 0.115 * (over / (over + 0.115));\n"
+    "        float newLum = lerp(baseLum, capped, darkAdGlareW);\n"
+    "        chromaVec *= (newLum / max(baseLum, 0.0001));\n"
+    "        baseLum = newLum;\n"
+    "      }\n"
+    "      float3 testRaw = emission + baseLum.xxx + chromaVec;\n"
+    "      float peak = max(testRaw.r, max(testRaw.g, testRaw.b));\n"
+    "      if (peak > 0.44) {\n"
+    "        float lum0 = luma(emission) + baseLum;\n"
+    "        float s = saturate((0.44 - lum0) / max(peak - lum0, 0.0001));\n"
+    "        chromaVec *= lerp(1.0, s, darkAdGlareW);\n"
+    "      }\n"
+    "    }\n"
     "    float3 transmittedColor = baseLum.xxx + chromaVec;\n"
     "    float3 rawBase = emission + transmittedColor;\n"
     "    // Exact Wave 3 legacy mapping for zero-veil lenses (col.a == 0); channel-clamped saturation for Clear glass\n"
@@ -1549,9 +1628,16 @@ static const char *ad_src =
     "  float prevT = mb_unpack16(prev.rg);\n"
     "  float is_dark = u_param.x, is_new = u_param.y, dt = u_param.z;\n"
     "  float latch, target;\n"
-    "  if (is_dark > 0.5) {\n"
-    "    target = smoothstep(0.35, 0.85, bgL);\n"
-    "    latch = target;\n"
+    "  if (is_dark > 1.5) {\n"
+    "    target = 0.0;\n"
+    "    latch = 64.0 / 255.0;\n"
+    "  } else if (is_dark > 0.5) {\n"
+    "    int code = int(floor(saturate(prev.b) * 255.0 + 0.5));\n"
+    "    bool had_dark = (is_new <= 0.5) && (code >= 48 && code <= 208);\n"
+    "    bool prev_on = had_dark && (code >= 96);\n"
+    "    bool on = prev_on ? (bgL > 0.20) : (bgL >= 0.26);\n"
+    "    target = on ? 1.0 : 0.0;\n"
+    "    latch = on ? (128.0 / 255.0) : (64.0 / 255.0);\n"
     "  } else {\n"
     "    if (is_new > 0.5) latch = (bgL < 0.14) ? 1.0 : 0.0;\n"
     "    else if (prev.b > 0.5) latch = (bgL > 0.21) ? 0.0 : 1.0;\n"
@@ -2527,7 +2613,7 @@ struct WinAdPend {
 };
 
 static int ad_collect_and_match(RenderWin *w, const float *f, int32_t start, int32_t count, int backdrop_changed,
-                                double dt, uint64_t serial, WinAdPend out[MB_ADAPTIVE_MAX]) {
+                                uintptr_t cur_bd, double dt, uint64_t serial, WinAdPend out[MB_ADAPTIVE_MAX]) {
   if (!w || ad_mode <= 0 || dt < 0.0) return 0;
   const float *a = f + (size_t)start * MB_INST;
   int kind = (int)(a[5] + 0.5f);
@@ -2544,7 +2630,7 @@ static int ad_collect_and_match(RenderWin *w, const float *f, int32_t start, int
       items[ni].cy = (gu.gb[1] + gu.gb[3]) * 0.5f;
       items[ni].hx = fmaxf((gu.gb[2] - gu.gb[0]) * 0.5f, 1.0f);
       items[ni].hy = fmaxf((gu.gb[3] - gu.gb[1]) * 0.5f, 1.0f);
-      items[ni].is_dark = (a[11] >= 0.05f && lum < 0.35f) ? 1 : 0;
+      items[ni].is_dark = (a[11] >= 0.05f && lum < 0.35f) ? (a[11] > 0.42f ? 2 : 1) : 0;
       ni++;
     }
   } else {
@@ -2561,18 +2647,19 @@ static int ad_collect_and_match(RenderWin *w, const float *f, int32_t start, int
       items[ni].cy = b[1] + b[3] * 0.5f;
       items[ni].hx = fmaxf(b[2] * 0.5f, 1.0f);
       items[ni].hy = fmaxf(b[3] * 0.5f, 1.0f);
-      items[ni].is_dark = (b[11] >= 0.05f && lum < 0.35f) ? 1 : 0;
+      items[ni].is_dark = (b[11] >= 0.05f && lum < 0.35f) ? (b[11] > 0.42f ? 2 : 1) : 0;
       ni++;
     }
   }
   int n_upd = 0;
   for (int k = 0; k < ni; k++) {
-    int sid = -1, is_new = 0;
+    int sid = -1, is_new = 0, mode_changed = 0;
     for (int i = 0; i < MB_ADAPTIVE_MAX; i++) {
       MBAdSlot *s = &w->ad_slots[i];
-      if (s->active && s->seen_serial == serial && s->is_dark == items[k].is_dark &&
+      if (s->active && s->seen_serial == serial && ((s->is_dark > 0) == (items[k].is_dark > 0)) &&
           hypotf(items[k].cx - s->cx, items[k].cy - s->cy) <= 2.0f) {
         sid = i;
+        if (s->is_dark != items[k].is_dark) { s->is_dark = items[k].is_dark; mode_changed = 1; }
         break;
       }
     }
@@ -2580,7 +2667,7 @@ static int ad_collect_and_match(RenderWin *w, const float *f, int32_t start, int
       float best_d = (float)MB_AD_MATCH_DIST + 1e-3f;
       for (int i = 0; i < MB_ADAPTIVE_MAX; i++) {
         MBAdSlot *s = &w->ad_slots[i];
-        if (!s->active || s->seen_serial == serial || s->is_dark != items[k].is_dark) continue;
+        if (!s->active || s->seen_serial == serial || ((s->is_dark > 0) != (items[k].is_dark > 0))) continue;
         float d = hypotf(items[k].cx - s->cx, items[k].cy - s->cy);
         if (d <= best_d) { best_d = d; sid = i; }
       }
@@ -2602,6 +2689,9 @@ static int ad_collect_and_match(RenderWin *w, const float *f, int32_t start, int
         memset(&w->ad_slots[sid], 0, sizeof w->ad_slots[sid]);
         w->ad_slots[sid].active = 1;
         w->ad_slots[sid].is_dark = items[k].is_dark;
+      } else if (w->ad_slots[sid].is_dark != items[k].is_dark) {
+        w->ad_slots[sid].is_dark = items[k].is_dark;
+        mode_changed = 1;
       }
       w->ad_slots[sid].cx = items[k].cx;
       w->ad_slots[sid].cy = items[k].cy;
@@ -2610,17 +2700,19 @@ static int ad_collect_and_match(RenderWin *w, const float *f, int32_t start, int
       w->ad_slots[sid].seen_serial = serial;
     }
     MBAdSlot *s = &w->ad_slots[sid];
-    if (!is_new && s->updated_serial == serial) continue;
-    int need = is_new || backdrop_changed || s->settle_left > 0.0;
+    if (!is_new && !mode_changed && s->updated_serial == serial) continue;
+    int slot_changed = backdrop_changed || mode_changed || (s->last_bd != cur_bd);
+    int need = is_new || slot_changed || s->settle_left > 0.0;
     if (need) {
       if (is_new) {
         s->settle_left = 0.0;
-      } else if (backdrop_changed) {
+      } else if (slot_changed) {
         s->settle_left = MB_AD_SETTLE_SEC;
       } else {
         s->settle_left -= dt;
         if (s->settle_left <= 0.0) s->settle_left = 0.0;
       }
+      s->last_bd = cur_bd;
       s->updated_serial = serial;
       out[n_upd++] = {sid, is_new, s->is_dark, s->cx, s->cy, s->hx, s->hy};
     }
@@ -3007,26 +3099,35 @@ static int grab_of(Grab *m, const float *f, int32_t start, int32_t end, int32_t 
     if (bx1 > x1) x1 = bx1;
     if (by1 > y1) y1 = by1;
   }
-  if (kind == 5 || unmerged_liquid) {
-    for (int32_t i = end; i < count; i++) {
-      const float *b = f + i * MB_INST;
-      int bk = (int)(b[5] + 0.5f);
-      if ((bk == 5 || bk == 6) && b[20] < 0.0f && b[20] != a[20]) break;
-      if (bk == 7 && b[23] < 0.0f) {
-        float hr = -b[23] * 0.5f;
-        if (b[21] - hr < x0) x0 = b[21] - hr;
-        if (b[22] - hr < y0) y0 = b[22] - hr;
-        if (b[21] + hr > x1) x1 = b[21] + hr;
-        if (b[22] + hr > y1) y1 = b[22] + hr;
+  float cap_x0 = x0, cap_y0 = y0, cap_x1 = x1, cap_y1 = y1;
+  for (int32_t i = end; i < count; i++) {
+    const float *b = f + i * MB_INST;
+    int bk = (int)(b[5] + 0.5f);
+    if ((bk == 5 || bk == 6) && b[20] < 0.0f && b[20] != a[20]) break;
+    if ((bk == 7 || bk == 10 || bk == 11) && b[23] < 0.0f) {
+      float cx, cy, hx, hy;
+      if (bk == 7) {
+        cx = b[0] + b[2] * 0.5f; cy = b[1] + b[3] * 0.5f;
+        hx = fmaxf(-b[23], b[2]); hy = fmaxf(fmaxf(-b[23] * 0.5f, b[3]), 1.0f);
+      } else if (bk == 10) {
+        cx = b[0] + b[2] * 0.5f; cy = b[1] + b[3] * 0.5f;
+        hx = hy = fmaxf(-b[23] * 0.5f, 1.0f);
+      } else {
+        cx = b[0] + b[2] * 0.5f + b[6]; cy = b[1] + b[3] * 0.5f + b[7];
+        hx = hy = fmaxf(-b[23] * 0.5f, 1.0f);
       }
+      if (cx - hx < cap_x0) cap_x0 = cx - hx;
+      if (cy - hy < cap_y0) cap_y0 = cy - hy;
+      if (cx + hx > cap_x1) cap_x1 = cx + hx;
+      if (cy + hy > cap_y1) cap_y1 = cy + hy;
     }
   }
   m->g.misc[0] = (float)n;
   m->g.misc[1] = 0.0f;
   m->g.gb[0] = x0 - 2; m->g.gb[1] = y0 - 2; m->g.gb[2] = x1 + 2; m->g.gb[3] = y1 + 2;
   float sc = (float)vscale;
-  int px0 = (int)floorf((x0 - margin) * sc), py0 = (int)floorf((y0 - margin) * sc);
-  int px1 = (int)ceilf((x1 + margin) * sc), py1 = (int)ceilf((y1 + margin) * sc);
+  int px0 = (int)floorf((cap_x0 - margin) * sc), py0 = (int)floorf((cap_y0 - margin) * sc);
+  int px1 = (int)ceilf((cap_x1 + margin) * sc), py1 = (int)ceilf((cap_y1 + margin) * sc);
   if (px0 < 0) px0 = 0;
   if (py0 < 0) py0 = 0;
   if (px1 > pw) px1 = pw;
@@ -3144,7 +3245,7 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
       float tid = bi[20];
       int k = (int)(bi[5] + 0.5f);
       int is_glass = tid < 0.0f;
-      int is_ad = k == 7 || ((k == 10 || k == 11) && bi[23] > 0.0f);
+      int is_ad = k == 7 || ((k == 10 || k == 11) && bi[23] != 0.0f);
       if (!is_glass && !is_ad) continue;
       int32_t run = i;
       if (is_glass) {
@@ -3202,9 +3303,24 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
           if (ey1 > dep[3]) { dep[3] = ey1; grew = 1; }
         }
       } else {
-        float rad = fabsf(bi[23]) + 4.0f;
-        float ex0 = bi[21] - rad, ey0 = bi[22] - rad;
-        float ex1 = bi[21] + rad, ey1 = bi[22] + rad;
+        float ex0, ey0, ex1, ey1;
+        if (bi[23] < 0.0f) {
+          float cx, cy, hx, hy;
+          if (k == 7) {
+            cx = bi[0] + bi[2] * 0.5f; cy = bi[1] + bi[3] * 0.5f;
+            hx = fmaxf(-bi[23], bi[2]) + 4.0f; hy = fmaxf(fmaxf(-bi[23] * 0.5f, bi[3]), 1.0f) + 4.0f;
+          } else if (k == 10) {
+            cx = bi[0] + bi[2] * 0.5f; cy = bi[1] + bi[3] * 0.5f;
+            hx = hy = fmaxf(-bi[23] * 0.5f, 1.0f) + 4.0f;
+          } else {
+            cx = bi[0] + bi[2] * 0.5f + bi[6]; cy = bi[1] + bi[3] * 0.5f + bi[7];
+            hx = hy = fmaxf(-bi[23] * 0.5f, 1.0f) + 4.0f;
+          }
+          ex0 = cx - hx; ey0 = cy - hy; ex1 = cx + hx; ey1 = cy + hy;
+        } else {
+          float rad = fabsf(bi[23]) + 4.0f;
+          ex0 = bi[21] - rad; ey0 = bi[22] - rad; ex1 = bi[21] + rad; ey1 = bi[22] + rad;
+        }
         if (ex0 < dep[0]) { dep[0] = ex0; grew = 1; }
         if (ey0 < dep[1]) { dep[1] = ey0; grew = 1; }
         if (ex1 > dep[2]) { dep[2] = ex1; grew = 1; }
@@ -3472,7 +3588,7 @@ static int capture(ID3D11RenderTargetView *target, int pw, int ph, const float *
     }
   }
   WinAdPend ad_pend[MB_ADAPTIVE_MAX];
-  int ad_n_upd = ad_collect_and_match(rw, f, start, count, reblurred, ad_cur_dt,
+  int ad_n_upd = ad_collect_and_match(rw, f, start, count, reblurred, (uintptr_t)gsrv, ad_cur_dt,
                                       rw ? rw->ad_frame_serial : 0, ad_pend);
   if (ad_n_upd > 0) {
     *switched = 1;
