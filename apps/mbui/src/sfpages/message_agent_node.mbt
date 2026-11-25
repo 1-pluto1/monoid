@@ -234,19 +234,33 @@ fn agent_asks_node(
   sought? : () -> Bool = fn() { false },
   only_while? : () -> Bool = fn() { true },
 ) -> Unit {
+  let has_ask = fn() {
+    match decision_asks(m()) {
+      Nothing => false
+      Login => core is Some(_)
+      _ => true
+    }
+  }
+  let has_proposal = fn() {
+    (here.view)().projects && m().proposal is Some(_)
+  }
   b.show(
     fn() {
       guard only_while() else { return false }
-      match decision_asks(m()) {
-        Nothing => false
-        Login => core is Some(_)
-        _ => true
-      }
+      has_ask() || has_proposal()
     },
     fn(d) {
-      // (the bell gone to it: it, whole, what the go-to brings before the eyes (View::sought), not the post's top)
-      d.sought(fn() { if sought() { Some(fn(w, h) { Some((0.0, 0.0, w, h)) }) } else { None } }) |> ignore
-      message_decision_node(d, src, here, m, core~)
+      if @signals.untracked(fn() { (here.view)().projects }) {
+        d.show(has_ask, at_once=true, fn(ad) {
+          ad.sought(fn() { if sought() { Some(fn(w, h) { Some((0.0, 0.0, w, h)) }) } else { None } }) |> ignore
+          message_decision_node(ad, src, here, m, core~)
+        })
+        agent_proposal_node(d, src, here, m)
+      } else {
+        // (the bell gone to it: it, whole, what the go-to brings before the eyes (View::sought), not the post's top)
+        d.sought(fn() { if sought() { Some(fn(w, h) { Some((0.0, 0.0, w, h)) }) } else { None } }) |> ignore
+        message_decision_node(d, src, here, m, core~)
+      }
     },
   )
 }
