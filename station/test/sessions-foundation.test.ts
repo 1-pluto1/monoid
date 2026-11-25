@@ -10,12 +10,13 @@
 // - Shared `pion-sqlite-tx-scanner.ts` concatenated raw-tx SQL detection & missing-directory throw
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Readable, Writable } from "node:stream";
 import { after, test } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   SessionsProgram,
   type ProgramUser,
@@ -27,6 +28,7 @@ import {
 import {
   mbReaderBinary,
   pionBinary,
+  probePionSupportedModes,
   resetReaderSelectionStateForTest,
   setMbReaderBinaryOverrideForTest,
   setPionProbeRunnerForTest,
@@ -191,13 +193,21 @@ test("W8-0: pion-sqlite-tx-scanner catches concatenated raw tx SQL and throws on
     () => scanPionDirForRawTxControl(join(tmpdir(), "definitely-nonexistent-pion-dir-w8-0")),
     /does not exist/,
   );
+
+  // W8-F: scan real `sessions_actors/src` + negative mutation check on a real copied file.
+  const actorsSrcDir = resolve(fileURLToPath(new URL("../../pion/station/packages/sessions_actors/src", import.meta.url)));
+  assert.deepEqual(scanPionDirForRawTxControl(actorsSrcDir), []);
+  const mutDir = makeTmp("sf-w8-tx-mut-");
+  const realStore = readFileSync(join(actorsSrcDir, "actor_store.pion"), "utf8");
+  writeFileSync(join(mutDir, "actor_store.pion"), realStore + '\nlet _ = db.exec("BEGIN IMMEDIATE")\n', "utf8");
+  assert.ok(scanPionDirForRawTxControl(mutDir).length >= 1, "mutated actor_store.pion with raw BEGIN IMMEDIATE must be caught");
 });
 
 test("W8-0: STILLFAIL_REQUIRE_PION_SESSIONS=1 throws when Pion is unimplemented, fallback, or missing", () => {
   resetReaderSelectionStateForTest();
   const data = makeTmp("sf-w8-req-");
   assert.throws(
-    () => SessionsProgram.of(data, true, { env: { STILLFAIL_REQUIRE_PION_SESSIONS: "1", STILLFAIL_READER_SESSIONS: "pion" } }),
+    () => SessionsProgram.of(data, true, { env: { STILLFAIL_REQUIRE_PION_SESSIONS: "1", STILLFAIL_READER_SESSIONS: "pion" }, pionImplemented: false }),
     /STILLFAIL_REQUIRE_PION_SESSIONS=1/,
   );
   assert.throws(
@@ -1196,5 +1206,261 @@ test("W8-E2 R10: store.deliverySettled releases retired actor after snapshot and
     assert.equal(probe2.error?.actorClosed, true, "failed markDelivered must not pin retired actor");
   } finally {
     await f.close();
+  }
+});
+
+test("W8-F PP4: agent.steer(true) does NOT coarsely clear another provisional delivery batchId, and { db } clears stale provisional batches", async () => {
+  const f = r10RoutingFixture();
+  const rows = [{ thread: "t", n: 1 }];
+  try {
+    const old = await f.register("old");
+    assert.equal((await f.rpc("store.markDelivered", ["s", rows, 401])).error, undefined);
+    // Accepting steer must NOT clear batch 401; only explicit store.deliverySettled / store.markUndelivered may.
+    assert.equal((await f.rpc("agent.steer", [old.handle, "accept"])).value, true);
+    await old.snapshot();
+    // Batch 401 must still route markUndelivered to the original retired actor until explicitly settled.
+    assert.equal((await f.rpc("store.markUndelivered", ["s", rows, 401])).error, undefined);
+    assert.deepEqual(f.writes, ["old"]);
+
+    // Now test `{ db: null }` rotation clears provisional batches cleanly, AND a same-key replacement
+    // actor registered before a late 3-arg `store.markUndelivered` MUST NOT receive the stale undo!
+    const old2 = await f.register("old2");
+    assert.equal((await f.rpc("store.markDelivered", ["s", rows, 402])).error, undefined);
+    await old2.snapshot();
+    f.program.post({ db: null });
+    const replacement = await f.register("replacement");
+    const probeAfterDb = await f.rpc("store.markUndelivered", ["s", rows, 402]);
+    assert.equal(probeAfterDb.error?.actorClosed, true, "stale 3-arg store.markUndelivered must return actorClosed: true");
+    assert.deepEqual(f.writes, ["old"], "replacement actor must NEVER be written by stale 3-arg undo");
+    await replacement.snapshot();
+  } finally {
+    await f.close();
+  }
+});
+
+test("W8-F: AgentsHost.replay().close() sends codexReplayed when reader is alive and IDs never collide across AgentsHost instances on a shared SessionsProgram", async (t) => {
+  const pion = requirePionOrSkip(t);
+  if (pion === null) return;
+  const { AgentsHost } = await import("../src/agents/mb-agents.ts");
+  const data = makeTmp("sf-w8-replay-close-");
+  const prev = process.env.STILLFAIL_READER_SESSIONS;
+  process.env.STILLFAIL_READER_SESSIONS = "pion";
+  resetReaderSelectionStateForTest();
+
+  // Keep the underlying SessionsProgram alive via an actors user while Host A closes and Host B opens.
+  const keepAliveUser: ProgramUser = { actors: true, said: () => {}, exited: () => {} };
+  const sharedProg = SessionsProgram.of(data, true)!;
+  sharedProg.use(keepAliveUser);
+
+  const hostA = AgentsHost.where(data);
+  const postedA: any[] = [];
+  const origPostA = hostA.post.bind(hostA);
+  hostA.post = (msg: any) => {
+    postedA.push(msg);
+    origPostA(msg);
+  };
+  const driverA = {};
+  hostA.use(driverA);
+  try {
+    const repA = hostA.replay();
+    repA.feed([["item/started", "thread-1", "commandExecution", "c1"]]);
+    repA.close();
+    const feedMsgA = postedA.find((m) => typeof m.codexReplay === "number");
+    assert.ok(feedMsgA, "expected codexReplay post from Host A");
+    assert.ok(
+      postedA.some((m) => m.codexReplayed === feedMsgA.codexReplay),
+      `expected codexReplayed:${feedMsgA.codexReplay} on replay.close(), got: ${JSON.stringify(postedA)}`,
+    );
+    await hostA.close(driverA);
+
+    // Open Host B on the exact same `data` (reuses `sharedProg`): its replay ID MUST be strictly > Host A's ID,
+    // so any late `{ replayed: idA }` from Host A cannot corrupt Host B's replay!
+    const hostB = AgentsHost.where(data);
+    assert.notEqual(hostB, hostA);
+    const postedB: any[] = [];
+    const origPostB = hostB.post.bind(hostB);
+    hostB.post = (msg: any) => {
+      postedB.push(msg);
+      origPostB(msg);
+    };
+    const driverB = {};
+    hostB.use(driverB);
+    try {
+      const repB = hostB.replay();
+      repB.feed([["item/started", "thread-2", "commandExecution", "c2"]]);
+      const feedMsgB = postedB.find((m) => typeof m.codexReplay === "number");
+      assert.ok(feedMsgB, "expected codexReplay post from Host B");
+      assert.ok(
+        feedMsgB.codexReplay > feedMsgA.codexReplay,
+        `Host B replay id (${feedMsgB.codexReplay}) must exceed Host A id (${feedMsgA.codexReplay}) on shared SessionsProgram`,
+      );
+      const liveB = await repB.done();
+      assert.ok(
+        liveB["thread-2"] !== undefined && JSON.stringify(liveB["thread-2"]).includes("c2"),
+        `Host B replay must resolve with its own thread-2 step c2, got: ${JSON.stringify(liveB)}`,
+      );
+      repB.close();
+    } finally {
+      await hostB.close(driverB);
+    }
+  } finally {
+    await sharedProg.release(keepAliveUser);
+    if (prev === undefined) delete process.env.STILLFAIL_READER_SESSIONS;
+    else process.env.STILLFAIL_READER_SESSIONS = prev;
+    resetReaderSelectionStateForTest();
+  }
+});
+
+test("W8-F R3 P1: AgentsHost session IDs remain monotonic across SessionsProgram restart so new sessions never collide with re-attached live sessions", async (t) => {
+  const pion = requirePionOrSkip(t);
+  if (pion === null) return;
+  const { AgentsHost } = await import("../src/agents/mb-agents.ts");
+  const data = makeTmp("sf-w8-restart-id-");
+  const prev = process.env.STILLFAIL_READER_SESSIONS;
+  process.env.STILLFAIL_READER_SESSIONS = "pion";
+  resetReaderSelectionStateForTest();
+
+  const host = AgentsHost.where(data);
+  const driver = {};
+  host.use(driver);
+  const origUse = SessionsProgram.prototype.use;
+  const capturedAgentUsers: ProgramUser[] = [];
+  SessionsProgram.prototype.use = function (user: ProgramUser) {
+    if (!user.actors) capturedAgentUsers.push(user);
+    return origUse.call(this, user);
+  };
+  try {
+    // 1. Attach live session A (id `a`) with only agents using the SessionsProgram.
+    const heardA: any[] = [];
+    const heardB: any[] = [];
+    const makeFakeHosted = (n: number, out: any[]) => ({
+      n,
+      info: { socket: join(data, `fake-${n}.sock`), pid: 999999 },
+      kind: "claude" as const,
+      flavor: {},
+      orphans: false,
+      routed: false,
+      gone: false,
+      detaching: false,
+      turnNow: () => null,
+      liveNow: () => null,
+      attached() {},
+      heard(h: any) { out.push(h); },
+      inTurn(fn: () => void) { fn(); },
+      exited_() {},
+      closed_() {},
+      left_() {},
+    });
+
+    const idA = host.number();
+    const procA = makeFakeHosted(idA, heardA);
+    host.attach(procA as any);
+    const firstProg = host.program();
+    assert.ok(firstProg !== null, "first SessionsProgram must be active");
+
+    // 2. Kill the underlying SessionsProgram so AgentsHost.#exited triggers a restart and re-attaches A with idA.
+    firstProg.kill();
+    await new Promise<void>((resolveWait) => {
+      const deadline = Date.now() + 5000;
+      const poll = () => {
+        const cur = host.program();
+        if (cur !== null && cur !== firstProg && !cur.ended) return resolveWait();
+        if (Date.now() > deadline) return resolveWait();
+        setTimeout(poll, 25);
+      };
+      poll();
+    });
+    const secondProg = host.program();
+    assert.ok(secondProg !== null && secondProg !== firstProg, "AgentsHost must restart a fresh SessionsProgram");
+    const agentUser = capturedAgentUsers.at(-1);
+    assert.ok(agentUser !== undefined, "restarted SessionsProgram must have registered AgentsHost ProgramUser");
+
+    // 3. Allocate a new session B after restart -> its ID MUST be strictly > idA (never reset to 1 or collide!).
+    const idB = host.number();
+    assert.ok(idB > idA, `post-restart session id (${idB}) must exceed live session A id (${idA})`);
+    const procB = makeFakeHosted(idB, heardB);
+    host.attach(procB as any);
+
+    // 4. Dispatch frames for idA and idB through the restarted SessionsProgram's real agent ProgramUser
+    //    and assert A and B each receive ONLY their own frames (no #sessions[idA] overwrite).
+    agentUser.said({ lines: idA, events: [{ kind: "a-only" }], turn: null, to: 1 });
+    agentUser.said({ lines: idB, events: [{ kind: "b-only" }], turn: null, to: 2 });
+    assert.equal(heardA.length, 1, "live session A must receive its own frame after restart");
+    assert.deepEqual(heardA[0].events, [{ kind: "a-only" }]);
+    assert.equal(heardB.length, 1, "new session B must receive its own frame after restart");
+    assert.deepEqual(heardB[0].events, [{ kind: "b-only" }]);
+
+    host.forget(procA as any);
+    host.forget(procB as any);
+  } finally {
+    SessionsProgram.prototype.use = origUse;
+    await host.close(driver);
+    if (prev === undefined) delete process.env.STILLFAIL_READER_SESSIONS;
+    else process.env.STILLFAIL_READER_SESSIONS = prev;
+    resetReaderSelectionStateForTest();
+  }
+});
+
+test("W8-F P1-3: pion --version probe settles to null on >64 KiB stdout and when a grandchild holds stdout open after direct child exits", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX shebang fixture");
+    return;
+  }
+  const dir = makeTmp("sf-w8-probe-");
+  resetReaderSelectionStateForTest();
+
+  // (a) Over-limit stdout (>64 KiB) settles immediately to null (assert fixture actually ran!).
+  const ranFile = join(dir, "big-ran.flag");
+  const bigBin = join(dir, "big-stdout.mjs");
+  writeFileSync(
+    bigBin,
+    [
+      `#!${process.execPath}`,
+      `import { writeFileSync } from "node:fs";`,
+      `writeFileSync(${JSON.stringify(ranFile)}, "ran");`,
+      `process.stdout.write("x".repeat(80 * 1024));`,
+    ].join("\n") + "\n",
+    "utf8",
+  );
+  chmodSync(bigBin, 0o755);
+  const bigRes = await probePionSupportedModes(bigBin);
+  assert.equal(existsSync(ranFile), true, "big-stdout fixture must have actually executed");
+  assert.equal(bigRes, null, "probe output exceeding 64 KiB must settle to null");
+
+  // (b) Direct child exits 0 while a spawned grandchild keeps stdout pipe open ->
+  // must settle to null after timeout (never hang forever). Assert pidFile exists & clean up grandchild PID in finally.
+  const pidFile = join(dir, "grandchild.pid");
+  const holdBin = join(dir, "grandchild-stdout.mjs");
+  writeFileSync(
+    holdBin,
+    [
+      `#!${process.execPath}`,
+      `import { spawn } from "node:child_process";`,
+      `import { writeFileSync } from "node:fs";`,
+      `const gc = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], { stdio: ["ignore", 1, "ignore"], detached: true });`,
+      `writeFileSync(${JSON.stringify(pidFile)}, String(gc.pid));`,
+      `gc.unref();`,
+      `process.exit(0);`,
+    ].join("\n") + "\n",
+    "utf8",
+  );
+  chmodSync(holdBin, 0o755);
+  let gcPid = 0;
+  try {
+    const holdRes = await probePionSupportedModes(holdBin);
+    assert.equal(existsSync(pidFile), true, "grandchild fixture must have written pidFile");
+    gcPid = Number(readFileSync(pidFile, "utf8").trim());
+    assert.ok(Number.isInteger(gcPid) && gcPid > 0, `expected valid grandchild PID, got ${gcPid}`);
+    assert.equal(holdRes, null, "probe with grandchild holding stdout open must time out and settle to null");
+  } finally {
+    if (gcPid <= 0 && existsSync(pidFile)) {
+      gcPid = Number(readFileSync(pidFile, "utf8").trim());
+    }
+    if (Number.isInteger(gcPid) && gcPid > 0) {
+      try {
+        process.kill(gcPid, "SIGKILL");
+      } catch {}
+    }
+    resetReaderSelectionStateForTest();
   }
 });

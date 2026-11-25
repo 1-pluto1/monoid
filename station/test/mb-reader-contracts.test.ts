@@ -13,6 +13,7 @@
 // (station_main) is held apart, by mb-station-contracts.test.ts. Each matcher is also run on a source changed to break
 // it, so that a matcher that passes everything fails here.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -322,7 +323,8 @@ function pionSessionsWrong(s: Sources): string[] {
 
   const wrong: string[] = [];
 
-  // 1. Actor `gen.rpc_k(host, key, "node.xxx" | "t", ...)` (3-arg) AND `rpc_k(key, "node.xxx" | "t", ...)` (2-arg).
+  // 1. Actor `gen.rpc_k(host, key, "node.xxx" | "t", ...)` (3-arg), `rpc_k(key, "node.xxx" | "t", ...)` (2-arg),
+  //    AND `rpc_direct_k(key, "node.xxx" | "agent.xxx" | "t", ...)` (2-arg).
   //    Using negative lookahead `(?!\s*")` on the 3rd arg of the 2-arg pattern ensures a literal key in
   //    `gen.rpc_k(host, "s1", "node.xxx", ...)` is NEVER misread as `f`.
   const rpcCalls = new Map<string, string>();
@@ -333,7 +335,7 @@ function pionSessionsWrong(s: Sources): string[] {
       const line = text.slice(0, m.index!).split("\n").length;
       if (!rpcCalls.has(f)) rpcCalls.set(f, `${name}:${line}`);
     }
-    for (const m of text.matchAll(/\brpc_k\(\s*[^,]+,\s*"([^"]+)"\s*,(?!\s*")/g)) {
+    for (const m of text.matchAll(/\brpc(?:_direct)?_k\(\s*[^,]+,\s*"([^"]+)"\s*,(?!\s*")/g)) {
       const f = m[1]!;
       const line = text.slice(0, m.index!).split("\n").length;
       if (!rpcCalls.has(f)) rpcCalls.set(f, `${name}:${line}`);
@@ -347,7 +349,12 @@ function pionSessionsWrong(s: Sources): string[] {
       if (!nodeCases.has(name)) {
         wrong.push(`${where} asks "${f}", which no \`case "${name}":\` of mb-actor.ts asked()'s node switch answers${agentCases.has(name) ? " (only its agent block has it)" : ""}`);
       }
-    } else if (!f.startsWith("store.") && !f.startsWith("deps.") && !f.startsWith("agent.")) {
+    } else if (f.startsWith("agent.")) {
+      const name = f.slice("agent.".length);
+      if (!agentCases.has(name) && !methods.has(name)) {
+        wrong.push(`${where} asks "${f}", answered neither by mb-actor.ts asked()'s agent block nor a runtime session's method`);
+      }
+    } else if (!f.startsWith("store.") && !f.startsWith("deps.")) {
       wrong.push(`${where} asks "${f}", a part mb-actor.ts asked() does not dispatch`);
     }
   }
@@ -359,8 +366,8 @@ function pionSessionsWrong(s: Sources): string[] {
     }
   }
 
-  // 3. Actor `store_k(a, "xxx", ...)`
-  for (const [name, where] of literals(s, pionFiles, /\bstore_k\(\s*[^,]+,\s*"([^"]+)"/g)) {
+  // 3. Actor `store_k(a, "xxx", ...)` AND `store_direct_k(key, "xxx", ...)`
+  for (const [name, where] of literals(s, pionFiles, /\bstore(?:_direct)?_k\(\s*[^,]+,\s*"([^"]+)"/g)) {
     if (!new RegExp(`\\b${name}\\??\\s*\\(`).test(storeText)) {
       wrong.push(`${where} calls store_k "${name}", missing in mb-actor.ts / station/src/store/`);
     }
@@ -424,6 +431,8 @@ function pionSessionsWrong(s: Sources): string[] {
     }
   }
 
+  // Tight lower bounds on Pion `--sessions` contract extraction so silent regex regressions fail loudly.
+  assert.ok(rpcCalls.size >= 14, `Pion --sessions rpc_k calls read: ${rpcCalls.size}`);
   return wrong;
 }
 
@@ -444,7 +453,7 @@ test("Pion --sessions source discovery fails loudly on missing packages root or 
   );
 });
 
-test("Pion --sessions matcher negative 1: catches real gen.rpc_k(host, key, ...) and 2-arg rpc_k for agent-only node.* and missing \"t\"", () => {
+test("Pion --sessions matcher negative 1: catches real gen.rpc_k(host, key, ...), rpc_direct_k, store_direct_k, and 2-arg rpc_k for agent-only node.* and missing \"t\"", () => {
   const base = pionSessionsSources();
   const s1: Sources = {
     ...base,
@@ -452,9 +461,15 @@ test("Pion --sessions matcher negative 1: catches real gen.rpc_k(host, key, ...)
       'gen.rpc_k(host, a.key, "node.noSuchMethod", [], mirror, k)',
       'gen.rpc_k(host, "literal-key", "node.holding", [], mirror, k)',
       'rpc_k(a.key, "t", [])',
+      'self.rpc_direct_k(a.key, "node.noSuchDirect", [], k)',
+      'self.rpc_direct_k(a.key, "agent.noSuchDirectAgent", [], k)',
+      'self.store_direct_k(a.key, "noSuchDirectStore", [], k)',
     ].join("\n"),
   };
   const wrong1 = pionSessionsWrong(s1);
+  assert.ok(wrong1.some((w) => w.includes('"node.noSuchDirect"')), wrong1.join("\n"));
+  assert.ok(wrong1.some((w) => w.includes('"agent.noSuchDirectAgent"')), wrong1.join("\n"));
+  assert.ok(wrong1.some((w) => w.includes('"noSuchDirectStore"')), wrong1.join("\n"));
   assert.ok(wrong1.some((w) => w.includes('"node.noSuchMethod"')), wrong1.join("\n"));
   assert.ok(wrong1.some((w) => w.includes('"node.holding"') && w.includes("only its agent block")), wrong1.join("\n"));
   assert.ok(!wrong1.some((w) => w.includes('"literal-key"')), `literal key must not be misparsed as RPC fn: ${wrong1.join("\n")}`);
@@ -527,4 +542,35 @@ test("Agents stdout protocol: mb-agents.ts #said() handles all 8 frame types and
   assert.notEqual(broken, mbAgentsTs);
   const wrong = agentsStdoutWrong(broken);
   assert.ok(wrong.some((w) => w.includes('"ownReplayed"')), wrong.join("\n"));
+});
+
+// ── MB reader source SHA-256 drift manifest (alerts when MoonBit reader changes without Pion sync) ──
+
+const MB_READER_SHA256_MANIFEST: Record<string, string> = {
+  "actors.mbt": "4a56a8bfa195096c8299dd29800cfa1a6fcb65387cf0e17300569ca23271201a",
+  "actor_base.mbt": "185a1015d8625ff90beea0c68d7f1f352b1f132085efa561799872e029393344",
+  "actor_store.mbt": "ff1a2ed085f37d4db234e76c29aea86f563aaa219bd5b148871064cd602313cd",
+  "actor_run.mbt": "d773c1edb09d60fa18f1260ca17be6cc6ff52f9414d0c9f898ea2770a02b20ee",
+  "jobs.mbt": "736b7df74c87a85c343e343afd9666a46d9c161a3cbe93ef3fe29b01ef90b818",
+  "live.mbt": "adca5f31d70d745251d1768939d282269f67114bca3e565d598bfd12993f2171",
+  "remote.mbt": "d8573ab63fd84f6d89b47d7a427c3a3a5c592282af00f9b94e6d713a32f4bc7a",
+  "remote_files.mbt": "b09322f49e0f45576eade817b29cd4df2808580374582a463c7e84ba04228c53",
+  "remote_source.mbt": "f71396b91d4b85079e3834e9de3315a8dc303db64a6a9056633f3f23486ac21e",
+  "remote_target.mbt": "fa75ddbceb15095dd894c32434b10f46bf3548efa8101048a24ff52e578fc2dc",
+  "dirsync.mbt": "6ded43b9bc1426e2f40054d6513825bf65736651f844baacd17c1ab1d39370b6",
+  "dirsync_source.mbt": "becf968f0c5716a97ab53444346f64c43374d85f373d631339910c5a3ad91fea",
+  "agents.mbt": "be1e2d950cc9d2b6355b7616a3c1339ad03406b4a80091bb2b1cf023727365c9",
+  "agents_codex.mbt": "6373ec1a5bab52bf12abe59206c081204fd3384d5a48fd457d0ad88e69f6a269",
+  "agents_own.mbt": "af611cab4213a0f4a134d65a33435c344115c19f4777c1349016a38497d5e6ae",
+};
+
+test("MB reader SHA-256 drift manifest matches all 15 ported station/mb/src/reader/*.mbt files", () => {
+  const drifted: string[] = [];
+  for (const [file, expected] of Object.entries(MB_READER_SHA256_MANIFEST)) {
+    const actual = createHash("sha256").update(readFileSync(join(reader, file))).digest("hex");
+    if (actual !== expected) {
+      drifted.push(`${file}: expected ${expected}, got ${actual} (sync Pion packages/sessions_* and update manifest)`);
+    }
+  }
+  assert.deepEqual(drifted, [], drifted.join("\n"));
 });

@@ -222,6 +222,12 @@ export class ActorsProgram {
 
   post(message: Json): boolean {
     if (this.#closed) return false;
+    if (typeof message === "object" && message !== null && "db" in message) {
+      const owners = [...this.#provisionalByActor.keys()];
+      this.#provisionalDeliveries.clear();
+      this.#provisionalByActor.clear();
+      for (const owner of owners) this.#maybePruneRetired(owner);
+    }
     this.#sent++;
     const kind = Object.keys(message)[0] ?? "";
     this.posted.set(kind, (this.posted.get(kind) ?? 0) + 1);
@@ -335,18 +341,6 @@ export class ActorsProgram {
     this.#maybePruneRetired(owner);
   }
 
-  #clearActorProvisionalDeliveries(actor: MbActor | ProgramShell) {
-    const set = this.#provisionalByActor.get(actor);
-    if (!set) return;
-    for (const batchId of set) {
-      if (this.#provisionalDeliveries.get(batchId) === actor) {
-        this.#provisionalDeliveries.delete(batchId);
-      }
-    }
-    this.#provisionalByActor.delete(actor);
-    this.#maybePruneRetired(actor);
-  }
-
   #maybePruneRetired(actor?: MbActor | ProgramShell) {
     if (actor === undefined) return;
     if (this.#actors.get(actor.key) === actor) return;
@@ -425,6 +419,10 @@ export class ActorsProgram {
       return;
     }
     if (typeof said?.rpc === "number") {
+      const strictProvisionalUndo =
+        said.fn === "store.markUndelivered" &&
+        Array.isArray(said.args) &&
+        typeof said.args[2] === "number";
       if (
         (said.fn === "agent.dispose" || said.fn === "agent.steer") &&
         Array.isArray(said.args) &&
@@ -439,15 +437,13 @@ export class ActorsProgram {
       ) {
         const owner = this.#stateWriteOwners.get(said.args[2]);
         if (owner !== undefined) actor = owner;
-      } else if (
-        said.fn === "store.markUndelivered" &&
-        Array.isArray(said.args) &&
-        typeof said.args[2] === "number"
-      ) {
-        const owner = this.#provisionalDeliveries.get(said.args[2]);
-        if (owner !== undefined) actor = owner;
+      } else if (strictProvisionalUndo) {
+        // 3-arg provisional delivery undo MUST hit its recorded owner strictly;
+        // never fall back to a same-key replacement actor or #latestRetired.
+        actor = this.#provisionalDeliveries.get(said.args[2]);
       }
       if (
+        !strictProvisionalUndo &&
         actor === undefined &&
         typeof said.actor === "string" &&
         typeof said.fn === "string" &&
@@ -489,8 +485,6 @@ export class ActorsProgram {
         (value) => {
           if (said.fn === "store.markUndelivered" && Array.isArray(said.args) && typeof said.args[2] === "number") {
             this.#clearProvisionalDelivery(said.args[2]);
-          } else if ((said.fn === "agent.steer" && Boolean(value)) || said.fn === "agent.prompt") {
-            this.#clearActorProvisionalDeliveries(target);
           }
           done();
           this.post({ answer: id, value: value === undefined ? null : value });

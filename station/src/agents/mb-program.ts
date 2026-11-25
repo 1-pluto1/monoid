@@ -55,6 +55,10 @@ type SessionsSpawnObserver = (event: SessionsSpawnEvent) => void;
 
 const dataReaderConfigs = new Map<string, () => ReaderSelectConfig>();
 let spawnObserverForTest: SessionsSpawnObserver | null = null;
+/// Process-wide monotonic ID for `AgentsHost` sessions/replays/freezes: never resets across
+/// `AgentsHost` instances sharing a `SessionsProgram` OR across `SessionsProgram` restarts
+/// while live `HostedProcess` instances re-attach with their original `p.n`.
+let nextSharedAgentId = 0;
 
 /// Register the live `ReaderSelectConfig` getter for `data` so synchronous `--sessions` entrypoints
 /// (`SessionsProgram.of`, `ActorsProgram.open`, `AgentsHost.where`) share `ReaderConfig.layer`.
@@ -134,6 +138,13 @@ export class SessionsProgram {
   readonly #held = new Set<ProgramUser>();
   #ended = false;
   #readyRecorded = false;
+
+  /// Monotonic module-level agent/replay/freeze ID so neither multiple `AgentsHost` instances
+  /// sharing a `SessionsProgram` nor a `SessionsProgram` restart while live sessions re-attach
+  /// with their original `p.n` can ever collide.
+  nextAgentId(): number {
+    return ++nextSharedAgentId;
+  }
 
   private constructor(
     data: string,
