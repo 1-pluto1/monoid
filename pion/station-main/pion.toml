@@ -12,6 +12,7 @@ members = [
   "packages/station_mesh",
   "packages/station_jobs",
   "packages/station_vault",
+  "packages/station_rig",
   "packages/station_main",
 ]
 
@@ -28,6 +29,7 @@ mesh_accept = { path = "packages/mesh_accept" }
 station_mesh = { path = "packages/station_mesh" }
 station_jobs = { path = "packages/station_jobs" }
 station_vault = { path = "packages/station_vault" }
+station_rig = { path = "packages/station_rig" }
 base64 = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "base64-v0.1.0", subdir = "packages/base64" }
 crypto = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "crypto-v0.4.1", subdir = "packages/crypto" }
 effect = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "effect-v0.1.0", subdir = "packages/effect" }
