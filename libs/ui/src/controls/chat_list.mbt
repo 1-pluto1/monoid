@@ -333,8 +333,8 @@ pub fn list_foot_in(at : ListAt) -> Double {
 ///|
 /// How far in a chat row's words are from its ground, and its ground's corner: in a side column its words as
 /// 新建对话's (band_pad) from both sides (navSession: a navRow's 10 either side; what stands in its foot's end corner
-/// placed there by itself: list_row `corner`), rounded as a sidebar's row; across the whole screen as the phone's
-/// (mChatRow: 22 at the left, 16 at the right), square.
+/// placed there by itself: list_row `corner`), rounded as a sidebar's row; across the whole screen phone_row_in from
+/// both sides (its last mark ending there: list_end_column), square.
 pub fn list_row_in(at : ListAt) -> @ui.Style {
   match at {
     Side | Tape => @ui.style(px=room(band_pad_in(at)), radius=side_row_radius)
@@ -343,25 +343,30 @@ pub fn list_row_in(at : ListAt) -> @ui.Style {
 }
 
 ///|
-/// How far in from a list's row's end the centre of its end column is: the column its rows' last marks stand in (a
-/// chat's station, its people and agents, under the row's corner's centre: list_row_node's `end_slot`), for what else
-/// in the list ends in it (a group's header's chevron).
-pub fn list_end_column() -> Double {
+/// How far in from a list's row's end the centre of its end column is, where the list stands (`at`): the column its
+/// rows' last marks stand in (a chat's station, its people and agents: list_row_node's `end_slot`), for what else in the
+/// list ends in it (a group's header's chevron). In a side column under the row's corner's centre (aside_end); across
+/// the whole screen, where a row is square and its whole width, its last mark as far in from its end as its words are
+/// from its start (phone_row_in), so the two sides of the list are as wide.
+pub fn list_end_column(at : ListAt) -> Double {
   let l = theme().chat_list
-  l.aside_end + l.face_d / 2.0
+  match at {
+    Side | Tape => l.aside_end + l.face_d / 2.0
+    Whole => phone_row_in.px() + l.face_d / 2.0
+  }
 }
 
 ///|
-/// A row's end padding that puts what stands last in it, `mark` across, centred in its list's end column
-/// (list_end_column).
-pub fn list_end_column_in(mark : Double) -> @ui.Style {
-  let pad = list_end_column() - mark / 2.0
+/// A row's end padding that puts what stands last in it, `mark` across, centred in its list's end column where the list
+/// stands (`at`: list_end_column).
+pub fn list_end_column_in(mark : Double, at : ListAt) -> @ui.Style {
+  let pad = list_end_column(at) - mark / 2.0
   @ui.style(pr=room(pad))
 }
 
 ///|
 // kept across runs: a value (no field of it changes)
-let whole_row_in : @ui.Style = @ui.style(pl=phone_row_in, pr=S4)
+let whole_row_in : @ui.Style = @ui.style(px=phone_row_in)
 
 ///|
 /// What holds a row of a list moved across in it (a finger's swipe): the row's own place, what moves in it cut to the
