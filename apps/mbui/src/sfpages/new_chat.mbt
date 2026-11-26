@@ -166,7 +166,7 @@ fn new_send_go(
     if ours() {
       fresh.starting.set(false)
     }
-    @sfbase.sent_local_gone(rk, row)
+    sent_refuse(rk, row)
     @sfbase.flight_carry_gone(draft)
     @sfbase.writing_starting(src, d, false)
     d.taken = None
@@ -236,7 +236,7 @@ fn new_send_go(
           // here)
           let had_cursor = @ui.field_has_focus()
           sending.val = false
-          @sfbase.sent_local_gone(rk, row)
+          sent_refuse(rk, row)
           @sfbase.flight_carry_gone(draft)
           @sfbase.writing_carry(src, draft, d.key)
           @sfbase.writing_starting(src, d, false)
