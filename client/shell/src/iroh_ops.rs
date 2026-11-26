@@ -279,6 +279,27 @@ fn close_info(error: &iroh::endpoint::ConnectionError) -> Value {
     info
 }
 
+/// Write one `meshScopes` event line to a subscribed control socket, re-checking `SocketClose`
+/// after acquiring the write lock so a same-poll `tcp.close` cannot let a frame append onto a
+/// cancelled partial `tcp.write`.
+pub(crate) async fn write_mesh_snapshot(
+    write: &crate::net::SocketWrite,
+    close: &crate::net::SocketClose,
+    snapshot: Vec<Value>,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    if close.is_closed() {
+        return Err("tcp socket closed".into());
+    }
+    let mut bytes = serde_json::to_vec(&json!({"event":"meshScopes", "scopes":snapshot})).unwrap();
+    bytes.push(b'\n');
+    let mut guard = write.lock().await;
+    if close.is_closed() {
+        return Err("tcp socket closed".into());
+    }
+    guard.write_all(&bytes).await.map_err(err)
+}
+
 impl Inner {
     /// A connection kept for the core, and let go once it closes, however it does (closed here, by the other end, timed
     /// out): kept, a closed connection and the streams opened on it stayed in memory, iroh's tasks still going over
@@ -416,8 +437,17 @@ impl Inner {
                 let socket = a.get("socket").and_then(Value::as_u64).ok_or("missing subscription socket")?;
                 if op == "iroh.meshUnsubscribe" { kept.mesh.unsubscribe(socket); }
                 else {
-                    let Handle::Tcp { write, .. } = self.handle(socket)? else { return Err("not a control socket".into()) };
-                    kept.mesh.subscribe(socket, write)?;
+                    let Handle::Tcp { write, close, .. } = self.handle(socket)? else { return Err("not a control socket".into()) };
+                    let cancel_close = close.clone();
+                    kept.mesh.subscribe_updates_until(
+                        socket,
+                        async move { cancel_close.cancelled().await },
+                        move |snapshot| {
+                            let write = write.clone();
+                            let close = close.clone();
+                            async move { write_mesh_snapshot(&write, &close, snapshot).await }
+                        },
+                    )?;
                 }
                 Ok(Answer::json(json!({})))
             }

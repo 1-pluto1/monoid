@@ -876,7 +876,8 @@ fn pipes_a_stream_into_a_socket_in_frames() {
         let stream = inner.run("conn.openBi", json!({ "id": id }), None).await.unwrap().json["id"].as_u64().unwrap();
         let (ours, node) = tokio::net::UnixStream::pair().unwrap();
         let (read, write) = ours.into_split();
-        let socket = inner.keep(Handle::Tcp { read: Arc::new(tokio::sync::Mutex::new(Box::new(read))), write: Arc::new(tokio::sync::Mutex::new(Box::new(write))) });
+        let socket = inner.keep(Handle::tcp(read, write));
+        let Handle::Tcp { close: socket_close, .. } = inner.handle(socket).unwrap() else { panic!("expected tcp handle") };
         let piping = {
             let inner = inner.clone();
             tokio::spawn(async move { inner.run("istream.pipe", json!({ "id": stream, "to": socket }), None).await })
@@ -903,12 +904,13 @@ fn pipes_a_stream_into_a_socket_in_frames() {
         want.extend(PIPE_END.to_be_bytes());
         assert_eq!(got, want);
         piping.await.unwrap().unwrap();
+        assert!(!socket_close.is_closed(), "istream.pipe ownership transfer must not trigger SocketClose");
 
         // the socket ending without its end resets the stream; the other end's reset is said as what failed it
         let stream = inner.run("conn.openBi", json!({ "id": id }), None).await.unwrap().json["id"].as_u64().unwrap();
         let (ours, node) = tokio::net::UnixStream::pair().unwrap();
         let (read, write) = ours.into_split();
-        let socket = inner.keep(Handle::Tcp { read: Arc::new(tokio::sync::Mutex::new(Box::new(read))), write: Arc::new(tokio::sync::Mutex::new(Box::new(write))) });
+        let socket = inner.keep(Handle::tcp(read, write));
         let piping = {
             let inner = inner.clone();
             tokio::spawn(async move { inner.run("istream.pipe", json!({ "id": stream, "to": socket }), None).await })
@@ -1375,7 +1377,7 @@ fn closing_a_connection_stops_a_half_open_piped_socket() {
         let stream = inner.run("conn.openBi", json!({ "id": id }), None).await.unwrap().json["id"].as_u64().unwrap();
         let (ours, node) = tokio::net::UnixStream::pair().unwrap();
         let (read, write) = ours.into_split();
-        let socket = inner.keep(Handle::Tcp { read: Arc::new(tokio::sync::Mutex::new(Box::new(read))), write: Arc::new(tokio::sync::Mutex::new(Box::new(write))) });
+        let socket = inner.keep(Handle::tcp(read, write));
         let piping = {
             let inner = inner.clone();
             tokio::spawn(async move { inner.run("istream.pipe", json!({ "id": stream, "to": socket }), None).await })
@@ -2078,4 +2080,425 @@ fn iroh_insert_relay_preserves_entries_and_disabled_relays_applies() {
     assert_eq!(removed.entries[0].to_string(), entry2);
 
     call(97_107, "iroh.close", json!({ "id": ep, "forget": true }), None);
+}
+
+#[test]
+fn tcp_close_aborts_blocked_tcp_read() {
+    let dir = TempDir::new();
+    let shell = Shell::start(dir.path().to_path_buf(), complete, ctx()).unwrap();
+    let inner = shell.inner.clone();
+    shell.runtime.block_on(async move {
+        let (ours, _peer) = tokio::io::duplex(256);
+        let (r, w) = tokio::io::split(ours);
+        let conn = inner.keep(Handle::tcp(r, w));
+        let Handle::Tcp { close, .. } = inner.handle(conn).unwrap() else { panic!("expected tcp handle") };
+
+        let mut reader = std::pin::pin!(inner.run("tcp.read", json!({ "id": conn }), None));
+        assert!(futures::poll!(reader.as_mut()).is_pending(), "tcp.read should park waiting for peer data");
+
+        inner.run("tcp.close", json!({ "id": conn }), None).await.unwrap();
+        assert!(close.is_closed(), "tcp.close must mark SocketClose closed");
+        let err = tokio::time::timeout(std::time::Duration::from_secs(3), reader)
+            .await
+            .expect("tcp.read should return promptly after tcp.close")
+            .err()
+            .expect("tcp.read should fail on tcp.close");
+        assert!(err.contains("closed"), "unexpected error: {err}");
+
+        // Repeated tcp.close is idempotent and subsequent tcp.read fails with unknown handle.
+        inner.run("tcp.close", json!({ "id": conn }), None).await.unwrap();
+        let after = inner.run("tcp.read", json!({ "id": conn }), None).await.err().unwrap();
+        assert!(after.contains("no handle"), "unexpected error after close: {after}");
+    });
+}
+
+#[test]
+fn tcp_close_aborts_backpressured_tcp_write() {
+    let dir = TempDir::new();
+    let shell = Shell::start(dir.path().to_path_buf(), complete, ctx()).unwrap();
+    let inner = shell.inner.clone();
+    shell.runtime.block_on(async move {
+        let (ours, mut peer) = tokio::io::duplex(256);
+        let (r, w) = tokio::io::split(ours);
+        let conn = inner.keep(Handle::tcp(r, w));
+        let Handle::Tcp { close, .. } = inner.handle(conn).unwrap() else { panic!("expected tcp handle") };
+
+        let payload = vec![0x5au8; 4096];
+        let writer = {
+            let inner = inner.clone();
+            tokio::spawn(async move { inner.run("tcp.write", json!({ "id": conn }), Some(payload)).await })
+        };
+        // Read 1 byte from peer to prove tcp.write has entered write_all and filled the 256-byte duplex.
+        let mut first = [0u8; 1];
+        tokio::time::timeout(std::time::Duration::from_secs(3), peer.read_exact(&mut first))
+            .await
+            .expect("tcp.write should start writing into duplex")
+            .unwrap();
+        assert_eq!(first, [0x5a]);
+        tokio::task::yield_now().await;
+        assert!(!writer.is_finished(), "tcp.write should block on duplex backpressure while peer stops reading");
+
+        inner.run("tcp.close", json!({ "id": conn }), None).await.unwrap();
+        assert!(close.is_closed(), "tcp.close must mark SocketClose closed");
+        let err = tokio::time::timeout(std::time::Duration::from_secs(3), writer)
+            .await
+            .expect("tcp.write should return promptly after tcp.close")
+            .unwrap()
+            .err()
+            .expect("tcp.write should fail on tcp.close");
+        assert!(err.contains("closed"), "unexpected error: {err}");
+    });
+}
+
+#[test]
+fn tcp_close_aborts_queued_tcp_read_and_write_on_mutex_lock() {
+    let dir = TempDir::new();
+    let shell = Shell::start(dir.path().to_path_buf(), complete, ctx()).unwrap();
+    let inner = shell.inner.clone();
+    shell.runtime.block_on(async move {
+        let (ours, _peer) = tokio::io::duplex(256);
+        let (r, w) = tokio::io::split(ours);
+        let conn = inner.keep(Handle::tcp(r, w));
+        let Handle::Tcp { read, write, close } = inner.handle(conn).unwrap() else { panic!("expected tcp handle") };
+
+        // Hold both mutex guards across tcp.close so tcp.read, tcp.write, and tcp.end can only complete via
+        // the lock-wait `select!` on `close.cancelled()` (not by acquiring the lock after an earlier holder exits).
+        let read_guard = read.lock().await;
+        let write_guard = write.lock().await;
+
+        let mut queued_read = std::pin::pin!(inner.run("tcp.read", json!({ "id": conn }), None));
+        let mut queued_write = std::pin::pin!(inner.run("tcp.write", json!({ "id": conn }), Some(b"queued".to_vec())));
+        let mut queued_end = std::pin::pin!(inner.run("tcp.end", json!({ "id": conn }), None));
+        // Deterministically advance each future past handle lookup and into its lock-wait `select!`.
+        assert!(futures::poll!(queued_read.as_mut()).is_pending());
+        assert!(futures::poll!(queued_write.as_mut()).is_pending());
+        assert!(futures::poll!(queued_end.as_mut()).is_pending());
+
+        inner.run("tcp.close", json!({ "id": conn }), None).await.unwrap();
+        assert!(close.is_closed());
+
+        let read_err = tokio::time::timeout(std::time::Duration::from_secs(3), queued_read)
+            .await
+            .expect("queued tcp.read should abort while read lock is still held")
+            .err()
+            .expect("queued tcp.read should fail on tcp.close");
+        let write_err = tokio::time::timeout(std::time::Duration::from_secs(3), queued_write)
+            .await
+            .expect("queued tcp.write should abort while write lock is still held")
+            .err()
+            .expect("queued tcp.write should fail on tcp.close");
+        let end_res = tokio::time::timeout(std::time::Duration::from_secs(3), queued_end)
+            .await
+            .expect("queued tcp.end should return promptly while write lock is still held");
+        assert!(read_err.contains("closed"), "unexpected read error: {read_err}");
+        assert!(write_err.contains("closed"), "unexpected write error: {write_err}");
+        assert!(end_res.is_ok(), "queued tcp.end should succeed on tcp.close: {:?}", end_res.err());
+
+        drop((read_guard, write_guard));
+    });
+}
+
+#[test]
+fn tcp_end_preserves_half_close_for_in_flight_tcp_read() {
+    let dir = TempDir::new();
+    let shell = Shell::start(dir.path().to_path_buf(), complete, ctx()).unwrap();
+    let inner = shell.inner.clone();
+    shell.runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conn = inner.run("tcp.open", json!({ "port": port }), None).await.unwrap().json["id"].as_u64().unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let (mut peer_read, mut peer_write) = peer.into_split();
+        let Handle::Tcp { close, .. } = inner.handle(conn).unwrap() else { panic!("expected tcp handle") };
+
+        let mut reader = std::pin::pin!(inner.run("tcp.read", json!({ "id": conn }), None));
+        assert!(futures::poll!(reader.as_mut()).is_pending(), "tcp.read should park waiting for peer data");
+
+        // Half-close write side; peer observes EOF, while in-flight tcp.read stays open.
+        inner.run("tcp.end", json!({ "id": conn }), None).await.unwrap();
+        assert!(!close.is_closed(), "tcp.end must not trigger SocketClose");
+        let mut peer_eof = Vec::new();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(3), peer_read.read_to_end(&mut peer_eof))
+            .await
+            .expect("peer should observe EOF after tcp.end")
+            .unwrap();
+        assert_eq!(n, 0);
+        assert!(futures::poll!(reader.as_mut()).is_pending(), "tcp.end must not cancel in-flight tcp.read");
+
+        peer_write.write_all(b"after-half-close").await.unwrap();
+        drop(peer_write);
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(3), reader)
+            .await
+            .expect("in-flight tcp.read should receive peer data after tcp.end")
+            .unwrap();
+        let mut received = first.bytes.unwrap_or_default();
+        if first.json.get("end") != Some(&json!(true)) {
+            loop {
+                let next = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    inner.run("tcp.read", json!({ "id": conn }), None),
+                )
+                .await
+                .expect("tcp.read should reach peer EOF")
+                .unwrap();
+                if let Some(chunk) = next.bytes {
+                    received.extend_from_slice(&chunk);
+                }
+                if next.json.get("end") == Some(&json!(true)) {
+                    break;
+                }
+            }
+        }
+        assert_eq!(received, b"after-half-close");
+
+        inner.run("tcp.close", json!({ "id": conn }), None).await.unwrap();
+        assert!(close.is_closed());
+    });
+}
+
+#[test]
+fn tcp_pipe_transfers_ownership_without_cancelling_stream() {
+    let dir = TempDir::new();
+    let shell = Shell::start(dir.path().to_path_buf(), complete, ctx()).unwrap();
+    let inner = shell.inner.clone();
+    shell.runtime.block_on(async move {
+        let front = inner.run("tcp.listen", json!({ "port": 0 }), None).await.unwrap().json;
+        let front_port = front["port"].as_u64().unwrap() as u16;
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+
+        let client = tokio::net::TcpStream::connect(("127.0.0.1", front_port)).await.unwrap();
+        let accepted = inner.run("tcp.accept", json!({ "id": front["id"] }), None).await.unwrap().json["id"].as_u64().unwrap();
+        let opened = inner.run("tcp.open", json!({ "port": target_port }), None).await.unwrap().json["id"].as_u64().unwrap();
+        let (server, _) = target.accept().await.unwrap();
+
+        let Handle::Tcp { close: close_accepted, .. } = inner.handle(accepted).unwrap() else { panic!("expected tcp handle") };
+        let Handle::Tcp { close: close_opened, .. } = inner.handle(opened).unwrap() else { panic!("expected tcp handle") };
+
+        let piping = {
+            let inner = inner.clone();
+            tokio::spawn(async move { inner.run("tcp.pipe", json!({ "ids": [accepted, opened] }), None).await })
+        };
+
+        let (mut client_read, mut client_write) = client.into_split();
+        let (mut server_read, mut server_write) = server.into_split();
+        let forward: Vec<u8> = (0..262_144u32).map(|i| (i % 251) as u8).collect();
+        let backward: Vec<u8> = (0..131_072u32).map(|i| ((i * 7) % 251) as u8).collect();
+
+        let forward_expected = forward.clone();
+        let send_forward = tokio::spawn(async move {
+            client_write.write_all(&forward).await.unwrap();
+            client_write.shutdown().await.unwrap();
+        });
+        let mut got_forward = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), server_read.read_to_end(&mut got_forward))
+            .await
+            .expect("forward pipe transfer should finish")
+            .unwrap();
+        send_forward.await.unwrap();
+        assert_eq!(got_forward, forward_expected);
+
+        let backward_expected = backward.clone();
+        let send_backward = tokio::spawn(async move {
+            server_write.write_all(&backward).await.unwrap();
+            server_write.shutdown().await.unwrap();
+        });
+        let mut got_backward = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), client_read.read_to_end(&mut got_backward))
+            .await
+            .expect("backward pipe transfer should finish")
+            .unwrap();
+        send_backward.await.unwrap();
+        assert_eq!(got_backward, backward_expected);
+
+        let piped = tokio::time::timeout(std::time::Duration::from_secs(3), piping)
+            .await
+            .expect("tcp.pipe should finish")
+            .unwrap()
+            .unwrap()
+            .json;
+        assert_eq!(piped, json!({ "there": 262_144, "back": 131_072 }));
+        assert!(!close_accepted.is_closed(), "tcp.pipe ownership transfer must not trigger SocketClose");
+        assert!(!close_opened.is_closed(), "tcp.pipe ownership transfer must not trigger SocketClose");
+        assert!(inner.run("tcp.read", json!({ "id": accepted }), None).await.is_err());
+        assert!(inner.run("tcp.read", json!({ "id": opened }), None).await.is_err());
+    });
+}
+
+#[test]
+fn tcp_close_stops_mesh_subscribe_without_tearing_partial_write() {
+    let dir = TempDir::new();
+    let shell = Shell::start(dir.path().to_path_buf(), complete, ctx()).unwrap();
+    let inner = shell.inner.clone();
+    shell.runtime.block_on(async move {
+        let endpoint = Endpoint::builder(Minimal).relay_mode(RelayMode::Disabled).bind().await.unwrap();
+        let kept = Arc::new(crate::iroh_ops::Kept::default());
+        let ep_id = inner.keep(Handle::Endpoint(endpoint, kept.clone()));
+
+        let (ours, peer) = tokio::io::duplex(64);
+        let (r, w) = tokio::io::split(ours);
+        let sock_id = inner.keep(Handle::tcp(r, w));
+        let Handle::Tcp { write: sock_write, close: sock_close, .. } = inner.handle(sock_id).unwrap() else {
+            panic!("expected tcp handle");
+        };
+        let write_weak = Arc::downgrade(&sock_write);
+
+        // Subscribe and consume the initial snapshot line so the subscription task parks in `changed.changed()`.
+        inner.run("iroh.meshSubscribe", json!({ "id": ep_id, "socket": sock_id }), None).await.unwrap();
+        let mut peer = tokio::io::BufReader::new(peer);
+        let mut initial = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), tokio::io::AsyncBufReadExt::read_line(&mut peer, &mut initial))
+            .await
+            .expect("initial meshScopes snapshot should arrive")
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&initial).unwrap();
+        assert_eq!(parsed["event"], json!("meshScopes"));
+
+        // Start a backpressured tcp.write that writes a partial JSON prefix into the 64-byte duplex and blocks.
+        let prefix = vec![b'x'; 512];
+        let writer = {
+            let inner = inner.clone();
+            tokio::spawn(async move { inner.run("tcp.write", json!({ "id": sock_id }), Some(prefix)).await })
+        };
+        // Drop the test's strong write ref so only tcp.write, handles, and meshSubscribe hold it.
+        drop(sock_write);
+        // Read 1 byte from peer to deterministically prove tcp.write has written a partial prefix and is parked
+        // inside write_all on the 64-byte duplex (leaving > 384 bytes still unwritten).
+        let mut first_prefix = [0u8; 1];
+        tokio::time::timeout(std::time::Duration::from_secs(3), peer.read_exact(&mut first_prefix))
+            .await
+            .expect("tcp.write should begin writing partial prefix")
+            .unwrap();
+        assert_eq!(first_prefix, [b'x']);
+        tokio::task::yield_now().await;
+        assert!(!writer.is_finished(), "tcp.write should stay blocked on duplex backpressure");
+
+        // Trigger a meshScopes update while tcp.write holds the lock, then close the socket.
+        kept.mesh.notify_changed();
+        tokio::task::yield_now().await;
+
+        inner.run("tcp.close", json!({ "id": sock_id }), None).await.unwrap();
+        assert!(sock_close.is_closed());
+        let write_err = tokio::time::timeout(std::time::Duration::from_secs(3), writer)
+            .await
+            .expect("tcp.write should abort promptly on tcp.close")
+            .unwrap()
+            .err()
+            .expect("tcp.write should fail on tcp.close");
+        assert!(write_err.contains("closed"), "unexpected write error: {write_err}");
+
+        // Trigger another meshScopes update after tcp.close and drain peer to EOF.
+        kept.mesh.notify_changed();
+        let mut drained = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), peer.read_to_end(&mut drained))
+            .await
+            .expect("peer should reach clean EOF once subscription exits and releases SocketWrite")
+            .unwrap();
+        assert!(
+            drained.iter().all(|&b| b == b'x'),
+            "meshSubscribe must not append meshScopes onto torn prefix: {:?}",
+            String::from_utf8_lossy(&drained)
+        );
+        assert_eq!(write_weak.strong_count(), 0, "meshSubscribe task must exit and release SocketWrite");
+
+        inner.run("iroh.close", json!({ "id": ep_id, "forget": true }), None).await.unwrap();
+    });
+}
+
+#[test]
+fn tcp_close_stops_mesh_subscribe_while_scopes_lock_is_held() {
+    let dir = TempDir::new();
+    let shell = Shell::start(dir.path().to_path_buf(), complete, ctx()).unwrap();
+    let inner = shell.inner.clone();
+    shell.runtime.block_on(async move {
+        let endpoint = Endpoint::builder(Minimal).relay_mode(RelayMode::Disabled).bind().await.unwrap();
+        let kept = Arc::new(crate::iroh_ops::Kept::default());
+        let ep_id = inner.keep(Handle::Endpoint(endpoint, kept.clone()));
+
+        let (ours, peer) = tokio::io::duplex(64);
+        let (r, w) = tokio::io::split(ours);
+        let sock_id = inner.keep(Handle::tcp(r, w));
+        let Handle::Tcp { write: sock_write, close: sock_close, .. } = inner.handle(sock_id).unwrap() else {
+            panic!("expected tcp handle");
+        };
+        let write_weak = Arc::downgrade(&sock_write);
+        drop(sock_write);
+
+        // Subscribe and consume the initial snapshot so the subscription task parks on `changed.changed()`.
+        inner.run("iroh.meshSubscribe", json!({ "id": ep_id, "socket": sock_id }), None).await.unwrap();
+        let mut peer = tokio::io::BufReader::new(peer);
+        let mut initial = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), tokio::io::AsyncBufReadExt::read_line(&mut peer, &mut initial))
+            .await
+            .expect("initial meshScopes snapshot should arrive")
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&initial).unwrap()["event"], json!("meshScopes"));
+
+        // Hold `scopes` lock and wait deterministically for the subscription task to wake from `changed()` and
+        // reach `scopes.lock().await`.
+        let scopes_guard = kept.mesh.lock_scopes_for_test().await;
+        let wait_notify = kept.mesh.scopes_lock_wait();
+        let entering_scopes_lock = wait_notify.notified();
+        tokio::pin!(entering_scopes_lock);
+        entering_scopes_lock.as_mut().enable();
+        kept.mesh.notify_changed();
+        tokio::time::timeout(std::time::Duration::from_secs(3), entering_scopes_lock)
+            .await
+            .expect("meshSubscribe task should wake from changed() and reach scopes.lock()");
+
+        // Close the socket while `scopes_guard` is still held: the outer select! must cancel `scopes.lock().await`
+        // immediately and release `SocketWrite` so the peer observes clean EOF before `scopes_guard` is dropped.
+        inner.run("tcp.close", json!({ "id": sock_id }), None).await.unwrap();
+        assert!(sock_close.is_closed());
+
+        let mut drained = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), peer.read_to_end(&mut drained))
+            .await
+            .expect("peer should observe EOF while scopes lock is still held")
+            .unwrap();
+        assert!(drained.is_empty(), "no extra frame should be written after tcp.close");
+        assert_eq!(write_weak.strong_count(), 0, "meshSubscribe task must drop SocketWrite while scopes lock is held");
+
+        drop(scopes_guard);
+        inner.run("iroh.close", json!({ "id": ep_id, "forget": true }), None).await.unwrap();
+    });
+}
+
+#[test]
+fn tcp_close_mesh_snapshot_checks_closed_after_acquiring_write_lock() {
+    let dir = TempDir::new();
+    let shell = Shell::start(dir.path().to_path_buf(), complete, ctx()).unwrap();
+    shell.runtime.block_on(async move {
+        let (ours, mut peer) = tokio::io::duplex(64);
+        let (_, w) = tokio::io::split(ours);
+        let write: crate::net::SocketWrite = Arc::new(tokio::sync::Mutex::new(Box::new(w)));
+        let close = crate::net::SocketClose::new();
+
+        // Hold the write lock so `write_mesh_snapshot` passes its entry `is_closed()` check and parks on
+        // `write.lock().await`.
+        let err = {
+            let guard = write.lock().await;
+            let mut send = std::pin::pin!(crate::iroh_ops::write_mesh_snapshot(&write, &close, vec![]));
+            assert!(futures::poll!(send.as_mut()).is_pending());
+
+            // Simulate the same-poll race: `tcp.close` flips `closed = true` and releases the write lock without the
+            // outer select! polling `cancel` first. The post-lock `is_closed()` check must still reject the write.
+            close.close();
+            drop(guard);
+            tokio::time::timeout(std::time::Duration::from_secs(3), send)
+                .await
+                .expect("write_mesh_snapshot should return promptly once lock is released")
+                .expect_err("write_mesh_snapshot must abort after acquiring lock on closed socket")
+        };
+        assert!(err.contains("closed"), "unexpected error: {err}");
+
+        drop(write);
+        let mut drained = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), peer.read_to_end(&mut drained))
+            .await
+            .expect("peer should observe EOF")
+            .unwrap();
+        assert!(drained.is_empty(), "closed socket must receive 0 bytes, got: {:?}", String::from_utf8_lossy(&drained));
+    });
 }
