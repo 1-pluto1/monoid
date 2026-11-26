@@ -21,6 +21,7 @@ members = [
   "packages/station_devices",
   "packages/station_sessions",
   "packages/station_api",
+  "packages/station_browser",
   "packages/station_main",
 ]
 
@@ -46,6 +47,7 @@ station_replica = { path = "packages/station_replica" }
 station_devices = { path = "packages/station_devices" }
 station_sessions = { path = "packages/station_sessions" }
 station_api = { path = "packages/station_api" }
+station_browser = { path = "packages/station_browser" }
 base64 = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "base64-v0.1.0", subdir = "packages/base64" }
 crypto = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "crypto-v0.4.1", subdir = "packages/crypto" }
 effect = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "effect-v0.1.0", subdir = "packages/effect" }
