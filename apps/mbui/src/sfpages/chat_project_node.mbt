@@ -151,6 +151,9 @@ pub fn chat_bar_project_attrs_node(
     .shrink(Is(0.0))
     .gap(Is(proj_s1_5))
     .lines_up(Is(Some(Middle)))
+    // (bare words and marks over the chat scrolled under the glass bar: their ink follows what is behind them, as the
+    // title's beside them does)
+    .adaptive_ink(Is(true))
     |> ignore
     let project_now = fn() {
       match view() {
@@ -195,9 +198,8 @@ pub fn chat_bar_project_attrs_node(
         .padding(Is((proj_s2, 0.0, proj_s2, 0.0)))
         .gap(Is(proj_s1))
         .lines_up(Is(Some(Middle)))
-        .radius(Is(@sf.small_corner))
+        .radius(Is(999.0))
         .max_width(By(fn() { Some(@sf.node_sp(b, 148.0)) }))
-        .edge(By(fn() { @sf.control_edge(hot=@sf.lit_node(b)) }))
         |> ignore
         @sf.hover_ground_node(b)
         @sf.focus_ring_node(b)
@@ -230,7 +232,7 @@ pub fn chat_bar_project_attrs_node(
           .min_height(Is(Some(@sf.bar_key_side)))
           .padding(Is((proj_s2, 0.0, proj_s2, 0.0)))
           .lines_up(Is(Some(Middle)))
-          .radius(Is(@sf.small_corner))
+          .radius(Is(999.0))
           .max_width(By(fn() { Some(@sf.node_sp(b, 104.0)) }))
           .ground(By(fn() { @sf.theme().p.neutral_bg }))
           |> ignore
@@ -261,7 +263,7 @@ pub fn chat_bar_project_attrs_node(
           .padding(Is((proj_s1, 0.0, proj_s1, 0.0)))
           .lines_up(Is(Some(Middle)))
           .lies_along(Is(Middle))
-          .radius(Is(@sf.small_corner))
+          .radius(Is(999.0))
           |> ignore
           @sf.hover_ground_node(b)
           @sf.focus_ring_node(b)

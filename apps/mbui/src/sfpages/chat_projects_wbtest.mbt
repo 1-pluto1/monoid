@@ -410,6 +410,21 @@ test "wide 1280x800 shows inline fits attrs; tight 768x900 hides fits attrs befo
   assert_true(cp_find_word(t_wide, "#ui-review") is Some(_))
   assert_true(cp_find_word(t_wide, "#ios") is Some(_))
   assert_eq(t_wide.audit(), [])
+  // the folder mark and the words over the chat under the glass bar take their ink from what is behind them (bare
+  // adaptive ink: slot 23 below 0), as the title's beside them does; the title here has none of its own
+  let bare = t_wide.drawn_instances().filter(fn(a) { a.length() > 23 && a[23] < 0.0 })
+  assert_true(bare.iter().any(fn(a) { a[5] == 11.0 }), msg="folder mark not adaptive")
+  assert_true(bare.iter().any(fn(a) { a[5] != 11.0 }), msg="project words not adaptive")
+  // the project's hover ground is a capsule (its corners at least half its height), not a rounded square
+  let capsules = fn() {
+    t_wide.drawn_instances().filter(fn(a) { a[5] == 0.0 && a[3] >= 30.0 && a[4] * 2.0 >= a[3] - 1.0 }).length()
+  }
+  let at_rest = capsules()
+  let proj = cp_find_word(t_wide, "monoid").unwrap()
+  t_wide.move_to(proj.1 + proj.3 / 2.0, proj.2 + proj.4 / 2.0)
+  t_wide.run_for(@ui.move_most_ms)
+  assert_eq(capsules(), at_rest + 1)
+  assert_eq(t_wide.audit(), [])
 
   // 2. Medium 768x900 with constrained title row (360pt bar room): fits hides attrs first, title stays intact
   let t_med = @ui.Tester::new(
