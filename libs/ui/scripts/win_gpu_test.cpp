@@ -266,7 +266,7 @@ static int read_offscreen_pixel_rgb(int px, int py, uint8_t rgb[3]) {
   return ok;
 }
 
-static int read_ad_bright_t(double *out_t) {
+static int read_ad_bright_t(double *out_t, uint8_t *out_latch = NULL) {
   if (!dev || !ctx || !rw || !rw->ad_tex[rw->ad_cur].t) return 0;
   ID3D11Texture2D *src = rw->ad_tex[rw->ad_cur].t;
   D3D11_TEXTURE2D_DESC td = {};
@@ -283,6 +283,7 @@ static int read_ad_bright_t(double *out_t) {
   if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
     const uint8_t *p = (const uint8_t *)m.pData;
     *out_t = ((double)p[0] * 256.0 + (double)p[1]) / 65535.0;
+    if (out_latch) *out_latch = p[2];
     ctx->Unmap(staging, 0);
     ok = 1;
   }
@@ -359,7 +360,57 @@ static void test_p0_liquid_glass_vectors(void) {
     free(px);
   }
 
-  // Stateful adaptive transition test via submit() (verifies !is_new fix when serial == 0 and deterministic tau=70ms exponential convergence):
+  // Stateful adaptive transition test 1: Light adaptive (is_dark = 0) 70ms exponential smoothing via submit():
+  {
+    double inst[2 * MB_INST];
+    fill_p0_rect(inst, 0.0, 0.0, 128.0, 128.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0);
+    fill_p0_rect(inst + MB_INST, 16.0, 16.0, 96.0, 96.0, 6.0, 253.0 / 255.0, 252.0 / 255.0, 253.0 / 255.0,
+                 0x67 / 255.0, -48.0);
+    inst[MB_INST + 4] = 16.0;
+    inst[MB_INST + 6] = 1.0;
+    inst[MB_INST + 7] = 1.0;
+    inst[MB_INST + 12] = 0.0;
+    inst[MB_INST + 13] = 4.0;
+    inst[MB_INST + 14] = -1.0;
+    inst[MB_INST + 15] = 1.0;
+    glass_free();
+    ad_mode = 1;
+    ad_cur_dt = 1.0 / 60.0;
+    if (rw) {
+      rw->ad_frame_serial = 0;
+      memset(rw->ad_slots, 0, sizeof rw->ad_slots);
+    }
+    CHECK(submit(inst, 2, 1.0, 1.0, 1.0) == 1);
+    ctx->Flush();
+    double frame0_t = -1.0;
+    uint8_t rgb0[3] = {0, 0, 0};
+    CHECK(read_ad_bright_t(&frame0_t) == 1);
+    CHECK(read_offscreen_pixel_rgb(64, 64, rgb0) == 1);
+    CHECK(frame0_t <= 0.02);
+
+    // Flip backdrop from white -> black and advance rw->ad_frame_serial++ with deterministic dt = 1/60s.
+    fill_p0_rect(inst, 0.0, 0.0, 128.0, 128.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0);
+    double mid_frame3_t = -1.0, final_t = -1.0;
+    uint8_t final_rgb[3] = {0, 0, 0};
+    for (int f = 1; f <= 45; f++) {
+      if (rw) rw->ad_frame_serial++;
+      ad_cur_dt = 1.0 / 60.0;
+      CHECK(submit(inst, 2, 0.0, 0.0, 0.0) == 1);
+      ctx->Flush();
+      if (f == 3) CHECK(read_ad_bright_t(&mid_frame3_t) == 1);
+    }
+    CHECK(read_ad_bright_t(&final_t) == 1);
+    CHECK(read_offscreen_pixel_rgb(64, 64, final_rgb) == 1);
+    printf("win_gpu: stateful_ad_light frame0_t=%.4f mid_frame3_t=%.4f final_t=%.4f rgb0=(%u,%u,%u) final_rgb=(%u,%u,%u)\n",
+           frame0_t, mid_frame3_t, final_t, rgb0[0], rgb0[1], rgb0[2], final_rgb[0], final_rgb[1], final_rgb[2]);
+    CHECK(fabs(mid_frame3_t - 0.5105) < 0.03);
+    CHECK(final_t >= 0.98);
+    CHECK(final_rgb[0] < rgb0[0] && final_rgb[1] < rgb0[1] && final_rgb[2] < rgb0[2]);
+    ad_cur_dt = 0.0;
+    glass_free();
+  }
+
+  // Stateful adaptive transition test 2: Dark adaptive (is_dark = 1) 1-frame atomic convergence + zero settle:
   {
     double inst[2 * MB_INST];
     fill_p0_rect(inst, 0.0, 0.0, 128.0, 128.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0);
@@ -381,30 +432,30 @@ static void test_p0_liquid_glass_vectors(void) {
     CHECK(submit(inst, 2, 1.0, 1.0, 1.0) == 1);
     ctx->Flush();
     double frame0_t = -1.0;
-    uint8_t rgb0[3] = {0, 0, 0};
-    CHECK(read_ad_bright_t(&frame0_t) == 1);
+    uint8_t latch0 = 0, rgb0[3] = {0, 0, 0};
+    CHECK(read_ad_bright_t(&frame0_t, &latch0) == 1);
     CHECK(read_offscreen_pixel_rgb(64, 64, rgb0) == 1);
     CHECK(frame0_t >= 0.98);
+    CHECK(latch0 == 128);
     CHECK(rgb0[0] >= 166 && rgb0[0] <= 182 && rgb0[1] >= 166 && rgb0[1] <= 182 && rgb0[2] >= 166 && rgb0[2] <= 182);
 
-    // Flip backdrop from white -> black and advance rw->ad_frame_serial++ with deterministic dt = 1/60s.
+    // Flip backdrop from white -> black: frame 1 must snap immediately (t <= 0.02, latch == 64, pixel 30..38, settling == 0).
     fill_p0_rect(inst, 0.0, 0.0, 128.0, 128.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0);
-    double mid_frame3_t = -1.0, final_t = -1.0;
-    uint8_t final_rgb[3] = {0, 0, 0};
-    for (int f = 1; f <= 45; f++) {
-      if (rw) rw->ad_frame_serial++;
-      ad_cur_dt = 1.0 / 60.0;
-      CHECK(submit(inst, 2, 0.0, 0.0, 0.0) == 1);
-      ctx->Flush();
-      if (f == 3) CHECK(read_ad_bright_t(&mid_frame3_t) == 1);
-    }
-    CHECK(read_ad_bright_t(&final_t) == 1);
-    CHECK(read_offscreen_pixel_rgb(64, 64, final_rgb) == 1);
-    printf("win_gpu: stateful_ad frame0_t=%.4f mid_frame3_t=%.4f final_t=%.4f final_rgb=(%u,%u,%u)\n",
-           frame0_t, mid_frame3_t, final_t, final_rgb[0], final_rgb[1], final_rgb[2]);
-    CHECK(mid_frame3_t > 0.25 && mid_frame3_t < 0.75);
-    CHECK(final_t <= 0.02);
-    CHECK(final_rgb[0] >= 30 && final_rgb[0] <= 38 && final_rgb[1] >= 30 && final_rgb[1] <= 38 && final_rgb[2] >= 30 && final_rgb[2] <= 38);
+    if (rw) rw->ad_frame_serial++;
+    ad_cur_dt = 1.0 / 60.0;
+    CHECK(submit(inst, 2, 0.0, 0.0, 0.0) == 1);
+    ctx->Flush();
+    if (rw) ad_finalize_frame(rw, 1, rw->ad_frame_serial);
+    double frame1_t = -1.0;
+    uint8_t latch1 = 0, rgb1[3] = {0, 0, 0};
+    CHECK(read_ad_bright_t(&frame1_t, &latch1) == 1);
+    CHECK(read_offscreen_pixel_rgb(64, 64, rgb1) == 1);
+    printf("win_gpu: stateful_ad_dark frame0_t=%.4f latch0=%u frame1_t=%.4f latch1=%u rgb1=(%u,%u,%u) settling=%d\n",
+           frame0_t, latch0, frame1_t, latch1, rgb1[0], rgb1[1], rgb1[2], mb_render_adaptive_settling(0));
+    CHECK(frame1_t <= 0.02);
+    CHECK(latch1 == 64);
+    CHECK(rgb1[0] >= 30 && rgb1[0] <= 38 && rgb1[1] >= 30 && rgb1[1] <= 38 && rgb1[2] >= 30 && rgb1[2] <= 38);
+    CHECK(mb_render_adaptive_settling(0) == 0);
     ad_cur_dt = 0.0;
     glass_free();
   }
@@ -1885,6 +1936,159 @@ static void test_v8_v9_droplet_roi_gates(void) {
   #undef W_PX
 }
 
+static void test_perf51_donor_and_provoking_vertex(void) {
+  const int VW = 200, VH = 160;
+  const int PW = VW * 2, PH = VH * 2;
+  #define P51_PX(buf, w, xpx, ypx) ((buf) + ((size_t)(ypx) * (size_t)(w) + (size_t)(xpx)) * 4u)
+  auto fill_unit_sq_segs = [](double *d) {
+    memset(d, 0, MB_INST * sizeof(double));
+    d[5] = 12.0;
+    d[0] = 0.0; d[1] = 0.0; d[2] = 1.0; d[3] = 0.0;
+    d[8] = 1.0; d[9] = 0.0; d[10] = 1.0; d[11] = 1.0;
+    d[12] = 1.0; d[13] = 1.0; d[14] = 0.0; d[15] = 1.0;
+    d[16] = 0.0; d[17] = 1.0; d[18] = 0.0; d[19] = 0.0;
+  };
+  auto wcag_y = [](uint8_t r, uint8_t g, uint8_t b) {
+    auto lin = [](double c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); };
+    return 0.2126 * lin(r / 255.0) + 0.7152 * lin(g / 255.0) + 0.0722 * lin(b / 255.0);
+  };
+
+  // (a) Top-bar pure progressive donor delegation hit, tight grab_of_with_donors < raw grab_of, CR >= 4.5, backdrop restored
+  for (int dark_bg = 0; dark_bg <= 1; dark_bg++) {
+    double bgv = dark_bg ? 0.06 : 0.94;
+    double tb[5 * MB_INST];
+    fill_p0_rect(tb, 0, 0, VW, VH, 0, bgv, bgv, bgv, 1.0, 0);
+    fill_p0_rect(tb + MB_INST, 0, 0, VW, 56, 5, 0, 0, 0, 0.0, -301);
+    tb[MB_INST + 6] = 1.0; tb[MB_INST + 7] = 6.0; tb[MB_INST + 15] = 1.0;
+    tb[MB_INST + 22] = -1.0; tb[MB_INST + 54] = 56.0; tb[MB_INST + 55] = 24.0;
+    fill_p0_rect(tb + 2 * MB_INST, 8, 12, 24, 24, 6, 0.14, 0.14, 0.15, 0.4, -302);
+    tb[2 * MB_INST + 4] = 12.0; tb[2 * MB_INST + 6] = 1.0; tb[2 * MB_INST + 7] = 1.4;
+    tb[2 * MB_INST + 14] = -1.0; tb[2 * MB_INST + 15] = 1.0;
+    tb[2 * MB_INST + 21] = 4.0; tb[2 * MB_INST + 23] = 2.0;
+    // Bare-adaptive title path (kind 11 filled square at x=100..124, y=14..38)
+    fill_p0_rect(tb + 3 * MB_INST, 100, 14, 24, 24, 11, 0.9, 0.9, 0.9, 1.0, 0);
+    tb[3 * MB_INST + 4] = 0.0; tb[3 * MB_INST + 12] = 0.0; tb[3 * MB_INST + 13] = 4.0;
+    tb[3 * MB_INST + 23] = -16.0;
+    fill_unit_sq_segs(tb + 4 * MB_INST);
+    uint8_t *px = render_rgba_pixels_of(tb, 5, bgv, bgv, bgv, 2.0, PW, PH);
+    CHECK(px != NULL);
+    CHECK(donor_delegated_count == 1);
+    CHECK(donor_of_buf && donor_of_buf[3] == -301);
+    float f_tmp[5 * MB_INST];
+    for (int i = 0; i < 5 * MB_INST; i++) f_tmp[i] = (float)tb[i];
+    Grab gm_del, gm_raw;
+    double saved_vscale = vscale;
+    vscale = 2.0;
+    CHECK(grab_of_with_donors(&gm_del, f_tmp, 2, 3, 5, PW, PH, donor_of_buf) == 1);
+    CHECK(grab_of(&gm_raw, f_tmp, 2, 3, 5, PW, PH) == 1);
+    vscale = saved_vscale;
+    CHECK(gm_del.w < gm_raw.w);
+    if (px) {
+      uint8_t *tp = P51_PX(px, PW, 112 * 2, 26 * 2);
+      double y_fg = wcag_y(tp[0], tp[1], tp[2]);
+      double y_bg = wcag_y((uint8_t)(bgv * 255.0 + 0.5), (uint8_t)(bgv * 255.0 + 0.5), (uint8_t)(bgv * 255.0 + 0.5));
+      double cr = ((y_fg > y_bg ? y_fg : y_bg) + 0.05) / ((y_fg > y_bg ? y_bg : y_fg) + 0.05);
+      CHECK(cr >= 4.5);
+      free(px);
+    }
+  }
+
+  // (b) 33rd cold capture donor pin over opposite-brightness white filler region (0 LSB diff on title)
+  {
+    double ref[6 * MB_INST];
+    fill_p0_rect(ref, 0, 0, VW, VH, 0, 1.0, 1.0, 1.0, 1.0, 0);
+    fill_p0_rect(ref + MB_INST, 60, 0, VW - 60, 60, 0, 0.05, 0.05, 0.05, 1.0, 0);
+    fill_p0_rect(ref + 2 * MB_INST, 0, 0, VW, 56, 5, 0, 0, 0, 0.0, -310);
+    ref[2 * MB_INST + 6] = 1.0; ref[2 * MB_INST + 7] = 6.0; ref[2 * MB_INST + 15] = 1.0;
+    ref[2 * MB_INST + 22] = -1.0; ref[2 * MB_INST + 54] = 56.0; ref[2 * MB_INST + 55] = 24.0;
+    fill_p0_rect(ref + 3 * MB_INST, 8, 12, 24, 24, 6, 0.14, 0.14, 0.15, 0.4, -311);
+    ref[3 * MB_INST + 4] = 12.0; ref[3 * MB_INST + 6] = 1.0; ref[3 * MB_INST + 7] = 1.4;
+    ref[3 * MB_INST + 14] = -1.0; ref[3 * MB_INST + 15] = 1.0;
+    ref[3 * MB_INST + 21] = 4.0; ref[3 * MB_INST + 23] = 2.0;
+    fill_p0_rect(ref + 4 * MB_INST, 100, 14, 24, 24, 11, 0.2, 0.2, 0.2, 1.0, 0);
+    ref[4 * MB_INST + 4] = 0.0; ref[4 * MB_INST + 12] = 0.0; ref[4 * MB_INST + 13] = 4.0;
+    ref[4 * MB_INST + 23] = -16.0;
+    fill_unit_sq_segs(ref + 5 * MB_INST);
+    uint8_t *ref_px = render_rgba_pixels_of(ref, 6, 1.0, 1.0, 1.0, 2.0, PW, PH);
+    CHECK(ref_px != NULL);
+
+    double *st = (double *)calloc(37 * MB_INST, sizeof(double));
+    memcpy(st, ref, 3 * MB_INST * sizeof(double));
+    for (int i = 0; i < 31; i++) {
+      double *g = st + (size_t)(3 + i) * MB_INST;
+      fill_p0_rect(g, 4 + (i % 10) * 19, 64 + (i / 10) * 22, 14, 14, 5, 0.5, 0.5, 0.5, 0.2, (double)(-(320 + i)));
+      g[6] = 1.0; g[7] = 2.0; g[15] = 1.0;
+    }
+    memcpy(st + 34 * MB_INST, ref + 3 * MB_INST, 3 * MB_INST * sizeof(double));
+    slots_invalidate();
+    unsigned clk0 = gslots_clock;
+    uint8_t *st_px = render_rgba_pixels_of(st, 37, 1.0, 1.0, 1.0, 2.0, PW, PH);
+    CHECK(st_px != NULL);
+    CHECK(donor_delegated_count == 1);
+    CHECK(gslots_clock - clk0 >= 33u);
+    if (ref_px && st_px) {
+      for (int y = 16 * 2; y < 36 * 2; y++) {
+        for (int x = 102 * 2; x < 122 * 2; x++) {
+          uint8_t *a = P51_PX(ref_px, PW, x, y);
+          uint8_t *b = P51_PX(st_px, PW, x, y);
+          CHECK(a[0] == b[0] && a[1] == b[1] && a[2] == b[2]);
+        }
+      }
+      uint8_t *tc = P51_PX(st_px, PW, 112 * 2, 26 * 2);
+      CHECK(tc[0] > 180 && tc[1] > 180 && tc[2] > 180);
+    }
+    free(ref_px); free(st_px); free(st);
+  }
+
+  // (c) kind == 8 lens subtree counterexample (donor_delegated_count == 0)
+  {
+    double ln[6 * MB_INST];
+    fill_p0_rect(ln, 0, 0, VW, VH, 0, 0.05, 0.05, 0.05, 1.0, 0);
+    fill_p0_rect(ln + MB_INST, 0, 0, VW, 56, 8, 1, 1, 1, 1.0, 0);
+    ln[MB_INST + 7] = 2.0; ln[MB_INST + 12] = 1.0; ln[MB_INST + 15] = 1.0;
+    fill_p0_rect(ln + 2 * MB_INST, 0, 0, VW, 56, 5, 0, 0, 0, 0.0, -360);
+    ln[2 * MB_INST + 6] = 1.0; ln[2 * MB_INST + 7] = 6.0; ln[2 * MB_INST + 15] = 1.0;
+    ln[2 * MB_INST + 22] = -1.0; ln[2 * MB_INST + 54] = 56.0; ln[2 * MB_INST + 55] = 24.0;
+    fill_p0_rect(ln + 3 * MB_INST, 8, 12, 24, 24, 6, 0.14, 0.14, 0.15, 0.4, -361);
+    ln[3 * MB_INST + 4] = 12.0; ln[3 * MB_INST + 6] = 1.0; ln[3 * MB_INST + 7] = 1.4;
+    ln[3 * MB_INST + 14] = -1.0; ln[3 * MB_INST + 15] = 1.0;
+    ln[3 * MB_INST + 21] = 4.0; ln[3 * MB_INST + 23] = 2.0;
+    fill_p0_rect(ln + 4 * MB_INST, 100, 14, 24, 24, 11, 0.2, 0.2, 0.2, 1.0, 0);
+    ln[4 * MB_INST + 4] = 0.0; ln[4 * MB_INST + 12] = 0.0; ln[4 * MB_INST + 13] = 4.0;
+    ln[4 * MB_INST + 23] = -16.0;
+    fill_unit_sq_segs(ln + 5 * MB_INST);
+    uint8_t *px = render_rgba_pixels_of(ln, 6, 0.05, 0.05, 0.05, 2.0, PW, PH);
+    CHECK(px != NULL);
+    CHECK(donor_delegated_count == 0);
+    free(px);
+  }
+
+  // (d) vid == 0u || vid == 3u provoking-vertex both-triangles verification
+  {
+    double pv[4 * MB_INST];
+    fill_p0_rect(pv, 0, 0, VW, VH, 0, 0.05, 0.05, 0.05, 1.0, 0);
+    fill_p0_rect(pv + MB_INST, 0, 0, VW, VH, 5, 0, 0, 0, 0.0, -370);
+    pv[MB_INST + 6] = 1.0; pv[MB_INST + 7] = 4.0; pv[MB_INST + 15] = 1.0;
+    pv[MB_INST + 22] = -1.0; pv[MB_INST + 54] = (double)VH; pv[MB_INST + 55] = 10.0;
+    // Large dark bare-adaptive filled square (20..160, 20..120): both triangle 0 (upper-left) & triangle 1 (lower-right) must invert bright!
+    fill_p0_rect(pv + 2 * MB_INST, 20, 20, 140, 100, 11, 0.15, 0.15, 0.15, 1.0, 0);
+    pv[2 * MB_INST + 4] = 0.0; pv[2 * MB_INST + 12] = 0.0; pv[2 * MB_INST + 13] = 4.0;
+    pv[2 * MB_INST + 23] = -16.0;
+    fill_unit_sq_segs(pv + 3 * MB_INST);
+    uint8_t *px = render_rgba_pixels_of(pv, 4, 0.05, 0.05, 0.05, 2.0, PW, PH);
+    CHECK(px != NULL);
+    if (px) {
+      uint8_t *tri0 = P51_PX(px, PW, 40 * 2, 35 * 2);
+      uint8_t *tri1 = P51_PX(px, PW, 140 * 2, 105 * 2);
+      CHECK(tri0[0] == tri1[0] && tri0[1] == tri1[1] && tri0[2] == tri1[2]);
+      CHECK(tri0[0] > 180 && tri0[1] > 180 && tri0[2] > 180);
+      free(px);
+    }
+  }
+  #undef P51_PX
+  printf("win_gpu: perf-51 ok\n");
+}
+
 int main(void) {
   // 1. Initial values before any frame.
   CHECK(mb_host_gpu_ms() == -1.0);
@@ -1942,6 +2146,9 @@ int main(void) {
 
   // 6. Commit 2 V8/V9 2D Multi-Pixel ROI gates on D3D11 WARP production shader.
   test_v8_v9_droplet_roi_gates();
+
+  // 7. Perf-51 R2 donor delegation, 33rd cold capture pin, lens counterexample & provoking-vertex verification.
+  test_perf51_donor_and_provoking_vertex();
 
   if (failed) return 1;
   printf("win_gpu: ok\n");
