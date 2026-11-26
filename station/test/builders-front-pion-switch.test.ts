@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { createSocket } from "node:dgram";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { type AddressInfo, connect, createServer, type Socket } from "node:net";
@@ -21,10 +21,11 @@ import {
   resolveReaderSelection,
 } from "../src/read/mb-reader.ts";
 import { READER_MODES, readerModeEnvKey, resolveReaderEngine } from "../src/read/reader-select.ts";
+import { pinnedPion } from "./pion-pinned.ts";
 
 function resolveDualBinaries(t: { skip: (msg: string) => void }): { mb: string; pion: string } | null {
   const realMb = mbReaderBinary();
-  const explicitPion = process.env.STILLFAIL_PION_READER?.trim();
+  const explicitPion = pinnedPion();
   const requireDual = process.env.STILLFAIL_REQUIRE_DUAL_READER === "1";
   const realPion = pionBinary();
 
@@ -468,65 +469,77 @@ async function runMeshParity(bin: string, label: string) {
     assert.equal((await fixedNewAcc)!.remoteId(), dialer.id());
     fixedNewDial.close(0, "");
 
-    // 6. `giveUp` on in-flight connect (cancel via fetch.cancel; assert non-empty cancellation error)
-    const frontClient = await Front.open(fA.socket);
+    // 6. `giveUp` on in-flight connect (cancel via fetch.cancel; assert non-empty cancellation error). The connect is to
+    //    a peer no endpoint here has met (a new key: none has its addresses) at a UDP socket that answers nothing, so it
+    //    stays pending until given up. To `dialer`, whose addresses fixed2's endpoint holds from step 5, it could finish
+    //    first (check-station 139593648443: "Missing expected rejection").
+    const nowhere = createSocket("udp4");
+    await new Promise<void>((r) => nowhere.bind(0, "127.0.0.1", r));
+    const nowhereAddr = `127.0.0.1:${nowhere.address().port}`;
+    const strangerId = (generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "der" }) as Buffer).subarray(-32).toString("hex");
+    // (steps 6 and 6b both dial it: closed after them, whichever fails)
     try {
-      await frontClient.ask("bind", {
-        streams: frontClient.streamsPath,
-        key: keyA.toString("hex"),
-        options: { alpns: [ALPN_MAIN.toString("hex")], relayUrls: [], discovery: false, bindAddr: fixedAddr, dscp: 20 },
-      });
-      let connectAskId = 0;
-      const connectP = frontClient.ask(
-        "connect",
-        { alpn: ALPN_MAIN.toString("hex"), addr: { id: dialer.id(), ips: ["127.0.0.1:1"] } },
-        (n) => {
-          connectAskId = n;
-        },
-      );
-      assert.ok(connectAskId > 0);
-      await frontClient.ask("giveUp", { of: connectAskId });
-      await assert.rejects(connectP, /cancel/i);
-      const relays = await frontClient.ask("relayStatus");
-      assert.ok(Array.isArray(relays));
-    } finally {
-      await frontClient.ask("close").catch(() => {});
-      frontClient.close();
-    }
+      const frontClient = await Front.open(fA.socket);
+      try {
+        await frontClient.ask("bind", {
+          streams: frontClient.streamsPath,
+          key: keyA.toString("hex"),
+          options: { alpns: [ALPN_MAIN.toString("hex")], relayUrls: [], discovery: false, bindAddr: fixedAddr, dscp: 20 },
+        });
+        let connectAskId = 0;
+        const connectP = frontClient.ask(
+          "connect",
+          { alpn: ALPN_MAIN.toString("hex"), addr: { id: strangerId, ips: [nowhereAddr] } },
+          (n) => {
+            connectAskId = n;
+          },
+        );
+        assert.ok(connectAskId > 0);
+        await frontClient.ask("giveUp", { of: connectAskId });
+        await assert.rejects(connectP, /cancel/i);
+        const relays = await frontClient.ask("relayStatus");
+        assert.ok(Array.isArray(relays));
+      } finally {
+        await frontClient.ask("close").catch(() => {});
+        frontClient.close();
+      }
 
-    // 6b. Non-safe-integer JS number parity (`1e20`/`2e20` vs expanded integer strings):
-    //     both MB and Pion echo `100000000000000000000` on `route(id: 1e20)` and match `connect(id: 2e20)` with `giveUp(of: 200000000000000000000)`.
-    const bigCtl = connect(fA.socket);
-    await new Promise<void>((resolve, reject) => bigCtl.once("connect", resolve).once("error", reject));
-    try {
-      const bigLines: string[] = [];
-      let bigBuf = "";
-      const waiters: Array<() => void> = [];
-      bigCtl.on("data", (chunk: Buffer) => {
-        bigBuf += chunk.toString();
-        for (let at = bigBuf.indexOf("\n"); at >= 0; at = bigBuf.indexOf("\n")) {
-          bigLines.push(bigBuf.slice(0, at));
-          bigBuf = bigBuf.slice(at + 1);
-        }
-        while (waiters.length > 0) waiters.shift()!();
-      });
-      const waitCount = async (n: number) => {
-        while (bigLines.length < n) await new Promise<void>((r) => waiters.push(r));
-      };
-      bigCtl.write(
-        `{"id":1e20,"op":"route","front":[],"routes":[],"alpn":null}\n{"id":2e20,"op":"connect","alpn":${JSON.stringify(ALPN_MAIN.toString("hex"))},"addr":{"id":${JSON.stringify(dialer.id())},"ips":["127.0.0.1:1"]}}\n{"id":2,"op":"giveUp","of":200000000000000000000}\n`,
-      );
-      await waitCount(3);
-      const routeReplyLine = bigLines.find((l) => l.includes("100000000000000000000"));
-      assert.ok(
-        routeReplyLine,
-        `route id 1e20 must serialize as 100000000000000000000, got: ${JSON.stringify(bigLines)}`,
-      );
-      const connectCancelLine = bigLines.find((l) => l.includes("200000000000000000000"));
-      assert.ok(connectCancelLine, `expected connect reply with 200000000000000000000 in ${JSON.stringify(bigLines)}`);
-      assert.match(String(JSON.parse(connectCancelLine).error ?? ""), /cancel/i);
+      // 6b. Non-safe-integer JS number parity (`1e20`/`2e20` vs expanded integer strings):
+      //     both MB and Pion echo `100000000000000000000` on `route(id: 1e20)` and match `connect(id: 2e20)` with `giveUp(of: 200000000000000000000)`.
+      const bigCtl = connect(fA.socket);
+      await new Promise<void>((resolve, reject) => bigCtl.once("connect", resolve).once("error", reject));
+      try {
+        const bigLines: string[] = [];
+        let bigBuf = "";
+        const waiters: Array<() => void> = [];
+        bigCtl.on("data", (chunk: Buffer) => {
+          bigBuf += chunk.toString();
+          for (let at = bigBuf.indexOf("\n"); at >= 0; at = bigBuf.indexOf("\n")) {
+            bigLines.push(bigBuf.slice(0, at));
+            bigBuf = bigBuf.slice(at + 1);
+          }
+          while (waiters.length > 0) waiters.shift()!();
+        });
+        const waitCount = async (n: number) => {
+          while (bigLines.length < n) await new Promise<void>((r) => waiters.push(r));
+        };
+        bigCtl.write(
+          `{"id":1e20,"op":"route","front":[],"routes":[],"alpn":null}\n{"id":2e20,"op":"connect","alpn":${JSON.stringify(ALPN_MAIN.toString("hex"))},"addr":{"id":${JSON.stringify(strangerId)},"ips":[${JSON.stringify(nowhereAddr)}]}}\n{"id":2,"op":"giveUp","of":200000000000000000000}\n`,
+        );
+        await waitCount(3);
+        const routeReplyLine = bigLines.find((l) => l.includes("100000000000000000000"));
+        assert.ok(
+          routeReplyLine,
+          `route id 1e20 must serialize as 100000000000000000000, got: ${JSON.stringify(bigLines)}`,
+        );
+        const connectCancelLine = bigLines.find((l) => l.includes("200000000000000000000"));
+        assert.ok(connectCancelLine, `expected connect reply with 200000000000000000000 in ${JSON.stringify(bigLines)}`);
+        assert.match(String(JSON.parse(connectCancelLine).error ?? ""), /cancel/i);
+      } finally {
+        bigCtl.destroy();
+      }
     } finally {
-      bigCtl.destroy();
+      await new Promise<void>((r) => nowhere.close(r));
     }
 
     await fixed2.close();

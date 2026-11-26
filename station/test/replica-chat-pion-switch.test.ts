@@ -3,20 +3,23 @@
 // cut at a character's end, older entries left out past CHAT_BYTES, `earlier` counted, sessions that left ordered last,
 // a chat the copy does not hold, a copy that is none, a `--thread` that is no number), each removing its scratch fold;
 // and `STILLFAIL_READER_REPLICA_CHAT=pion` makes `readChatSoon` spawn the Pion program through the reader selection.
-// Skips when no Pion binary is built here; strictly 0-skip with distinct binaries when STILLFAIL_REQUIRE_DUAL_READER=1.
+// Each reading is counted (ops, errors, time) as its engine's, a MoonBit one asked as Pion a fallback, which runs with
+// no Pion built. The rest skips when no Pion binary is built here; strictly 0-skip with distinct binaries when
+// STILLFAIL_REQUIRE_DUAL_READER=1.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, sep } from "node:path";
 import { after, test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { mbReaderBinary, pionBinary, resetReaderSelectionStateForTest, resolveReaderSelectionAsync } from "../src/read/mb-reader.ts";
 import { readerTelemetry } from "../src/read/reader-telemetry.ts";
-import { CHAT_BYTES, CHAT_ENTRIES, CHAT_SESSIONS, CHAT_TEXT, readChatSoon } from "../src/replica/chat.ts";
+import { CHAT_BYTES, CHAT_ENTRIES, CHAT_READ_TIMEOUT, CHAT_SESSIONS, CHAT_TEXT, readChatSoon } from "../src/replica/chat.ts";
 import { nothingTold } from "../src/replica/export.ts";
 import { Store } from "../src/store/store.ts";
 import { InlineRunner } from "./reference/replica-work.ts";
 import { HOME, ORIGIN, attach, chat, dataDir } from "./replica-fakes.ts";
+import { pinnedPion } from "./pion-pinned.ts";
 
 type Json = any;
 const cleanup: string[] = [];
@@ -41,7 +44,7 @@ function binaries(t: { skip: (msg: string) => void }): { mb: string; pion: strin
   }
   const pion = pionBinary();
   if (pion === null) {
-    if (requireDual || process.env.STILLFAIL_PION_READER?.trim()) assert.fail(`STILLFAIL_PION_READER is required (${process.env.STILLFAIL_PION_READER ?? "unset"}) but resolved to null`);
+    if (requireDual || pinnedPion()) assert.fail(`STILLFAIL_PION_READER is required (${pinnedPion() ?? "unset"}) but resolved to null`);
     t.skip("STILLFAIL_PION_READER / built stillfail-pion binary not present in this environment");
     return null;
   }
@@ -245,10 +248,15 @@ test("replica-chat: STILLFAIL_READER_REPLICA_CHAT=pion spawns stillfail-pion thr
     readerTelemetry.flushWindow();
     const selected = await read();
     const counted = readerTelemetry.flushWindow().filter((b) => b.mode === "replica-chat");
-    const count = (engine: string, k: "spawns" | "fallbacks") => counted.filter((b) => b.engine === engine).reduce((n, b) => n + b[k], 0);
+    const count = (engine: string, k: "spawns" | "fallbacks" | "ops" | "errors") => counted.filter((b) => b.engine === engine).reduce((n, b) => n + b[k], 0);
     assert.equal(count("pion", "spawns"), 1, `one Pion spawn: ${JSON.stringify(counted)}`);
     assert.equal(count("mb", "spawns"), 0, "no MoonBit spawn");
     assert.equal(count("pion", "fallbacks") + count("mb", "fallbacks"), 0, "no fallback");
+    // (the reading counted as Pion's, once, timed, and none an error)
+    assert.equal(count("pion", "ops"), 1, `one Pion reading counted: ${JSON.stringify(counted)}`);
+    assert.equal(count("pion", "errors"), 0, "none an error");
+    assert.equal(count("mb", "ops"), 0, "none counted as MoonBit's");
+    assert.ok(counted.some((b) => b.engine === "pion" && b.maxMs !== undefined), `its time counted: ${JSON.stringify(counted)}`);
     assert.equal(existsSync(work), false, "the fold is gone after");
     assert.equal(JSON.stringify(selected), JSON.stringify(mb), "the selected Pion reading is MoonBit's");
     // (where a shell script runs: the very arguments it was spawned with)
@@ -271,4 +279,115 @@ test("replica-chat: STILLFAIL_READER_REPLICA_CHAT=pion spawns stillfail-pion thr
     }
     resetReaderSelectionStateForTest();
   }
+});
+
+test("replica-chat: Pion asked for and none there reads with MoonBit, counted as a fallback, each reading and refusal counted", async (t) => {
+  const mb = mbReaderBinary();
+  if (mb === null) {
+    if (process.env.CI) assert.fail("stillfail-reader binary is required in CI");
+    t.skip("stillfail-reader not built here (station/mb/build.sh)");
+    return;
+  }
+  const c = await copied();
+  const names = ["STILLFAIL_PION_READER", "STILLFAIL_MB_READER", "STILLFAIL_READER_REPLICA_CHAT", "STILLFAIL_READER_ENGINE"] as const;
+  const saved = names.map((k) => [k, process.env[k]] as const);
+  try {
+    process.env.STILLFAIL_PION_READER = join(c.data, "no-pion-here");
+    process.env.STILLFAIL_MB_READER = mb;
+    process.env.STILLFAIL_READER_REPLICA_CHAT = "pion";
+    delete process.env.STILLFAIL_READER_ENGINE;
+    resetReaderSelectionStateForTest();
+    const chosen = await resolveReaderSelectionAsync("replica-chat", { logAt: "replica" });
+    assert.equal(chosen.engine, "mb");
+    assert.equal(chosen.selection.fallback, true);
+    readerTelemetry.flushWindow();
+    const work = join(c.data, "replica", "chat-fallback.db");
+    const read = await readChatSoon({ dir: c.dir, work, thread: c.big, shellDir: join(c.data, "shell") });
+    assert.equal(read.thread?.id, c.big);
+    // (a copy that is none: refused, and that reading counted as an error)
+    const empty = join(c.data, "no-copy-fallback");
+    mkdirSync(empty, { recursive: true });
+    writeFileSync(join(empty, "head.json"), JSON.stringify({ v: 1, origin: ORIGIN }));
+    await assert.rejects(readChatSoon({ dir: empty, work, thread: c.big, shellDir: join(c.data, "shell") }), /no copy here/);
+    const counted = readerTelemetry.flushWindow().filter((b) => b.mode === "replica-chat");
+    const count = (engine: string, k: "spawns" | "fallbacks" | "ops" | "errors") => counted.filter((b) => b.engine === engine).reduce((n, b) => n + b[k], 0);
+    assert.equal(count("mb", "spawns"), 2, `two MoonBit spawns: ${JSON.stringify(counted)}`);
+    assert.equal(count("pion", "spawns"), 0, "no Pion spawn");
+    assert.equal(count("pion", "fallbacks"), 2, `each spawn a fallback from Pion: ${JSON.stringify(counted)}`);
+    assert.equal(count("mb", "ops"), 2, "both readings counted as MoonBit's");
+    assert.equal(count("mb", "errors"), 1, "the refusal an error");
+    assert.equal(existsSync(work), false, "the fold is gone after");
+  } finally {
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    resetReaderSelectionStateForTest();
+  }
+});
+
+test("replica-chat: a reading called off is not counted; one called off as taking too long is a failed reading, timed", { skip: process.platform === "win32" && "a shell script stands in for the program" }, async () => {
+  // (a program that never answers, by the MoonBit reader's name: the reading is settled only by its calling off)
+  const dir = dataDir("chat-stops");
+  cleanup.push(dir);
+  const hangs = join(dir, "stillfail-reader");
+  writeFileSync(hangs, "#!/bin/sh\nexec sleep 600\n");
+  chmodSync(hangs, 0o755);
+  const calledOff = async (reason?: unknown) => {
+    const stop = new AbortController();
+    const reading = readChatSoon({ dir, work: join(dir, "chat.db"), thread: 1, shellDir: join(dir, "shell"), binary: hangs, signal: stop.signal });
+    // (past the selection's microtasks: the program is spawned, its reading under way)
+    await new Promise<void>((r) => setImmediate(r));
+    stop.abort(reason);
+    await assert.rejects(reading, /called off/);
+    return readerTelemetry.flushWindow().filter((b) => b.mode === "replica-chat" && b.engine === "mb");
+  };
+  readerTelemetry.flushWindow();
+  const plain = await calledOff();
+  assert.equal(plain.reduce((n, b) => n + b.spawns, 0), 1, `spawned once: ${JSON.stringify(plain)}`);
+  assert.equal(plain.reduce((n, b) => n + b.ops + b.errors, 0), 0, `called off: no reading counted: ${JSON.stringify(plain)}`);
+  const late = await calledOff(CHAT_READ_TIMEOUT);
+  assert.equal(late.reduce((n, b) => n + b.ops, 0), 1, `took too long: one reading counted: ${JSON.stringify(late)}`);
+  assert.equal(late.reduce((n, b) => n + b.errors, 0), 1, "a failed one");
+  assert.ok(late.some((b) => b.maxMs !== undefined), `its time counted: ${JSON.stringify(late)}`);
+});
+
+test("replica-chat: a program that answered and does not end, called off as taking too long, is a failed reading; called off otherwise, its answer", { skip: process.platform === "win32" && "a shell script stands in for the program" }, async () => {
+  // (a program by the MoonBit reader's name that answers a chat, then says so on a FIFO the test reads, then stays: its
+  // answer read by the time the FIFO's word is, as it came first on a pipe already read)
+  const dir = dataDir("chat-answered");
+  cleanup.push(dir);
+  const said = join(dir, "said");
+  execFileSync("mkfifo", [said]);
+  const answer = JSON.stringify({ chat: { origin: ORIGIN, workspace: HOME, gen: "g1", name: "n", made: 1, to: 2, thread: null, entries: [], earlier: 0, sessions: [] } });
+  const stays = join(dir, "stillfail-reader");
+  writeFileSync(stays, `#!/bin/sh\nprintf '%s\\n' '${answer}'\nprintf x > ${JSON.stringify(said)}\nexec sleep 600\n`);
+  chmodSync(stays, 0o755);
+  const calledOff = async (reason?: unknown) => {
+    const heard = new Promise<void>((resolve, reject) => {
+      const s = createReadStream(said);
+      s.once("data", () => {
+        s.destroy();
+        resolve();
+      });
+      s.once("error", reject);
+    });
+    const stop = new AbortController();
+    const reading = readChatSoon({ dir, work: join(dir, "chat.db"), thread: 1, shellDir: join(dir, "shell"), binary: stays, signal: stop.signal });
+    await heard;
+    await new Promise<void>((r) => setImmediate(r));
+    stop.abort(reason);
+    const got = await reading.then((chat) => ({ chat }), (e: unknown) => ({ error: messageOf(e) }));
+    return { got, counted: readerTelemetry.flushWindow().filter((b) => b.mode === "replica-chat" && b.engine === "mb") };
+  };
+  readerTelemetry.flushWindow();
+  const plain = await calledOff();
+  assert.equal("chat" in plain.got && plain.got.chat.gen, "g1", `called off after its answer: the answer: ${JSON.stringify(plain.got)}`);
+  assert.equal(plain.counted.reduce((n, b) => n + b.ops, 0), 1, `one reading counted: ${JSON.stringify(plain.counted)}`);
+  assert.equal(plain.counted.reduce((n, b) => n + b.errors, 0), 0, "not a failed one");
+  const late = await calledOff(CHAT_READ_TIMEOUT);
+  assert.match("error" in late.got ? late.got.error : "", /called off/, `took too long: refused: ${JSON.stringify(late.got)}`);
+  assert.equal(late.counted.reduce((n, b) => n + b.ops, 0), 1, `took too long: one reading counted: ${JSON.stringify(late.counted)}`);
+  assert.equal(late.counted.reduce((n, b) => n + b.errors, 0), 1, "a failed one, though it had answered");
+  assert.ok(late.counted.some((b) => b.maxMs !== undefined), `its time counted: ${JSON.stringify(late.counted)}`);
 });
