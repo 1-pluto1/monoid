@@ -44,6 +44,22 @@ fn conn_is_http_url(url : String) -> Bool {
   url.starts_with("http://") || url.starts_with("https://")
 }
 
+fn conn_is_hex64(s : String) -> Bool {
+  let b = s.to_bytes()
+  if b.length() != 64 {
+    return false
+  }
+  for i in 0..<64 {
+    let c = b[i].to_int() & 0xFF
+    let is_digit = c >= 48 && c <= 57
+    let is_hex_lower = c >= 97 && c <= 102
+    if !is_digit && !is_hex_lower {
+      return false
+    }
+  }
+  true
+}
+
 fn conn_is_ws_url(url : String) -> Bool {
   url.starts_with("ws://") || url.starts_with("wss://")
 }
@@ -256,6 +272,17 @@ pub fn EdgeMuxHub::host(
 ) -> EdgeMuxHub {
   EdgeMuxHub::from_transport(
     builders_core::MuxTransport::host(),
+    max_deferred_done=max_deferred_done,
+    max_deferred_sys=max_deferred_sys,
+  )
+}
+
+/// Alias for `EdgeMuxHub::host` used by `daemon_core` as the sole process-wide `host_shim::wait` owner.
+pub fn EdgeMuxHub::from_host(
+  max_deferred_done : Int = EDGE_MUX_MAX_DEFERRED_DONE,
+  max_deferred_sys : Int = EDGE_MUX_MAX_DEFERRED_SYS,
+) -> EdgeMuxHub {
+  EdgeMuxHub::host(
     max_deferred_done=max_deferred_done,
     max_deferred_sys=max_deferred_sys,
   )
@@ -1178,17 +1205,18 @@ pub fn ConnectMuxBridge::load_outbound_file(
 // ---------------------------------------------------------------------------
 
 pub struct ConnectsCallbacks {
-  pub on_event : (String, station_connects::ConnectPlatform, station_connects::ChatEvent) -> Unit
-  pub on_card_answer : (String, station_connects::FeishuCardAnswer) -> Unit
-  pub on_interactive : (String, String, base_codec::Json) -> Unit
+  pub on_event : (String, station_connects::ConnectPlatform, station_connects::ChatEvent) -> Bool
+  pub on_card_answer : (String, station_connects::FeishuCardAnswer) -> Bool
+  pub on_interactive : (String, String, base_codec::Json) -> Bool
   pub on_disconnect : (String, String) -> Unit
 }
 
+/// Fail-closed default callbacks: return `false` so unattached runtimes NEVER ACK inbound frames.
 pub fn ConnectsCallbacks::noop() -> ConnectsCallbacks {
   ConnectsCallbacks::{
-    on_event: fn(_cid : String, _p : station_connects::ConnectPlatform, _ev : station_connects::ChatEvent) -> Unit {},
-    on_card_answer: fn(_cid : String, _ans : station_connects::FeishuCardAnswer) -> Unit {},
-    on_interactive: fn(_cid : String, _eid : String, _payload : base_codec::Json) -> Unit {},
+    on_event: fn(_cid : String, _p : station_connects::ConnectPlatform, _ev : station_connects::ChatEvent) -> Bool { false },
+    on_card_answer: fn(_cid : String, _ans : station_connects::FeishuCardAnswer) -> Bool { false },
+    on_interactive: fn(_cid : String, _eid : String, _payload : base_codec::Json) -> Bool { false },
     on_disconnect: fn(_cid : String, _reason : String) -> Unit {},
   }
 }
@@ -1268,6 +1296,22 @@ pub fn ConnectsOsRuntime::group_stream_id_of(
   connect_id : String,
 ) -> Option[Int] {
   self.group_sse_streams.get(connect_id)
+}
+
+pub fn ConnectsOsRuntime::slack_team_id(
+  self : ConnectsOsRuntime,
+  connect_id : String,
+) -> Option[String] {
+  match self.connectors.get(connect_id) {
+    Some(ConnectorEntry::Slack(s)) => {
+      if s.team_id.length() > 0 {
+        Some(s.team_id)
+      } else {
+        None
+      }
+    }
+    _ => None
+  }
 }
 
 pub fn ConnectsOsRuntime::register_slack(
@@ -1393,17 +1437,21 @@ pub fn ConnectsOsRuntime::start_connect(
   let tr = self.bridge.transport(async_ws_writes=true)
   self.statuses.set(connect_id, station_connects::ConnectStatus::Starting)
   match entry {
-    ConnectorEntry::Slack(s) => match s.connect(tr) {
-      Ok(h) => {
-        self.running_connects.set(connect_id, true)
-        self.ws_to_connect.set(h, connect_id)
-        self.statuses.set(connect_id, station_connects::ConnectStatus::Connected)
-        let _ = self.arm_ws_next(h)
-        Ok(())
-      }
-      Err(e) => {
-        self.statuses.set(connect_id, station_connects::ConnectStatus::Reconnecting(e))
-        Err(e)
+    ConnectorEntry::Slack(s) => {
+      // Populate runtime `team_id` / `bot_user_id` / `bot_id` via `auth.test` (best-effort).
+      let _ = s.identify(tr)
+      match s.connect(tr) {
+        Ok(h) => {
+          self.running_connects.set(connect_id, true)
+          self.ws_to_connect.set(h, connect_id)
+          self.statuses.set(connect_id, station_connects::ConnectStatus::Connected)
+          let _ = self.arm_ws_next(h)
+          Ok(())
+        }
+        Err(e) => {
+          self.statuses.set(connect_id, station_connects::ConnectStatus::Reconnecting(e))
+          Err(e)
+        }
       }
     }
     ConnectorEntry::Feishu(f) => match f.connect(tr) {
@@ -1433,6 +1481,12 @@ pub fn ConnectsOsRuntime::start_connect(
       }
     }
     ConnectorEntry::Group(g) => {
+      if conn_is_hex64(g.anchor_url) {
+        // Canonical Node `config.json` 64-hex iroh endpoint ID (`im/2` mesh transport):
+        // accepted as valid config, explicitly marked `unsupported_im2` (never ACK/advance cursor).
+        self.statuses.set(connect_id, station_connects::ConnectStatus::Error("unsupported_im2"))
+        return Err("unsupported_im2")
+      }
       if !conn_is_http_url(g.anchor_url) {
         self.statuses.set(connect_id, station_connects::ConnectStatus::Error("invalid anchor_url"))
         return Err("disallowed Group anchor URL scheme: " + g.anchor_url)
@@ -1560,24 +1614,36 @@ fn ConnectsOsRuntime::dispatch_ws_frame(
   match entry {
     ConnectorEntry::Slack(s) => match s.handle_frame(tr, frame) {
       station_connects::SlackStep::Event(eid, ev) => {
-        if self.is_connect_running(connect_id) {
+        let delivered = if self.is_connect_running(connect_id) {
           (self.callbacks.on_event)(connect_id, station_connects::ConnectPlatform::Slack, ev)
+        } else {
+          false
         }
-        let _ = s.ack(tr, eid)
+        if delivered && self.is_connect_running(connect_id) {
+          let _ = s.ack(tr, eid)
+        }
         true
       }
       station_connects::SlackStep::Interactive(eid, payload) => {
-        if self.is_connect_running(connect_id) {
+        let delivered = if self.is_connect_running(connect_id) {
           (self.callbacks.on_interactive)(connect_id, eid, payload)
+        } else {
+          false
         }
-        let _ = s.ack(tr, eid)
+        if delivered && self.is_connect_running(connect_id) {
+          let _ = s.ack(tr, eid)
+        }
         true
       }
       station_connects::SlackStep::SlashCommand(eid, payload) => {
-        if self.is_connect_running(connect_id) {
+        let delivered = if self.is_connect_running(connect_id) {
           (self.callbacks.on_interactive)(connect_id, eid, payload)
+        } else {
+          false
         }
-        let _ = s.ack(tr, eid)
+        if delivered && self.is_connect_running(connect_id) {
+          let _ = s.ack(tr, eid)
+        }
         true
       }
       station_connects::SlackStep::DuplicateIgnored(eid, _) => {
@@ -1616,17 +1682,25 @@ fn ConnectsOsRuntime::dispatch_ws_frame(
           station_connects::FeishuDomain::Feishu => station_connects::ConnectPlatform::Feishu
           station_connects::FeishuDomain::Lark => station_connects::ConnectPlatform::Lark
         }
-        if self.is_connect_running(connect_id) {
+        let delivered = if self.is_connect_running(connect_id) {
           (self.callbacks.on_event)(connect_id, plat, ev)
+        } else {
+          false
         }
-        let _ = f.ack_frame(tr, req, code=200, answer_json=None, dedupe_key=dedupe_key)
+        if delivered && self.is_connect_running(connect_id) {
+          let _ = f.ack_frame(tr, req, code=200, answer_json=None, dedupe_key=dedupe_key)
+        }
         true
       }
       station_connects::FeishuStep::CardAction(req, dedupe_key, ans) => {
-        if self.is_connect_running(connect_id) {
+        let delivered = if self.is_connect_running(connect_id) {
           (self.callbacks.on_card_answer)(connect_id, ans)
+        } else {
+          false
         }
-        let _ = f.ack_frame(tr, req, code=200, answer_json=None, dedupe_key=dedupe_key)
+        if delivered && self.is_connect_running(connect_id) {
+          let _ = f.ack_frame(tr, req, code=200, answer_json=None, dedupe_key=dedupe_key)
+        }
         true
       }
       station_connects::FeishuStep::DuplicateIgnored(req, dedupe_key) => {
@@ -1653,16 +1727,26 @@ fn ConnectsOsRuntime::dispatch_ws_frame(
     }
     ConnectorEntry::Comma(c) => match c.handle_frame(tr, frame) {
       station_connects::CommaStep::TaskPut(batch) => {
-        if self.is_connect_running(connect_id) {
+        let mut all_delivered = self.is_connect_running(connect_id)
+        if all_delivered {
           for i in 0..<batch.events.length() {
-            (self.callbacks.on_event)(
+            if !self.is_connect_running(connect_id) {
+              all_delivered = false
+              break
+            }
+            if !(self.callbacks.on_event)(
               connect_id,
               station_connects::ConnectPlatform::Comma,
               batch.events[i],
-            )
+            ) {
+              all_delivered = false
+              break
+            }
           }
         }
-        c.commit_put(tr, batch)
+        if all_delivered && self.is_connect_running(connect_id) {
+          c.commit_put(tr, batch)
+        }
         true
       }
       station_connects::CommaStep::Closed(reason_opt) => {
@@ -1815,9 +1899,46 @@ pub fn ConnectsOsRuntime::feed_group_sse(
         match g.take_sse(evs[i], now_ms) {
           station_connects::GroupStep::Event(ev) => {
             if self.is_connect_running(connect_id) {
-              (self.callbacks.on_event)(connect_id, station_connects::ConnectPlatform::Group, ev)
-              delivered = delivered + 1
+              if (self.callbacks.on_event)(connect_id, station_connects::ConnectPlatform::Group, ev) {
+                g.commit_pending(now_ms)
+                delivered = delivered + 1
+              } else {
+                // Fail-closed: discard pending cursor commit, close SSE stream & trigger backoff reconnect
+                // so the rejected event and any trailing events in the stream are redelivered in order!
+                g.discard_pending()
+                match self.group_sse_streams.get(connect_id) {
+                  Some(sid) => self.on_group_sse_closed(connect_id, sid, "event_rejected")
+                  None => {
+                    self.running_connects.remove(connect_id)
+                    g.machine.on_close(now_ms, Some("event_rejected"))
+                    self.statuses.set(connect_id, station_connects::ConnectStatus::Reconnecting("event_rejected"))
+                    if !self.stopped {
+                      (self.callbacks.on_disconnect)(connect_id, "event_rejected")
+                    }
+                  }
+                }
+                break
+              }
+            } else {
+              g.discard_pending()
+              break
             }
+          }
+          station_connects::GroupStep::NeedSync(space, cur) => {
+            g.discard_pending()
+            let reason = "need_sync:" + space + ":" + cur.to_string()
+            match self.group_sse_streams.get(connect_id) {
+              Some(sid) => self.on_group_sse_closed(connect_id, sid, reason)
+              None => {
+                self.running_connects.remove(connect_id)
+                g.machine.on_close(now_ms, Some(reason))
+                self.statuses.set(connect_id, station_connects::ConnectStatus::Reconnecting(reason))
+                if !self.stopped {
+                  (self.callbacks.on_disconnect)(connect_id, reason)
+                }
+              }
+            }
+            break
           }
           _ => ()
         }

@@ -74,6 +74,10 @@ extern "C" {
 #define STS_EV_UDP_RECV   50u
 #define STS_EV_UDP_CLOSED 51u
 
+// Async DNS resolution events (pushed via sth_push_sys):
+//   STS_EV_DNS_RESOLVED: [60][rc:i32 le][ip_utf8...]                             (control)
+#define STS_EV_DNS_RESOLVED 60u
+
 // Spawn flags for `sts_proc_spawn` and `sts_pty_spawn`.
 #define STS_PROC_NEW_PGID        (1u << 0)
 #define STS_PROC_STRIP_MALLOC_SE (1u << 1)
@@ -293,6 +297,38 @@ int32_t sts_js_lower_utf8(
 // Idempotently register deterministic SQLite scalar function `js_lower(x)` via `sqlite3_auto_extension`.
 // Implemented in `station_sqlite_ext.c`; returns 0 (SQLITE_OK) on success, non-zero SQLite rc on error.
 int32_t sts_register_sqlite_js_lower(void);
+
+// Pure user-space literal IP / `localhost` resolution for `device:` tunnel dialing
+// (0 syscalls, 0 FDs, never blocks):
+// Returns:
+//   1  literal IP / `localhost` allowed (`out_ip` holds canonical literal IP),
+//  -2  if `reject_loopback_or_unspec != 0` and literal/localhost is loopback/unspecified
+//      (127.0.0.0/8, 0.0.0.0, ::1, ::, ::ffff:127.0.0.0/104, ::ffff:0.0.0.0, decimal/hex/octal IPv4),
+//   0  non-literal hostname requiring async DNS via `sts_resolve_host_for_tunnel_async`,
+//  -1  invalid input or buffer too small.
+int32_t sts_resolve_host_for_tunnel(
+    const char *host,
+    int32_t reject_loopback_or_unspec,
+    char *out_ip,
+    size_t out_cap);
+
+// Non-blocking async DNS resolution on a detached worker thread; emits `STS_EV_DNS_RESOLVED`
+// (`[60][rc:i32 le][ip_utf8...]`, rc=1 allowed, -2 blocked loopback/unspec, -1 DNS error).
+// Returns 1 if the worker was spawned, 0 on error.
+int32_t sts_resolve_host_for_tunnel_async(
+    uint64_t event_id,
+    const char *host,
+    int32_t reject_loopback_or_unspec);
+
+// Replace the current process in-place:
+// - POSIX: `execv(program, argv)` preserving PID, PGID, signal mask, and inherited FDs (e.g. launcher 3/4/5).
+// - Windows: `CreateProcessW` with `bInheritHandles=TRUE` inside a `KILL_ON_JOB_CLOSE | SILENT_BREAKAWAY_OK`
+//   Job Object, waiting for exit and returning the child's exit code.
+// Returns 127 on failure (never returns on successful POSIX `execv`).
+int32_t sts_exec_replace(
+    const char *program,
+    const uint8_t *argv_nul,
+    int64_t argv_len);
 
 // Free any buffer returned by `sts_*`.
 void sts_free(void *ptr);

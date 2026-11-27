@@ -56,6 +56,7 @@
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -8680,5 +8681,551 @@ void *sts_network_interfaces(int64_t *out_len) {
 }
 
 #endif // _WIN32
+
+static int sts_ipv4_host_is_loopback_or_unspec(uint32_t ip_host) {
+    if ((ip_host >> 24) == 127u) return 1; // 127.0.0.0/8
+    if (ip_host == 0u) return 1;           // 0.0.0.0
+    return 0;
+}
+
+static int sts_ipv6_bytes_is_loopback_or_unspec(const uint8_t *b) {
+    int all_zero = 1;
+    for (int i = 0; i < 16; i++) {
+        if (b[i] != 0) {
+            all_zero = 0;
+            break;
+        }
+    }
+    if (all_zero) return 1; // ::
+    int v6_lo = 1;
+    for (int i = 0; i < 15; i++) {
+        if (b[i] != 0) {
+            v6_lo = 0;
+            break;
+        }
+    }
+    if (v6_lo && b[15] == 1) return 1; // ::1
+    int v4_mapped = 1;
+    for (int i = 0; i < 10; i++) {
+        if (b[i] != 0) {
+            v4_mapped = 0;
+            break;
+        }
+    }
+    if (v4_mapped && b[10] == 0xff && b[11] == 0xff) {
+        if (b[12] == 127) return 1; // ::ffff:127.0.0.0/104
+        if (b[12] == 0 && b[13] == 0 && b[14] == 0 && b[15] == 0) return 1; // ::ffff:0.0.0.0
+    }
+    return 0;
+}
+
+static int sts_sockaddr_is_loopback_or_unspec(const struct sockaddr *sa) {
+    if (sa == NULL) return 0;
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
+        return sts_ipv4_host_is_loopback_or_unspec(ntohl(sin->sin_addr.s_addr));
+    }
+    if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
+        return sts_ipv6_bytes_is_loopback_or_unspec((const uint8_t *)sin6->sin6_addr.s6_addr);
+    }
+    return 0;
+}
+
+static int sts_is_localhost_name(const char *s) {
+    if (s == NULL) return 0;
+    size_t len = strlen(s);
+    if (len == 10 && s[9] == '.') len = 9;
+    if (len != 9) return 0;
+    const char *want = "localhost";
+    for (size_t i = 0; i < 9; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
+        if (c != (unsigned char)want[i]) return 0;
+    }
+    return 1;
+}
+
+// Pure user-space BSD/POSIX `inet_aton`-compatible IPv4 parser supporting 1–4 dot-separated
+// decimal, octal (`0...`), and hex (`0x...`) components (e.g. `2130706433`, `0x7f000001`, `0177.0.0.1`).
+static int sts_parse_ipv4_compat(const char *s, uint32_t *out_host) {
+    if (s == NULL || s[0] == '\0' || out_host == NULL) return 0;
+    uint32_t parts[4];
+    int nparts = 0;
+    const char *p = s;
+    for (;;) {
+        if (nparts >= 4) return 0;
+        if (*p == '\0') return 0;
+        uint64_t val = 0;
+        int base = 10;
+        int digits = 0;
+        if (*p == '0') {
+            if (p[1] == 'x' || p[1] == 'X') {
+                base = 16;
+                p += 2;
+            } else {
+                base = 8;
+                digits = 1;
+                p += 1;
+            }
+        }
+        while (*p != '\0' && *p != '.') {
+            unsigned char c = (unsigned char)*p;
+            uint64_t d;
+            if (c >= '0' && c <= '9') d = (uint64_t)(c - '0');
+            else if (base == 16 && c >= 'a' && c <= 'f') d = (uint64_t)(c - 'a' + 10);
+            else if (base == 16 && c >= 'A' && c <= 'F') d = (uint64_t)(c - 'A' + 10);
+            else return 0;
+            if (d >= (uint64_t)base) return 0;
+            val = val * (uint64_t)base + d;
+            if (val > 0xFFFFFFFFULL) return 0;
+            digits = 1;
+            p++;
+        }
+        if (!digits) return 0;
+        parts[nparts++] = (uint32_t)val;
+        if (*p == '\0') break;
+        if (*p == '.') {
+            p++;
+            if (*p == '\0') return 0;
+        }
+    }
+    if (nparts == 1) {
+        *out_host = parts[0];
+        return 1;
+    }
+    if (nparts == 2) {
+        if (parts[0] > 0xFFu || parts[1] > 0xFFFFFFu) return 0;
+        *out_host = (parts[0] << 24) | parts[1];
+        return 1;
+    }
+    if (nparts == 3) {
+        if (parts[0] > 0xFFu || parts[1] > 0xFFu || parts[2] > 0xFFFFu) return 0;
+        *out_host = (parts[0] << 24) | (parts[1] << 16) | parts[2];
+        return 1;
+    }
+    if (parts[0] > 0xFFu || parts[1] > 0xFFu || parts[2] > 0xFFu || parts[3] > 0xFFu) return 0;
+    *out_host = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+    return 1;
+}
+
+static int32_t sts_copy_ip_out(const char *ip, char *out_ip, size_t out_cap) {
+    size_t flen = strlen(ip);
+    if (flen == 0 || flen + 1 > out_cap) return -1;
+    memcpy(out_ip, ip, flen + 1);
+    return 1;
+}
+
+int32_t sts_resolve_host_for_tunnel(
+    const char *host,
+    int32_t reject_loopback_or_unspec,
+    char *out_ip,
+    size_t out_cap) {
+    if (host == NULL || host[0] == '\0' || out_ip == NULL || out_cap < 2) {
+        return -1;
+    }
+    out_ip[0] = '\0';
+    size_t hlen = strlen(host);
+    char clean[512];
+    const char *lookup_host = host;
+    int bracketed = 0;
+    if (hlen >= 2 && host[0] == '[' && host[hlen - 1] == ']') {
+        size_t inner = hlen - 2;
+        if (inner == 0 || inner >= sizeof(clean)) return -1;
+        memcpy(clean, host + 1, inner);
+        clean[inner] = '\0';
+        lookup_host = clean;
+        bracketed = 1;
+    }
+    if (!bracketed && sts_is_localhost_name(lookup_host)) {
+        if (reject_loopback_or_unspec != 0) return -2;
+        return sts_copy_ip_out("127.0.0.1", out_ip, out_cap);
+    }
+    struct in6_addr v6;
+    if (inet_pton(AF_INET6, lookup_host, &v6) == 1) {
+        if (reject_loopback_or_unspec != 0 &&
+            sts_ipv6_bytes_is_loopback_or_unspec((const uint8_t *)v6.s6_addr)) {
+            return -2;
+        }
+        char buf[INET6_ADDRSTRLEN];
+        if (inet_ntop(AF_INET6, &v6, buf, sizeof(buf)) == NULL) return -1;
+        return sts_copy_ip_out(buf, out_ip, out_cap);
+    }
+    if (bracketed) {
+        return -1;
+    }
+    struct in_addr v4;
+    uint32_t v4_host = 0;
+    // Parse IPv4 with `sts_parse_ipv4_compat` BEFORE `inet_pton(AF_INET, ...)`:
+    // macOS BSD `inet_pton` accepts leading-zero octets as decimal (`0177.0.0.1` -> `177.0.0.1`),
+    // whereas `getaddrinfo`/`inet_aton` treats `0177` as octal `127` (`127.0.0.1`).
+    if (sts_parse_ipv4_compat(lookup_host, &v4_host)) {
+        if (reject_loopback_or_unspec != 0 && sts_ipv4_host_is_loopback_or_unspec(v4_host)) {
+            return -2;
+        }
+        v4.s_addr = htonl(v4_host);
+        char buf[INET_ADDRSTRLEN];
+        if (inet_ntop(AF_INET, &v4, buf, sizeof(buf)) == NULL) return -1;
+        return sts_copy_ip_out(buf, out_ip, out_cap);
+    }
+    if (inet_pton(AF_INET, lookup_host, &v4) == 1) {
+        if (reject_loopback_or_unspec != 0 &&
+            sts_ipv4_host_is_loopback_or_unspec(ntohl(v4.s_addr))) {
+            return -2;
+        }
+        char buf[INET_ADDRSTRLEN];
+        if (inet_ntop(AF_INET, &v4, buf, sizeof(buf)) == NULL) return -1;
+        return sts_copy_ip_out(buf, out_ip, out_cap);
+    }
+    // Non-literal hostname: caller must dispatch `sts_resolve_host_for_tunnel_async`.
+    return 0;
+}
+
+typedef struct {
+    uint64_t event_id;
+    int32_t reject_loopback_or_unspec;
+    char *host;
+} sts_dns_task_t;
+
+static void sts_dns_emit_result(uint64_t event_id, int32_t rc, const char *ip) {
+    size_t ip_len = (rc == 1 && ip != NULL) ? strlen(ip) : 0;
+    uint8_t payload[5 + INET6_ADDRSTRLEN];
+    if (ip_len > INET6_ADDRSTRLEN) ip_len = INET6_ADDRSTRLEN;
+    payload[0] = (uint8_t)STS_EV_DNS_RESOLVED;
+    uint32_t u = (uint32_t)rc;
+    payload[1] = (uint8_t)(u & 0xFFu);
+    payload[2] = (uint8_t)((u >> 8) & 0xFFu);
+    payload[3] = (uint8_t)((u >> 16) & 0xFFu);
+    payload[4] = (uint8_t)((u >> 24) & 0xFFu);
+    if (ip_len > 0) {
+        memcpy(payload + 5, ip, ip_len);
+    }
+    sth_push_sys(event_id, payload, (int64_t)(5 + ip_len));
+}
+
+static void sts_dns_run_task(sts_dns_task_t *task) {
+#ifdef _WIN32
+    static atomic_int g_sts_resolve_wsa = 0;
+    if (atomic_load(&g_sts_resolve_wsa) == 0) {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
+            atomic_store(&g_sts_resolve_wsa, 1);
+        }
+    }
+#endif
+    char first_ip[INET6_ADDRSTRLEN];
+    first_ip[0] = '\0';
+    int32_t out_rc = sts_resolve_host_for_tunnel(
+        task->host,
+        task->reject_loopback_or_unspec,
+        first_ip,
+        sizeof(first_ip));
+    if (out_rc == 0) {
+        out_rc = -1;
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo *res = NULL;
+        int gai_rc = getaddrinfo(task->host, NULL, &hints, &res);
+        if (gai_rc == 0 && res != NULL) {
+            int blocked = 0;
+            for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+                if (ai->ai_addr == NULL) continue;
+                if (ai->ai_family != AF_INET && ai->ai_family != AF_INET6) continue;
+                if (task->reject_loopback_or_unspec != 0 &&
+                    sts_sockaddr_is_loopback_or_unspec(ai->ai_addr)) {
+                    blocked = 1;
+                    break;
+                }
+                if (first_ip[0] == '\0') {
+                    if (ai->ai_family == AF_INET) {
+                        const struct sockaddr_in *sin = (const struct sockaddr_in *)ai->ai_addr;
+                        if (inet_ntop(AF_INET, &sin->sin_addr, first_ip, sizeof(first_ip)) == NULL) {
+                            first_ip[0] = '\0';
+                        }
+                    } else if (ai->ai_family == AF_INET6) {
+                        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)ai->ai_addr;
+                        if (inet_ntop(AF_INET6, &sin6->sin6_addr, first_ip, sizeof(first_ip)) == NULL) {
+                            first_ip[0] = '\0';
+                        }
+                    }
+                }
+            }
+            freeaddrinfo(res);
+            if (blocked) {
+                out_rc = -2;
+            } else if (first_ip[0] != '\0') {
+                out_rc = 1;
+            }
+        }
+    }
+    sts_dns_emit_result(task->event_id, out_rc, first_ip);
+    free(task->host);
+    free(task);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI sts_dns_worker_win(LPVOID arg) {
+    sts_dns_run_task((sts_dns_task_t *)arg);
+    sts_detached_end();
+    return 0;
+}
+#else
+static void *sts_dns_worker_posix(void *arg) {
+    sts_dns_run_task((sts_dns_task_t *)arg);
+    sts_detached_end();
+    return NULL;
+}
+#endif
+
+int32_t sts_resolve_host_for_tunnel_async(
+    uint64_t event_id,
+    const char *host,
+    int32_t reject_loopback_or_unspec) {
+    if (host == NULL || host[0] == '\0') return 0;
+    size_t hlen = strlen(host);
+    if (hlen >= 512) return 0;
+    sts_dns_task_t *task = (sts_dns_task_t *)calloc(1, sizeof(sts_dns_task_t));
+    if (task == NULL) return 0;
+    task->host = (char *)malloc(hlen + 1);
+    if (task->host == NULL) {
+        free(task);
+        return 0;
+    }
+    memcpy(task->host, host, hlen + 1);
+    task->event_id = event_id;
+    task->reject_loopback_or_unspec = reject_loopback_or_unspec;
+#ifdef _WIN32
+    if (!win_spawn_detached_thread(sts_dns_worker_win, task)) {
+        free(task->host);
+        free(task);
+        return 0;
+    }
+#else
+    if (!spawn_detached_thread(sts_dns_worker_posix, task)) {
+        free(task->host);
+        free(task);
+        return 0;
+    }
+#endif
+    return 1;
+}
+
+#ifdef _WIN32
+#ifndef PROC_THREAD_ATTRIBUTE_JOB_LIST
+#define PROC_THREAD_ATTRIBUTE_JOB_LIST ((SIZE_T)0x0002000D)
+#endif
+
+typedef struct {
+    wchar_t *data;
+    size_t len;
+    size_t cap;
+} sts_wbuf_t;
+
+static int sts_wbuf_push(sts_wbuf_t *b, wchar_t c) {
+    if (b->len + 1 >= b->cap) {
+        size_t next_cap = b->cap == 0 ? 256 : b->cap * 2;
+        wchar_t *next = (wchar_t *)realloc(b->data, next_cap * sizeof(wchar_t));
+        if (next == NULL) return 0;
+        b->data = next;
+        b->cap = next_cap;
+    }
+    b->data[b->len++] = c;
+    b->data[b->len] = L'\0';
+    return 1;
+}
+
+static int sts_wbuf_append_arg(sts_wbuf_t *b, const wchar_t *arg) {
+    int need_quotes = arg[0] == L'\0';
+    for (const wchar_t *p = arg; !need_quotes && *p != L'\0'; p++) {
+        if (*p == L' ' || *p == L'\t' || *p == L'\n' || *p == L'\v' || *p == L'"') {
+            need_quotes = 1;
+        }
+    }
+    if (!need_quotes) {
+        for (const wchar_t *p = arg; *p != L'\0'; p++) {
+            if (!sts_wbuf_push(b, *p)) return 0;
+        }
+        return 1;
+    }
+    if (!sts_wbuf_push(b, L'"')) return 0;
+    size_t slashes = 0;
+    for (const wchar_t *p = arg; *p != L'\0'; p++) {
+        if (*p == L'\\') {
+            slashes++;
+        } else if (*p == L'"') {
+            for (size_t i = 0; i < slashes * 2 + 1; i++) {
+                if (!sts_wbuf_push(b, L'\\')) return 0;
+            }
+            slashes = 0;
+            if (!sts_wbuf_push(b, L'"')) return 0;
+        } else {
+            for (size_t i = 0; i < slashes; i++) {
+                if (!sts_wbuf_push(b, L'\\')) return 0;
+            }
+            slashes = 0;
+            if (!sts_wbuf_push(b, *p)) return 0;
+        }
+    }
+    for (size_t i = 0; i < slashes * 2; i++) {
+        if (!sts_wbuf_push(b, L'\\')) return 0;
+    }
+    return sts_wbuf_push(b, L'"');
+}
+#endif
+
+int32_t sts_exec_replace(
+    const char *program,
+    const uint8_t *argv_nul,
+    int64_t argv_len) {
+    if (program == NULL || program[0] == '\0' || argv_len < 0) {
+        return 127;
+    }
+    if (argv_len > 0 && argv_nul == NULL) {
+        return 127;
+    }
+
+    size_t total = (size_t)argv_len;
+    size_t argc = 0;
+    size_t pos = 0;
+    while (pos < total) {
+        const uint8_t *nul = (const uint8_t *)memchr(argv_nul + pos, '\0', total - pos);
+        if (nul == NULL) break;
+        argc++;
+        pos = (size_t)(nul - argv_nul) + 1;
+    }
+
+    size_t alloc_argc = argc > 0 ? argc : 1;
+    char **argv = (char **)malloc((alloc_argc + 1) * sizeof(char *));
+    if (argv == NULL) {
+        fprintf(stderr, "stillfail-station-pion: out of memory preparing exec\n");
+        return 127;
+    }
+    size_t idx = 0;
+    if (argc == 0) {
+        argv[idx++] = (char *)program;
+    } else {
+        pos = 0;
+        while (pos < total && idx < argc) {
+            const uint8_t *nul = (const uint8_t *)memchr(argv_nul + pos, '\0', total - pos);
+            if (nul == NULL) break;
+            argv[idx++] = (char *)(argv_nul + pos);
+            pos = (size_t)(nul - argv_nul) + 1;
+        }
+    }
+    argv[idx] = NULL;
+
+#ifdef _WIN32
+    wchar_t *wprog = utf8_to_wide(program);
+    if (wprog == NULL) {
+        free(argv);
+        fprintf(stderr, "stillfail-station-pion: invalid UTF-8 program path\n");
+        return 127;
+    }
+    sts_wbuf_t cmd = { NULL, 0, 0 };
+    for (size_t i = 0; i < idx; i++) {
+        if (i > 0 && !sts_wbuf_push(&cmd, L' ')) {
+            free(cmd.data);
+            free(wprog);
+            free(argv);
+            fprintf(stderr, "stillfail-station-pion: out of memory building command line\n");
+            return 127;
+        }
+        wchar_t *warg = utf8_to_wide(argv[i]);
+        int ok = warg != NULL && sts_wbuf_append_arg(&cmd, warg);
+        free(warg);
+        if (!ok) {
+            free(cmd.data);
+            free(wprog);
+            free(argv);
+            fprintf(stderr, "stillfail-station-pion: failed formatting Windows arguments\n");
+            return 127;
+        }
+    }
+    free(argv);
+
+    HANDLE job = CreateJobObjectW(NULL, NULL);
+    if (job == NULL) {
+        fprintf(stderr, "stillfail-station-pion: CreateJobObjectW failed (error %lu)\n", (unsigned long)GetLastError());
+        free(cmd.data);
+        free(wprog);
+        return 127;
+    }
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
+    ZeroMemory(&jeli, sizeof(jeli));
+    jeli.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
+        fprintf(stderr, "stillfail-station-pion: SetInformationJobObject failed (error %lu)\n", (unsigned long)GetLastError());
+        CloseHandle(job);
+        free(cmd.data);
+        free(wprog);
+        return 127;
+    }
+
+    SIZE_T attr_size = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+    if (attr_size == 0) {
+        fprintf(stderr, "stillfail-station-pion: InitializeProcThreadAttributeList sizing failed (error %lu)\n", (unsigned long)GetLastError());
+        CloseHandle(job);
+        free(cmd.data);
+        free(wprog);
+        return 127;
+    }
+    LPPROC_THREAD_ATTRIBUTE_LIST attr_list = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
+    if (attr_list == NULL || !InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size)) {
+        fprintf(stderr, "stillfail-station-pion: InitializeProcThreadAttributeList failed (error %lu)\n", (unsigned long)GetLastError());
+        free(attr_list);
+        CloseHandle(job);
+        free(cmd.data);
+        free(wprog);
+        return 127;
+    }
+    if (!UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, &job, sizeof(HANDLE), NULL, NULL)) {
+        fprintf(stderr, "stillfail-station-pion: UpdateProcThreadAttribute(JOB_LIST) failed (error %lu)\n", (unsigned long)GetLastError());
+        DeleteProcThreadAttributeList(attr_list);
+        free(attr_list);
+        CloseHandle(job);
+        free(cmd.data);
+        free(wprog);
+        return 127;
+    }
+
+    STARTUPINFOEXW siex;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&siex, sizeof(siex));
+    siex.StartupInfo.cb = sizeof(siex);
+    siex.lpAttributeList = attr_list;
+    ZeroMemory(&pi, sizeof(pi));
+    BOOL created = CreateProcessW(
+        wprog, cmd.data, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT, NULL, NULL, &siex.StartupInfo, &pi);
+    DWORD create_err = created ? 0 : GetLastError();
+    DeleteProcThreadAttributeList(attr_list);
+    free(attr_list);
+    free(cmd.data);
+    free(wprog);
+    if (!created) {
+        fprintf(stderr, "stillfail-station-pion: CreateProcessW(%s) failed (error %lu)\n", program, (unsigned long)create_err);
+        CloseHandle(job);
+        return 127;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CloseHandle(job);
+    return (int32_t)code;
+#else
+    fflush(stdout);
+    fflush(stderr);
+    execv(program, argv);
+    int err = errno;
+    fprintf(stderr, "stillfail-station-pion: execv(%s) failed: %s\n", program, strerror(err));
+    free(argv);
+    return 127;
+#endif
+}
 
 #include "station_js_lower.h"

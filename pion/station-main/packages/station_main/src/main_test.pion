@@ -58,11 +58,25 @@ fn assert_true(cond : Bool, msg : String) -> Unit {
   }
 }
 
-test "version line advertises roles:rig and all 8 CLI commands in W12-CLI-Main" {
+test "version line advertises roles:rig,whole and all 8 CLI commands in W17A-Whole-Cutover" {
   let v = version_line()
-  assert_str_eq(v, "stillfail-station-pion 0.1.0 roles:rig commands:id,status,lock,channel,enroll,update,heap,admin")
+  assert_str_eq(v, "stillfail-station-pion 0.1.0 roles:rig,whole commands:id,status,lock,channel,enroll,update,heap,admin")
   let tokens = v.split(" ")
   assert_true(tokens.length() == 4, "version line must have exactly 4 whitespace-separated tokens")
+}
+
+test "is_rig_raw_cloud_json matches launcher data.rs::is_rig 1:1" {
+  let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  let hex_upper = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+  assert_true(!is_rig_raw_cloud_json("{}"), "empty json is not rig")
+  assert_true(!is_rig_raw_cloud_json("{\"workspace\":\"ws-1\"}"), "whole station is not rig")
+  assert_true(!is_rig_raw_cloud_json("{\"workspace\":\"ws-1\",\"rig\":{\"owner\":\"u1\"}}"), "rig missing person is not rig")
+  assert_true(!is_rig_raw_cloud_json("{\"workspace\":\"ws-1\",\"rig\":{\"owner\":\"u1\",\"person\":\"" + hex_upper + "\"}}"), "uppercase hex person is not rig")
+  assert_true(is_rig_raw_cloud_json("{\"workspace\":\"ws-1\",\"rig\":{\"owner\":\"u1\",\"person\":\"" + hex + "\"}}"), "pure home rig is rig")
+  assert_true(is_rig_raw_cloud_json("{\"workspace\":\"ws-1\",\"rig\":{\"owner\":\"u1\",\"person\":\"" + hex + "\"},\"joined\":[{}]}"), "malformed joined [{}] stays rig")
+  assert_true(!is_rig_raw_cloud_json("{\"workspace\":\"ws-1\",\"rig\":{\"owner\":\"u1\",\"person\":\"" + hex + "\"},\"removed_at\":null}"), "removed_at:null disqualifies rig")
+  assert_true(!is_rig_raw_cloud_json("{\"workspace\":\"ws-1\",\"rig\":{\"owner\":\"u1\",\"person\":\"" + hex + "\"},\"joined\":[{\"workspace\":\"ws-2\"}]}"), "mixed full joined workspace is not rig")
+  assert_true(is_rig_raw_cloud_json("{\"workspace\":\"ws-1\",\"rig\":{\"owner\":\"u1\",\"person\":\"" + hex + "\"},\"joined\":[{\"workspace\":\"ws-2\",\"rig\":{\"owner\":\"u2\",\"person\":\"" + hex + "\"}}]}"), "all-rig joined workspace is rig")
 }
 
 test "cli_main helpers classify all 8 CLI subcommands, parse env, and decode process_usage" {
@@ -328,8 +342,9 @@ test "dispatch_rig_peer_rpc enforces handover hold, UNGATED allowlist, and grant
 }
 
 test "is_rig_raw_cloud_json matches launcher data.rs removed_at key presence check" {
+  let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
   assert_true(
-    is_rig_raw_cloud_json("{\"workspace\":\"ws1\",\"station\":\"st1\",\"rig\":{\"owner\":\"u1\",\"person\":\"p1\"}}"),
+    is_rig_raw_cloud_json("{\"workspace\":\"ws1\",\"station\":\"st1\",\"rig\":{\"owner\":\"u1\",\"person\":\"" + hex + "\"}}"),
     "valid rig cloud.json accepted",
   )
   assert_true(
@@ -739,4 +754,148 @@ test "hooks_tui_main resolves self executable path and rewrites native claude-tu
     None => panic("expected dir -1001.0 mtimeMs")
   }
   assert_true(parse_fs_lstat_reply("{\"value\":null}") is None, "null fs.lstat returns None")
+}
+
+test "decide_connect_inbound covers full multi/single-session, requireMention, edit, ownNotice, cross-station, and fail-closed matrix" {
+  let msg = fn(addressed : Bool) -> station_connects::ChatEvent {
+    station_connects::ChatEvent::Message(
+      station_connects::InboundMessage::{
+        channel: "C1",
+        thread_ts: "1.0",
+        ts: "1.0",
+        user: "U1",
+        text: "hi",
+        addressed: addressed,
+        files: [],
+        quoted: None,
+      },
+    )
+  }
+  let own_notice = station_connects::ChatEvent::OwnNotice(
+    station_connects::InboundMessage::{
+      channel: "C1",
+      thread_ts: "1.0",
+      ts: "1.1",
+      user: "UBOT",
+      text: "notice",
+      addressed: false,
+      files: [],
+      quoted: None,
+    },
+  )
+  let edit = station_connects::ChatEvent::Changed("C1", "1.0", "1.0", "edited")
+  let stop = station_connects::ChatEvent::Stop("C1", "1.0", "1.2", None)
+  let login = station_connects::ChatEvent::LoginCode("C1", "1.0", "1.3", "U1", "123456")
+
+  // Cross-station routed_elsewhere ALWAYS fails closed (RefuseNoAck).
+  assert_true(decide_connect_inbound(false, true, true, true, msg(true)) is ConnectInboundDecision::RefuseNoAck, "routed elsewhere msg")
+  assert_true(decide_connect_inbound(true, false, true, true, edit) is ConnectInboundDecision::RefuseNoAck, "routed elsewhere edit")
+
+  // Multi-session (`single=false`, `require_mention=true`):
+  assert_true(decide_connect_inbound(false, true, false, false, msg(false)) is ConnectInboundDecision::IgnoreAndAck, "multi unaddressed new thread ignored")
+  assert_true(decide_connect_inbound(false, true, false, false, msg(true)) is ConnectInboundDecision::PersistMessage, "multi addressed new thread persisted")
+  assert_true(decide_connect_inbound(false, true, false, true, msg(false)) is ConnectInboundDecision::PersistMessage, "multi unaddressed existing thread persisted")
+
+  // Single-session (`single=true`):
+  assert_true(decide_connect_inbound(true, true, false, false, msg(false)) is ConnectInboundDecision::IgnoreAndAck, "single requireMention=true unaddressed new ignored")
+  assert_true(decide_connect_inbound(true, false, false, false, msg(false)) is ConnectInboundDecision::PersistMessage, "single requireMention=false unaddressed new persisted")
+  assert_true(decide_connect_inbound(true, true, false, true, msg(false)) is ConnectInboundDecision::PersistMessage, "single requireMention=true existing thread persisted")
+  assert_true(decide_connect_inbound(true, true, false, false, msg(true)) is ConnectInboundDecision::PersistMessage, "single addressed new persisted")
+
+  // Changed (edit):
+  assert_true(decide_connect_inbound(false, true, false, false, edit) is ConnectInboundDecision::IgnoreAndAck, "edit on unknown thread ignored")
+  assert_true(decide_connect_inbound(false, true, false, true, edit) is ConnectInboundDecision::PersistEdit, "edit on existing thread persisted")
+
+  // OwnNotice: aligned with Node `acceptOwnNotice` (no spurious notice rows).
+  assert_true(decide_connect_inbound(false, true, false, true, own_notice) is ConnectInboundDecision::IgnoreAndAck, "ownNotice ignored & ACKed")
+
+  // Unimplemented Stop / LoginCode fail closed.
+  assert_true(decide_connect_inbound(false, true, false, true, stop) is ConnectInboundDecision::RefuseNoAck, "Stop fails closed")
+  assert_true(decide_connect_inbound(false, true, false, true, login) is ConnectInboundDecision::RefuseNoAck, "LoginCode fails closed")
+}
+
+test "enabled_external_connects_in_config aligns 1:1 with Node config.ts:174 and remote_connects/strict helpers" {
+  let parse = fn(s : String) -> base_codec::Json {
+    match base_codec::json_parse(s) {
+      base_codec::JsonParseResult::Ok(j) => j
+      base_codec::JsonParseResult::Err(e) => panic(e)
+    }
+  }
+  // Empty / missing connects -> empty list
+  assert_true(enabled_external_connects_in_config(parse("{}")).length() == 0, "missing connects")
+  assert_true(enabled_external_connects_in_config(parse("{\"connects\":[]}")).length() == 0, "empty connects")
+
+  // Disabled connects -> empty list
+  let disabled_cfg = parse("{\"connects\":[{\"id\":\"s0\",\"enabled\":false,\"slack\":{\"appToken\":\"xapp-1\",\"botToken\":\"xoxb-1\"}},{\"id\":\"f0\",\"kind\":\"feishu\",\"enabled\":false},{\"id\":\"c0\",\"kind\":\"comma\",\"enabled\":false},{\"id\":\"g0\",\"kind\":\"group\",\"enabled\":false}]}")
+  assert_true(enabled_external_connects_in_config(disabled_cfg).length() == 0, "disabled ignored")
+
+  // 1:1 with `station/src/sessions/config.ts:174`: any kind other than feishu/comma/group (omitted, null, "chat", "Slack", non-string) -> slack!
+  let enabled_cfg = parse("{\"connects\":[{\"id\":\"s-omit\"},{\"id\":\"s-null\",\"kind\":null},{\"id\":\"s-chat\",\"kind\":\"chat\"},{\"id\":\"s-cap\",\"kind\":\"Slack\"},{\"id\":\"s-num\",\"kind\":123},{\"id\":\"s-exp\",\"kind\":\"slack\",\"enabled\":true},{\"id\":\"f1\",\"kind\":\"feishu\"},{\"id\":\"cm1\",\"kind\":\"comma\"},{\"id\":\"g1\",\"kind\":\"group\",\"group\":{\"server\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}},{\"id\":\"s-off\",\"kind\":\"slack\",\"enabled\":false}]}")
+  let found = enabled_external_connects_in_config(enabled_cfg)
+  assert_true(found.length() == 9, "expected 9 enabled external connects")
+  assert_str_eq(found[0], "slack:s-omit")
+  assert_str_eq(found[1], "slack:s-null")
+  assert_str_eq(found[2], "slack:s-chat")
+  assert_str_eq(found[3], "slack:s-cap")
+  assert_str_eq(found[4], "slack:s-num")
+  assert_str_eq(found[5], "slack:s-exp")
+  assert_str_eq(found[6], "feishu:f1")
+  assert_str_eq(found[7], "comma:cm1")
+  assert_str_eq(found[8], "group:g1")
+
+  // remote-connects.json classifier
+  assert_true(remote_connects_file_needs_node(None, false) is None, "missing remote-connects")
+  assert_true(remote_connects_file_needs_node(Some("{}"), false) is None, "empty remote-connects")
+  match remote_connects_file_needs_node(Some("{\"sl@peer1\":{\"station\":\"peer1\"}}"), false) {
+    Some(r) => assert_str_eq(r, "remote-connects:1")
+    None => panic("expected non-empty remote-connects")
+  }
+  match remote_connects_file_needs_node(Some("{bad json"), false) {
+    Some(r) => assert_str_eq(r, "remote-connects.json(corrupt)")
+    None => panic("expected corrupt remote-connects fail-safe")
+  }
+  match remote_connects_file_needs_node(None, true) {
+    Some(r) => assert_str_eq(r, "remote-connects.json(unreadable)")
+    None => panic("expected unreadable remote-connects fail-safe")
+  }
+
+  // strict env (ASCII case-insensitive 1:1 with Rust launcher main.rs:339) & --app extraction
+  assert_true(is_engine_strict_value("1"), "strict 1")
+  assert_true(is_engine_strict_value("true"), "strict true")
+  assert_true(is_engine_strict_value("True"), "strict True")
+  assert_true(is_engine_strict_value("TrUe"), "strict TrUe")
+  assert_true(is_engine_strict_value("TRUE"), "strict TRUE")
+  assert_true(is_engine_strict_value(" true "), "strict trimmed true")
+  assert_true(!is_engine_strict_value("0"), "strict 0 false")
+  assert_true(!is_engine_strict_value("false"), "strict false")
+  assert_true(!is_engine_strict_value(""), "strict empty false")
+  assert_true(is_engine_strict_env(Some("True")), "strict env True")
+  assert_true(is_engine_strict_env(Some("TrUe")), "strict env TrUe")
+  assert_true(!is_engine_strict_env(Some("0")), "strict env 0 false")
+  assert_true(!is_engine_strict_env(None), "strict env none false")
+
+  // Strict 3-state DbDepCheck classifier (NoneFound -> None; Found & Unknown -> Some)
+  assert_true(classify_db_dep_check(DbDepCheck::NoneFound) is None, "DbDepCheck::NoneFound")
+  match classify_db_dep_check(DbDepCheck::Found) {
+    Some(r) => assert_str_eq(r, "db:remote-connect-sessions")
+    None => panic("expected db:remote-connect-sessions")
+  }
+  match classify_db_dep_check(DbDepCheck::Unknown("db:unreadable:5")) {
+    Some(r) => assert_str_eq(r, "db:unreadable:5")
+    None => panic("expected fail-safe Unknown reason")
+  }
+  assert_true(pending_restore_reason(false) is None, "pending_restore_reason(false)")
+  match pending_restore_reason(true) {
+    Some(r) => assert_str_eq(r, "restore:pending-ready-json")
+    None => panic("expected restore:pending-ready-json")
+  }
+
+  match extract_app_dir_from_argv(["bin", "run", "--app", "/opt/app", "--data", "/d"]) {
+    Some(d) => assert_str_eq(d, "/opt/app")
+    None => panic("expected --app value")
+  }
+  match extract_app_dir_from_argv(["bin", "run", "--app=/opt/app2"]) {
+    Some(d) => assert_str_eq(d, "/opt/app2")
+    None => panic("expected --app= value")
+  }
 }
