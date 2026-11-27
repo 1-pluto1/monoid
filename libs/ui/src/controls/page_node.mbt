@@ -1224,7 +1224,7 @@ pub fn group_node(parent : @view.View, rows : (@view.View) -> Unit, card? : Bool
     parent.box(made_for=loc, fn(k) {
       style_node(k, fn() { panel_card_group.then(panel_card_rows).then(panel_card_out_node(k)) })
       k.lends(on_card_lent, true).lends(part_at, { ..at, list: at.look is Wide, card: false }) |> ignore
-      corner_card_node(k, fn() { card_corner }, inset=fn() { corner_inset })
+      corner_card_node(k, fn() { dialog_card_corner }, inset=fn() { corner_inset })
       rows(k)
     })
     |> ignore
@@ -1585,13 +1585,15 @@ fn link_row_made(
   // ground is where it stands in from the panel's sides (panel_row_corner), a small panel's inner corner in one;
   // elsewhere a card's row, as ever)
   let at = panel_in_of(parent)
-  let in_panel = panel_row_at(at, own=card_pad - corner_inset, card=on_card_node(parent))
+  let card = on_card_node(parent)
+  let in_panel_card = card && parent.lent(panel_in_lent) is Some(p) && !p.small
+  let in_panel = panel_row_at(at, own=card_pad - corner_inset, card~)
   let (out, side) = match in_panel {
     Some(p) => (p.out, p.side)
     None => (0.0, text_in)
   }
   let corner = if in_panel is None {
-    @ui.concentric(group_corner, list_pad)
+    if in_panel_card { dialog_row_corner } else { @ui.concentric(group_corner, list_pad) }
   } else if at.small {
     small_panel_inner(r_menu)
   } else {
@@ -1614,7 +1616,7 @@ fn link_row_made(
       hover_ground_node(r, on=fn() { !off() })
       // (busy: pressed none)
       let pressed = pressed_by(r)
-      pressed_node(r, fn() { if !off() { pressed() } }, Is(if in_panel is Some(_) { corner } else { row_corner }), Link, title)
+      pressed_node(r, fn() { if !off() { pressed() } }, Is(corner), Link, title)
       // (bound only where it can be busy: every other row's press as pressed_node's, nothing more bound)
       if busy is Some(_) {
         r.presses(By(fn() { !off() })).focusable(By(fn() { !off() })) |> ignore
@@ -1879,12 +1881,12 @@ pub fn row_end_key_grown(v : @view.View) -> Double {
 /// Where what stands `t` under a container's top, in its corner of `corner`, stands in from its top and end to be
 /// concentric with it, and how round: at the ladder's step (corner_ladder) nearest at or above `t`, none where it stands
 /// out of the corner's reach or the ladder has no step there.
-fn corner_step(corner : Double, t : Double) -> (Double, Double)? {
+fn corner_step(corner : Double, t : Double, ladder? : Array[Double] = corner_ladder) -> (Double, Double)? {
   if t >= corner || t <= 0.0 {
     return None
   }
   let mut at : (Double, Double)? = None
-  for r in corner_ladder {
+  for r in ladder {
     if r < corner - 0.5 && corner - r <= t + 0.5 {
       match at {
         Some((_, was)) if was <= r => ()
@@ -1924,7 +1926,8 @@ pub fn row_corner_key_look(k : @view.View, w : Double) -> () -> Double {
     let (pad, corner) = list_card_in(k)
     let ends = if in_pane_node(k) { card_pad - wide_row_over } else { pad }
     let top = ends + wide_row_over
-    match corner_step(corner, top) {
+    let ladder = if k.lent(panel_in_lent) is Some(p) && !p.small { dialog_corner_ladder } else { corner_ladder }
+    match corner_step(corner, top, ladder~) {
       Some((e, r)) => (dmax(0.0, top - e), dmax(0.0, pad + text_in - e), r)
       None => (0.0, 0.0, line() / 2.0)
     }
@@ -1983,7 +1986,8 @@ pub fn row_corner_button_node(
   // there, at a step of the ladder's (corner_ladder: the corner rule's), the nearest at or above its top, its ground
   // grown as much over and under its words, which stay where line_end_node has them; none where it stands out of the
   // corner's reach, row_end_button_node's)
-  let stands = fn() -> (Double, Double)? { corner_step(corner, top()) }
+  let ladder = if parent.lent(panel_in_lent) is Some(p) && !p.small { dialog_corner_ladder } else { corner_ladder }
+  let stands = fn() -> (Double, Double)? { corner_step(corner, top(), ladder~) }
   let grown = fn() {
     match stands() {
       Some((e, _)) => dmax(0.0, top() - e)

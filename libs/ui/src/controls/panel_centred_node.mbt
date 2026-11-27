@@ -130,10 +130,12 @@ fn panel_centred_node(
       // the body's box starts that much lower and its column's top room is that much less, so what scrolls in it stops
       // clear of the button and what it holds stands where it did)
       let close_under = fn() {
+        // 0 with dialog_r=38 and dialog_corner_key_side=36 (capsule_in(38, 36) = 20 <= dialog_pad = 24);
+        // kept parameterized in case dialog_r or key diameter changes.
         if top_share == 0.0 && !x.nodes.heads &&
           !untitled() &&
           now().2 == "" {
-          dmax(0.0, @ui.capsule_in(dialog_r, dialog_close) - (dialog_pad + dialog_head_over))
+          dmax(0.0, @ui.capsule_in(dialog_r, dialog_corner_key_side) - dialog_pad)
         } else {
           0.0
         }
@@ -154,9 +156,7 @@ fn panel_centred_node(
       // whose title is as it is now (`live`) built after what it holds and its foot (read out last, drawn over them))
       // (no stop of Tab's: a press, Escape and back close it)
       let close_node = fn(v : @view.View) {
-        icon_button_node(v, "close", fn() { t("common.close") }, cancel, size=dialog_close)
-        .tab_stop(Is(false))
-        |> ignore
+        dialog_close_key_node(v, cancel) |> ignore
       }
       let corner = fn() {
         d.show(untitled, fn(o) {
@@ -197,14 +197,16 @@ fn panel_centred_node(
               let stepped = keyed.under is Some(_)
               if stepped {
                 line.box(fn(k) {
-                  style_node(k, fn() { dialog_back_at }, in_row=true)
-                  icon_button_node(k, "chevron-left", fn() { t("common.back") }, fn() { back_under(keyed) |> ignore }, size=step_back_side)
-                  |> ignore
+                  style_node(k, fn() { dialog_back_at(drop=head_line_drop(k, Heading, h=dialog_corner_key_side, row=dialog_corner_key_side)) }, in_row=true)
+                  dialog_step_back_node(k, fn() { back_under(keyed) |> ignore }) |> ignore
                 })
                 |> ignore
               }
               line.box(fn(l) {
-                style_node(l, fn() { dialog_title_line }, in_row=true)
+                style_node(l, fn() {
+                  let d = @ui.capsule_in(dialog_r, dialog_corner_key_side)
+                  dialog_title_line.then(@ui.style(mt=room(d - dialog_pad + head_line_drop(l, Heading, row=dialog_corner_key_side))))
+                }, in_row=true)
                 l.shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
                 if stepped {
                   l.grow(Is(1.0)) |> ignore
@@ -215,7 +217,7 @@ fn panel_centred_node(
               })
               |> ignore
               line.box(fn(at) {
-                style_node(at, fn() { dialog_close_at() }, in_row=true)
+                style_node(at, fn() { dialog_close_at(drop=head_line_drop(at, Heading, h=dialog_corner_key_side, row=dialog_corner_key_side)) }, in_row=true)
                 close_node(at)
               })
               |> ignore

@@ -823,7 +823,10 @@ fn sheet_node(
             }
             let inset = sheet_float_inset * float_t
             let foot_clear = sheet_foot_clear(float_t)
-            let bottom_r = pane_corner * float_t
+            // Keep bottom corners at rigid `dialog_r` (38pt) while floating so they slide smoothly into view from
+            // `sheet_under = dialog_r` below the viewport instead of passing through intermediate [22, 34] radii
+            // that violate corner concentricity against 36pt footer controls during interactive drag.
+            let bottom_r = dialog_r
             let extra = if is_ground { dmax(0.0, -fb) * (1.0 - float_t) } else { 0.0 }
             let dh = if is_ground {
               -(reach.get() - sheet_under * (1.0 - float_t) + foot_clear) - fb * float_t + extra
@@ -835,7 +838,7 @@ fn sheet_node(
               dy: 0.0,
               dw: -2.0 * inset,
               dh,
-              corners: Some((pane_corner, pane_corner, bottom_r, bottom_r)),
+              corners: Some((dialog_r, dialog_r, bottom_r, bottom_r)),
             }
           })
         }
@@ -843,7 +846,7 @@ fn sheet_node(
           sheet.box(fn(g) {
             g
             .over(Is(true))
-            .radius(Is(pane_corner))
+            .radius(Is(dialog_r))
             .shown_by(sheet, fn(h) { sheet_float_drawn(g, h, true) })
             |> ignore
             make(g)
@@ -979,7 +982,7 @@ fn sheet_node(
             let foot_clear = sheet_foot_clear(sheet_float_t(cut))
             (0.0, 0.0, 0.0, reach.get() + foot_clear)
           }))
-          .radius(Is(pane_corner))
+          .radius(Is(dialog_r))
           .shown_by(sheet, fn(h) { sheet_float_drawn(cut, h, false) })
           .clips(Is(true))
           |> ignore
@@ -1013,7 +1016,9 @@ fn sheet_node(
             })
             |> ignore
             // (its pages: the one that shows in the sheet's column, as tall as it makes the sheet; the rest over it, off to
-            // its sides (cut off by the sheet), kept as they were left)
+            // its sides (cut off by the sheet), kept as they were left; `sheet_stack_over` bleeds into the empty padding
+            // below the grabber bar so a capped sheet's clip never shaves the top of a concentric step back key or its
+            // focus ring)
             col.box(fn(stack) {
               stack
               // (what slides off to its sides cut off by it, a share of the window tall; as tall as what it holds, a
@@ -1021,7 +1026,7 @@ fn sheet_node(
               // down to its foot)
               .margin(By(fn() {
                 let inset = sheet_float_inset * sheet_float_t(stack)
-                (-inset, 0.0, -inset, 0.0)
+                (-inset, -sheet_stack_over, -inset, 0.0)
               }))
               .clips(By(fn() { capped_of(top().x) }))
               .grow(By(fn() { if capped_of(top().x) { 1.0 } else { 0.0 } }))
@@ -1100,7 +1105,7 @@ fn sheet_node(
                       sheet_target_float_t(pg)
                     }
                     let inset = sheet_float_inset * ft
-                    (inset, 0.0, inset, 0.0)
+                    (inset, sheet_stack_over, inset, 0.0)
                   }))
                   .height(By(fn() {
                     if capped && !shows() {
@@ -1108,7 +1113,7 @@ fn sheet_node(
                         Some(h) => Some(h)
                         None =>
                           if !hugs_of(pg) {
-                            Some(dmax(0.0, x.tall * win_h() - sheet_grab_h - @ui.system_bars().bottom))
+                            Some(dmax(0.0, x.tall * win_h() - (sheet_grab_h - sheet_stack_over) - @ui.system_bars().bottom))
                           } else {
                             None
                           }
@@ -1124,7 +1129,7 @@ fn sheet_node(
                       let wh = win_h()
                       let most = wh * (if x.grows { 1.0 } else { sheet_most })
                       let lim = if capped && hugs_of(pg) { dmin(most, x.tall * wh) } else { most }
-                      Some(dmax(0.0, lim - sheet_grab_h - (if capped { @ui.system_bars().bottom } else { 0.0 })))
+                      Some(dmax(0.0, lim - (sheet_grab_h - sheet_stack_over) - (if capped { @ui.system_bars().bottom } else { 0.0 })))
                     } else {
                       None
                     }
@@ -1150,36 +1155,44 @@ fn sheet_node(
                   // (its title, none where what it holds heads itself (`heads_itself`): its own title's row there; one as
                   // it is now (`live`), there while it has one)
                   // (its title's words, and its step's count beside them where it says one (step_head's: 1 / 4))
-                  let title_words = fn(at : @view.View) {
+                  let title_words = fn(at : @view.View, centered : Bool) {
+                    let style = if centered { sheet_head_words } else { sheet_title_words }
+                    let line_style = if centered { sheet_title_line_center } else { dialog_title_line }
                     at.box(fn(l) {
-                      style_node(l, fn() { dialog_title_line })
+                      style_node(l, fn() { line_style })
                       l.shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
                       // (a part of it in the accent where it is marked so: title_accent.mbt, a menu's title)
                       if title_marked(@signals.untracked(fn() { now().0 })) {
                         l.box(fn(w) {
                           w
                           .words_runs(By(fn() { title_runs(now().0, theme().p.accent_text) }))
-                          .words_look(By(fn() { @ui.style_words(sheet_title_words) }))
-                          .ink(By(fn() { @ui.style_ink(sheet_title_words) }))
+                          .words_look(By(fn() { @ui.style_words(style) }))
+                          .ink(By(fn() { @ui.style_ink(style) }))
+                          .words_centered(Is(centered))
                           .shrink(Is(1.0))
                           .min_width(Is(Some(0.0)))
                           |> ignore
                         })
                         |> ignore
                       } else {
-                        words_node(l, fn() { now().0 }, fn() { sheet_title_words }).shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
+                        words_node(l, fn() { now().0 }, fn() { style })
+                        .words_centered(Is(centered))
+                        .shrink(Is(1.0))
+                        .min_width(Is(Some(0.0)))
+                        |> ignore
                       }
                       l.show(fn() { now().1 != "" }, fn(n) { words_node(n, fn() { now().1 }, fn() { dialog_step }) |> ignore })
                     })
                     |> ignore
                   }
                   let title_row = fn(r : @view.View) {
+                    let has_end = x.nodes.head_end is Some(_)
                     style_node(r, fn() { sheet_title_row })
-                    // (its words on as many lines as they take, in the room the row leaves them, as the host's title)
+                    // (centered under the grabber like iOS 27 when there is no trailing head_end control)
                     r.box(fn(at) {
-                      style_node(at, fn() { sheet_title_room }, in_row=true)
+                      style_node(at, fn() { if has_end { sheet_title_room } else { sheet_title_room_center } }, in_row=true)
                       at.shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
-                      title_words(at)
+                      title_words(at, !has_end)
                     })
                     |> ignore
                     // (what stands at the end of its line: PanelNodes' `head_end`, its title taking the room up to it)
@@ -1193,22 +1206,20 @@ fn sheet_node(
                       None => ()
                     }
                   }
-                  // (a step further in: its back key before its title, as a step's head has it (step_head), the row no
-                  // taller for it)
+                  // (a step further in, matching iOS 27: 44pt circular Liquid Glass back button concentric with the
+                  // sheet's 38pt top-left corner at 16×16, horizontally centered title right under the grabber with
+                  // its first line vertically centered on the back button, and a symmetric 44pt right balance spacer)
                   let step_row = fn(r : @view.View) {
-                    style_node(r, fn() { sheet_title_row.then(step_head_gap) })
-                    r.box(fn(key) {
-                      style_node(key, fn() {
-                        in_line(step_back_side - @ui.tree_theme().text_size(Title).1).then(@ui.style(ml=room(-step_back_in)))
-                      })
-                      icon_button_node(key, "chevron-left", fn() { t("common.back") }, go_back, size=step_back_side) |> ignore
+                    style_node(r, fn() { sheet_step_row_style(r) })
+                    sheet_step_back_node(r, go_back) |> ignore
+                    r.box(fn(at) {
+                      style_node(at, fn() { sheet_title_room_center }, in_row=true)
+                      at.grow(Is(1.0)).shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
+                      title_words(at, true)
                     })
                     |> ignore
-                    // (its words on as many lines as they take, in the room the row leaves them, as the host's title)
-                    r.box(fn(at) {
-                      style_node(at, fn() { sheet_title_room }, in_row=true)
-                      at.shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
-                      title_words(at)
+                    r.box(fn(bal) {
+                      bal.width(Is(Some(sheet_step_back_side))).height(Is(Some(1.0))).shrink(Is(0.0)) |> ignore
                     })
                     |> ignore
                   }
@@ -1330,7 +1341,7 @@ fn sheet_node(
                           }
                           let ft_y = sheet_float_t(row)
                           if ft_x > 0.001 || ft_y > 0.001 {
-                            let at = @ui.capsule_in(pane_corner, button_height())
+                            let at = @ui.capsule_in(dialog_r, button_height())
                             let base_px = 20.0
                             let base_pb = if x.ruled { 16.0 } else { 24.0 }
                             let px = base_px + (at - base_px) * ft_x
@@ -1365,7 +1376,7 @@ fn sheet_node(
         sheet.box(fn(v) {
           v
           .over(Is(true))
-          .radius(Is(pane_corner))
+          .radius(Is(dialog_r))
           .shown_by(sheet, fn(h) { sheet_float_drawn(v, h, true) })
           // (none of it drawn while it dims nothing)
           .alpha(By(fn() { if recede.shown(layer) > 0.0 { 1.0 } else { 0.0 } }))
@@ -1633,4 +1644,149 @@ priv struct SheetItem {
 ///|
 impl Eq for SheetItem with equal(a, b) {
   a.pg.n == b.pg.n
+}
+
+///|
+/// Top bleed of a sheet's page stack into the empty padding below the grabber bar (`y = 6..11pt`, `sheet_grab_h =
+/// 25pt`): keeps the stack's clip boundary (`y = 14pt`) clear above both the 44pt concentric back key (`y = 16pt`) and
+/// its inset focus ring on capped sheets, while every page's matching `pt = sheet_stack_over` leaves all non-step
+/// layouts unchanged.
+let sheet_stack_over : Double = 11.0
+
+///|
+/// Diameter of a phone sheet step's circular Liquid Glass back button matching real iOS 27 (`CASDFElementLayer
+/// 44×44 r=22`): 44pt (`radius = 22`), so `@ui.capsule_in(38, 44) = 16` sits snugly at `(16, 16)` concentric with
+/// `dialog_r` (38pt).
+let sheet_step_back_side : Double = 44.0
+
+///|
+/// Chevron glyph size inside `sheet_step_back_node` (matching iOS 27 44pt navigation bar back chevron).
+let sheet_step_back_icon : Double = 22.0
+
+///|
+/// Chevron glyph size inside a 36pt desktop dialog circular back button.
+let dialog_back_key_icon : Double = 18.0
+
+///|
+/// Close glyph size inside `dialog_close_key_node` (16pt optical weight inside the 36pt circular Liquid Glass disc).
+let dialog_close_key_icon : Double = 16.0
+
+///|
+/// How far in from a 38pt sheet corner its 44pt circular back button stands (`capsule_in(38, 44) = 16`, matching
+/// real iOS 27 `(16, 16)` and `panel_card_in`).
+let sheet_step_key_at : Double = @ui.capsule_in(dialog_r, sheet_step_back_side)
+
+///|
+/// Centered sheet header title styles (iOS 27 inline sheet navigation title: centered horizontally under the grabber,
+/// semibold, `Title` size).
+// kept across runs: values (no field changes)
+let sheet_head_words : @ui.TextStyle = @ui.text_style(size=Title, weight=Semibold, color=Fg, center=true)
+
+///|
+let sheet_title_room_center : @ui.Style = @ui.css("w=Full align=ACenter")
+
+///|
+let sheet_title_line_center : @ui.Style = @ui.style(row=true, w=grow, gap=S2, align=AEnd, justify=JCenter)
+
+///|
+/// Circular Liquid Glass corner button (`bar_pill_group_node` with `pad=0`, full-circle interactive button, primary
+/// `p.text` ink, matching iOS 27 `NavigationBarPlatterContainer_v2` `<` and `×` buttons).
+#callsite(autofill(loc))
+fn corner_pill_key_node(
+  parent : @view.View,
+  icon : String,
+  label : () -> String,
+  press : () -> Unit,
+  side~ : Double,
+  icon_size~ : Double,
+  tab_stop? : Bool = true,
+  loc~ : SourceLoc,
+) -> @view.View {
+  bar_pill_group_node(loc~, parent, height=side, pad=0.0, gap=0.0, fn(pill) {
+    let btn = @headless.button(made_for=loc, pill, label, fn(_) { press() }, fn(k, b) {
+      k
+      .width(Is(Some(side)))
+      .height(Is(Some(side)))
+      .radius(Is(side / 2.0))
+      .lines_up(Is(Some(Middle)))
+      .lies_along(Is(Middle))
+      .focus_ring(Is(Some((-1.5, -1.5, 0L))))
+      |> ignore
+      hover_ground_node(
+        k,
+        color=fn() {
+          if k.pressed() {
+            bar_pill_press_ink(solid=k.glass_solid())
+          } else {
+            @glass.liquid_pill_hover_ink(solid=k.glass_solid())
+          }
+        },
+      )
+      rippled_look(loc~, k, Is(side / 2.0), fn() { b.press() }, ink=fn() { bar_pill_press_ink(solid=k.glass_solid()) }, pointer=true)
+      bind_pill_press(k)
+      icon_node(k, icon, icon_size, By(fn() { theme().p.text }), weighed=true) |> ignore
+    })
+    if !tab_stop {
+      btn.tab_stop(Is(false)) |> ignore
+    }
+  })
+}
+
+///|
+/// Circular 44pt Liquid Glass back button for phone sheet step headers standing in the 38pt top-left corner at (16, 16).
+#callsite(autofill(loc))
+fn sheet_step_back_node(
+  parent : @view.View,
+  press : () -> Unit,
+  loc~ : SourceLoc,
+) -> @view.View {
+  corner_pill_key_node(loc~, parent, "chevron-left", fn() { t("common.back") }, press, side=sheet_step_back_side, icon_size=sheet_step_back_icon)
+}
+
+///|
+/// Circular 36pt Liquid Glass back button for desktop/wide dialog step headers standing in the 38pt top-left corner.
+#callsite(autofill(loc))
+fn dialog_step_back_node(
+  parent : @view.View,
+  press : () -> Unit,
+  loc~ : SourceLoc,
+) -> @view.View {
+  corner_pill_key_node(loc~, parent, "chevron-left", fn() { t("common.back") }, press, side=dialog_corner_key_side, icon_size=dialog_back_key_icon)
+}
+
+///|
+/// Circular 36pt Liquid Glass close button for dialog headers standing in the 38pt top-right corner (`tab_stop=false`).
+#callsite(autofill(loc))
+fn dialog_close_key_node(
+  parent : @view.View,
+  cancel : () -> Unit,
+  loc~ : SourceLoc,
+) -> @view.View {
+  corner_pill_key_node(loc~, parent, "close", fn() { t("common.close") }, cancel, side=dialog_corner_key_side, icon_size=dialog_close_key_icon, tab_stop=false)
+}
+
+///|
+/// Layout style for a sheet step's header row (`step_row`): `AFirstLine` aligns the centered title's first line with
+/// the 44pt circular Liquid Glass back button at `(16, 16)` across 0.85x–2.0x font scales, keeping the button
+/// concentric with `dialog_r` (38pt). At extreme scales (>2.0x) where first-line centering would push the title into
+/// the grabber (`y = 6..11pt`) or displace the back button from `(16, 16)`, switches to `AStart` at `y = 16pt` so the
+/// back button remains strictly concentric and the title stays clear below the grabber.
+fn sheet_step_row_style(v : @view.View) -> @ui.Style {
+  let line = node_sp(v, @ui.tree_theme().text_size(Title).1)
+  let raw_over = sheet_step_key_at - sheet_grab_h - dmax(0.0, (line - sheet_step_back_side) / 2.0)
+  let (align, over) = if raw_over < -sheet_stack_over {
+    (@ui.Align::AStart, sheet_step_key_at - sheet_grab_h)
+  } else {
+    (@ui.Align::AFirstLine, raw_over)
+  }
+  let mt_room = room(over)
+  @ui.style(
+    row=true,
+    w=Full,
+    align~,
+    gap=S2,
+    px=room(sheet_step_key_at),
+    pb=S3,
+    mt=mt_room,
+  )
 }

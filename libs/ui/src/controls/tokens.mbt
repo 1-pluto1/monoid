@@ -241,6 +241,27 @@ pub let small_corner : Double = @ui.concentric(row_corner, corner_inset)
 pub let corner_ladder : Array[Double] = [pane_corner, card_corner, r_menu, row_corner, small_corner]
 
 ///|
+/// Concentric corner ladder for 38pt iOS 27 dialogs and bottom sheets (38 -> 22 -> 14 -> 6), kept separate from the
+/// page/pane `corner_ladder` (42 -> 26 -> 24 -> 18 -> 10) so non-panel pages keep their exact geometry.
+// kept across runs: a value (no field of it changes)
+let dialog_corner_ladder : Array[Double] = [dialog_r, dialog_card_corner, dialog_row_corner, dialog_small_corner]
+
+///|
+/// Both independent ladders concatenated in decreasing runs for `Theme::corner_ladder` (validated per run in `corners.mbt`).
+// kept across runs: a value (no field of it changes)
+let theme_corner_ladder : Array[Double] = [
+  pane_corner,
+  card_corner,
+  r_menu,
+  row_corner,
+  small_corner,
+  dialog_r,
+  dialog_card_corner,
+  dialog_row_corner,
+  dialog_small_corner,
+]
+
+///|
 /// How far apart two things that light up under the hand stand at least (Theme::lit_apart, the spacing rules): the
 /// web's sidebar rows (Sidebar.css.ts navRow, `& + &` 2 over the one before), so two lit grounds never read as one.
 pub let lit_apart : Double = 2.0
@@ -1894,7 +1915,7 @@ fn ui_theme_of(t : Theme) -> @ui.Theme {
     // a line of words that say none 1.4 of their size, as the web's root (`line-height: 1.4`) and Android's (Theme.kt
     // WebType: 1.4.em)
     text_line: 1.4,
-    corner_ladder,
+    corner_ladder: theme_corner_ladder,
     corner_fit: Some(corner_fit),
     lit_apart,
     lit_reach,
@@ -2601,9 +2622,18 @@ pub let dialog_margin : Double = 32.0
 pub let dialog_close : Double = 32.0
 
 ///|
-/// A dialog's corner (DIALOG_PAD 24 and a pill's half height 18) and shadow (0 24px 64px: a blur's deviation half its
-/// CSS radius).
-pub let dialog_r : Double = pane_corner
+/// Dialog and bottom-sheet corner radius matching real iOS 27 (38pt; concentric with 44pt sheet `<` at 16pt inset and
+/// 36pt dialog `<`/`×` at 20pt inset), plus its concentric inner card (22pt) and card-row (14pt) corners.
+pub let dialog_r : Double = 38.0
+
+///|
+let dialog_card_corner : Double = @ui.concentric(dialog_r, panel_card_in)
+
+///|
+let dialog_row_corner : Double = @ui.concentric(dialog_card_corner, corner_inset)
+
+///|
+let dialog_small_corner : Double = @ui.concentric(dialog_row_corner, corner_inset)
 
 ///|
 pub let dialog_shadow : Double = 32.0

@@ -1837,9 +1837,10 @@ fn pick_found(choices : Array[Choice], query : String) -> Array[Choice] {
 // The web's: a small panel beside what opened it, a dialog in the middle of the window
 
 ///|
-/// A step's head in a dialog: as high as a titled dialog's head (dialog_head's, its close button over its corner now).
+/// A step's head in a centred multi-step dialog: matches `dialog_head`'s 36pt row height, with top-left concentric
+/// back key and right padding clearing the stationary top-right close button.
 // kept across runs: a value (no field of it changes)
-let dialog_step_head : @ui.Style = @ui.style(row=true, w=Full, align=ACenter, min_h=Fixed(dialog_close), pt=room(dialog_head_over))
+let dialog_step_head : @ui.Style = @ui.style(row=true, w=Full, align=AStart, gap=S2_5, min_h=Fixed(dialog_corner_key_side))
 
 ///|
 // kept across runs: a value (no field of it changes)
@@ -2056,9 +2057,6 @@ pub fn sheet_window_h_node(v : @view.View) -> Double {
 let step_back_side : Double = dialog_close
 
 ///|
-let step_back_in : Double = (dialog_close - 16.0) / 2.0
-
-///|
 /// A step's back key offset from the small panel's title line (panel_pad + text_in) to keep it concentric with r_menu.
 let step_back_out_px : Double = r_menu - step_back_side / 2.0 - panel_pad - text_in
 
@@ -2066,16 +2064,6 @@ let step_back_out_px : Double = r_menu - step_back_side / 2.0 - panel_pad - text
 /// A step's back key before a title's row of its own: concentric with the small panel's top-left corner (`r_menu`).
 // kept across runs: a value (no field of it changes)
 let step_back_out : @ui.Style = @ui.style(ml=room(step_back_out_px))
-
-///|
-/// A step's back key before a dialog's title in its head's row (dialog_head, its parts S3 apart): as far out of the
-/// words' line, its chevron as near the title as a step's head has it (step_head_gap).
-// kept across runs: a value (no field of it changes)
-let dialog_back_at : @ui.Style = @ui.style(ml=room(-step_back_in), mr=room(@ui.Space::px(S1) - @ui.Space::px(S3)))
-
-///|
-// kept across runs: a value (no field of it changes)
-let step_head_gap : @ui.Style = @ui.css("gap=S1")
 
 ///|
 /// Where a long list's sheet settles as it is dragged (and nearly all of the window).
@@ -2093,7 +2081,7 @@ let sheet_grows : @ui.Style = @ui.style(w=Full, h=grow)
 
 ///|
 // kept across runs: a value (no field of it changes)
-let sheet_title_row : @ui.Style = @ui.css("row w=Full pt=S1 pb=S2_5 align=ACenter").then(@ui.style(px=room(sheet_panel_sides)))
+let sheet_title_row : @ui.Style = @ui.css("row w=Full pt=S1 pb=S2_5 align=AFirstLine").then(@ui.style(px=room(sheet_panel_sides)))
 
 ///|
 // kept across runs: a value (no field of it changes)
