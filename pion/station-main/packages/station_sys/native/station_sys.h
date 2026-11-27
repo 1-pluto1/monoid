@@ -120,6 +120,8 @@ int32_t sts_proc_kill_handle(int64_t handle, int32_t sig, int32_t group);
 int32_t sts_proc_close(int64_t handle);
 int32_t sts_proc_kill(int32_t pid, int32_t sig, int32_t group);
 int64_t sts_proc_start_time_ms(int32_t pid);
+int64_t sts_proc_start_ticks(int32_t pid);
+void *sts_boot_id(int64_t *out_len);
 
 // 3. Launcher control channel (Unix control fd > 4 e.g. fd 5, Windows named pipe).
 // Rejects reserved fds 0..4 (stdio 0..2 and launcher listening fds 3..4).
@@ -211,6 +213,24 @@ int32_t sts_active_workers(void);
 // - `sts_bounded_push_inflight_for_test`: count of reader threads currently inside `sth_push_sys_bounded`.
 int32_t sts_wait_detached_for_test(int64_t timeout_ms);
 int32_t sts_bounded_push_inflight_for_test(void);
+
+// FD-level TOCTOU-safe read/write under `root` (`openat` with `O_NOFOLLOW | O_DIRECTORY` on POSIX,
+// `FILE_FLAG_OPEN_REPARSE_POINT` on Windows): rejects symlinks, non-regular files, and `..` traversal.
+void *sts_read_under_nofollow(
+    const char *root,
+    const char *rel,
+    int64_t offset,
+    int64_t len,
+    int64_t *out_len,
+    int64_t *out_size);
+int32_t sts_write_under_nofollow(
+    const char *root,
+    const char *rel,
+    const uint8_t *data,
+    int64_t len,
+    int64_t offset,
+    int32_t mode,
+    int32_t truncate_end);
 
 // Free any buffer returned by `sts_*`.
 void sts_free(void *ptr);
