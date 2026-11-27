@@ -379,6 +379,111 @@ static void test_win_udp_and_info(void) {
     printf("  [PASS] win udp + env + machine/ifaces/usage + signals\n");
 }
 
+static void test_win_drive_io_and_reparse(void) {
+    char dir[256];
+    win_make_temp_dir(dir, sizeof(dir));
+
+    // Exclusive directory creation: succeeds once, fails on duplicate.
+    char ex_dir[320];
+    snprintf(ex_dir, sizeof(ex_dir), "%s\\excl", dir);
+    assert(sts_mkdir_exclusive(ex_dir) == 1);
+    assert(sts_mkdir_exclusive(ex_dir) == 0);
+
+    // Target regular file for `.part` symlink reparse-point test.
+    char target_path[384], part_sym[384];
+    snprintf(target_path, sizeof(target_path), "%s\\target.bin", ex_dir);
+    snprintf(part_sym, sizeof(part_sym), "%s\\evil.part", ex_dir);
+    const char *keep = "KEEP_ME_INTACT_12345";
+    int64_t sz = 0;
+    int32_t is_short = 0;
+    assert(sts_write_at(target_path, 0, (const uint8_t *)keep, 20, 1, 0, 0, 0, 0, 1, &sz, &is_short) == 0);
+    assert(sz == 20 && is_short == 0);
+    assert(sts_sync_file(target_path) == 0);
+
+    // Directory MUST return -4 (EISDIR, POSIX parity) on read_range_meta and -5 on write_at / sync_file.
+    {
+        int64_t rlen = 0, rtot = 0, rmtime = 0;
+        int32_t rerr = 0;
+        assert(sts_write_at(ex_dir, 0, (const uint8_t *)"x", 1, 0, 0, 0, 0, 0, 0, &sz, &is_short) == -5);
+        assert(sts_write_at(ex_dir, 0, (const uint8_t *)"x", 1, 1, 0, 0, 0, 0, 0, &sz, &is_short) == -5);
+        assert(sts_sync_file(ex_dir) == -5);
+        assert(sts_read_range_meta(ex_dir, 0, 16, &rlen, &rtot, &rmtime, &rerr) == NULL && rerr == -4);
+    }
+
+    // Non-disk device (\\.\NUL) MUST return -5 across write_at / sync_file / read_range_meta.
+    {
+        int64_t rlen = 0, rtot = 0, rmtime = 0;
+        int32_t rerr = 0;
+        assert(sts_write_at("\\\\.\\NUL", 0, (const uint8_t *)"x", 1, 0, 0, 0, 0, 0, 0, &sz, &is_short) == -5);
+        assert(sts_sync_file("\\\\.\\NUL") == -5);
+        assert(sts_read_range_meta("\\\\.\\NUL", 0, 16, &rlen, &rtot, &rmtime, &rerr) == NULL && rerr == -5);
+    }
+
+    // Read-only regular file MUST still return -3 (EACCES) on sts_write_at.
+    {
+        char ro_path[384];
+        snprintf(ro_path, sizeof(ro_path), "%s\\readonly.bin", ex_dir);
+        assert(sts_write_at(ro_path, 0, (const uint8_t *)"ro", 2, 1, 0, 0, 0, 0, 0, &sz, &is_short) == 0);
+        int wro_n = MultiByteToWideChar(CP_UTF8, 0, ro_path, -1, NULL, 0);
+        assert(wro_n > 0);
+        wchar_t *wro = (wchar_t *)malloc(sizeof(wchar_t) * (size_t)wro_n);
+        assert(wro != NULL);
+        assert(MultiByteToWideChar(CP_UTF8, 0, ro_path, -1, wro, wro_n) > 0);
+        assert(SetFileAttributesW(wro, FILE_ATTRIBUTE_READONLY) != 0);
+        assert(sts_write_at(ro_path, 0, (const uint8_t *)"x", 1, 0, 0, 0, 0, 0, 0, &sz, &is_short) == -3);
+        assert(SetFileAttributesW(wro, FILE_ATTRIBUTE_NORMAL) != 0);
+        free(wro);
+        assert(sts_unlink(ro_path) == 1);
+    }
+    printf("  [PASS] win drive_io (dir read -> -4 / write+sync -> -5, \\\\.\\NUL -> -5, readonly file -> -3)\n");
+
+    // Attempt to create a Windows symlink `evil.part -> target.bin`.
+    int wt_n = MultiByteToWideChar(CP_UTF8, 0, target_path, -1, NULL, 0);
+    int wl_n = MultiByteToWideChar(CP_UTF8, 0, part_sym, -1, NULL, 0);
+    assert(wt_n > 0 && wl_n > 0);
+    wchar_t *wtarget = (wchar_t *)malloc(sizeof(wchar_t) * (size_t)wt_n);
+    wchar_t *wlink = (wchar_t *)malloc(sizeof(wchar_t) * (size_t)wl_n);
+    assert(wtarget != NULL && wlink != NULL);
+    assert(MultiByteToWideChar(CP_UTF8, 0, target_path, -1, wtarget, wt_n) > 0);
+    assert(MultiByteToWideChar(CP_UTF8, 0, part_sym, -1, wlink, wl_n) > 0);
+
+    DWORD sym_flags = 0x2; /* SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE */
+    BOOLEAN sym_ok = CreateSymbolicLinkW(wlink, wtarget, sym_flags);
+    DWORD sym_err = sym_ok ? 0 : GetLastError();
+    if (!sym_ok && sym_err == ERROR_INVALID_PARAMETER) {
+        sym_ok = CreateSymbolicLinkW(wlink, wtarget, 0);
+        sym_err = sym_ok ? 0 : GetLastError();
+    }
+    if (sym_ok) {
+        // create_new != 0 MUST NOT follow or truncate target_path; must return -5.
+        assert(sts_write_at(part_sym, 0, (const uint8_t *)"X", 1, 1, 0, 0, 0, 0, 0, &sz, &is_short) == -5);
+        // create_new == 0 MUST also reject reparse point with -5.
+        assert(sts_write_at(part_sym, 0, (const uint8_t *)"X", 1, 0, 0, 0, 0, 0, 0, &sz, &is_short) == -5);
+        // sts_sync_file MUST also reject reparse point with -5.
+        assert(sts_sync_file(part_sym) == -5);
+        // Verify target_path was NOT truncated or modified.
+        int64_t rlen = 0, rtot = 0, rmtime = 0;
+        int32_t rerr = -1;
+        void *rbuf = sts_read_range_meta(target_path, 0, 32, &rlen, &rtot, &rmtime, &rerr);
+        assert(rbuf != NULL && rerr == 0 && rlen == 20 && rtot == 20);
+        assert(memcmp(rbuf, keep, 20) == 0);
+        sts_free(rbuf);
+        assert(DeleteFileW(wlink) != 0);
+        printf("  [PASS] win drive_io + reparse-point .part anti-truncate (-5)\n");
+    } else if (sym_err == ERROR_PRIVILEGE_NOT_HELD) {
+        printf("  [SKIP] win reparse-point symlink test (ERROR_PRIVILEGE_NOT_HELD)\n");
+    } else {
+        fprintf(stderr, "CreateSymbolicLinkW failed unexpectedly: err=%lu\n", (unsigned long)sym_err);
+        assert(sym_ok != 0);
+    }
+    free(wtarget);
+    free(wlink);
+
+    assert(sts_unlink(target_path) == 1);
+    assert(sts_rmdir(ex_dir) == 1);
+    assert(sts_rmdir(dir) == 1);
+}
+
 static void test_win_cli_prims(void) {
     char dir[256];
     win_make_temp_dir(dir, sizeof(dir));
@@ -449,6 +554,7 @@ int main(void) {
     test_win_flock();
     test_win_proc_and_pty();
     test_win_udp_and_info();
+    test_win_drive_io_and_reparse();
     test_win_cli_prims();
     assert(sts_wait_detached_for_test(5000) == 1);
     printf("station_sys_test (windows): ALL PASSED\n");
@@ -1701,6 +1807,95 @@ int main(void) {
         unlink(sub_file);
         rmdir(sub_dir);
         rmdir(root_dir);
+    }
+
+    // Positioned DriveFs primitives: `sts_stat`, `sts_read_range_meta`, `sts_write_at`, `sts_sync_file`.
+    {
+        char drv_file[256];
+        snprintf(drv_file, sizeof(drv_file), "/tmp/sts-drive-io-%d.bin", (int)getpid());
+        unlink(drv_file);
+        int64_t sz = 0;
+        int32_t is_short = 0;
+        // Missing file without create -> -2 (ENOENT)
+        assert(sts_write_at(drv_file, 0, (const uint8_t *)"abc", 3, 0, 0, 0, 0, 0, 0, &sz, &is_short) == -2);
+        // Create + write at offset 0
+        assert(sts_write_at(drv_file, 0, (const uint8_t *)"0123456789", 10, 1, 0, 0, 0, 0, 1, &sz, &is_short) == 0);
+        assert(sz == 10 && is_short == 0);
+        // at_least > current size -> short == 1, no write
+        assert(sts_write_at(drv_file, 10, (const uint8_t *)"ZZ", 2, 0, 1, 20, 0, 0, 0, &sz, &is_short) == 0);
+        assert(sz == 10 && is_short == 1);
+        // pwrite middle + truncate + fsync
+        assert(sts_write_at(drv_file, 4, (const uint8_t *)"ABCD", 4, 0, 1, 10, 1, 9, 1, &sz, &is_short) == 0);
+        assert(sz == 9 && is_short == 0);
+        assert(sts_sync_file(drv_file) == 0);
+        assert(sts_sync_file("/tmp/sts-drive-io-nonexistent-999999") == -2);
+        // sts_stat + sts_read_range_meta
+        int64_t st_len = 0;
+        void *st_s = sts_stat(drv_file, &st_len);
+        assert(st_s != NULL && st_len > 0 && contains_substr((const char *)st_s, (size_t)st_len, "file|9|"));
+        sts_free(st_s);
+        int64_t rlen = 0, rtot = 0, rmtime = 0;
+        int32_t rerr = -1;
+        void *r = sts_read_range_meta(drv_file, 3, 5, &rlen, &rtot, &rmtime, &rerr);
+        assert(r != NULL && rerr == 0 && rlen == 5 && rtot == 9 && rmtime > 0);
+        assert(memcmp(r, "3ABCD", 5) == 0);
+        sts_free(r);
+        // Directory rejected with -4 (EISDIR)
+        assert(sts_read_range_meta("/tmp", 0, 4, &rlen, &rtot, &rmtime, &rerr) == NULL && rerr == -4);
+        // Overflow rejected with -6
+        assert(sts_read_range_meta(drv_file, INT64_MAX - 2, 10, &rlen, &rtot, &rmtime, &rerr) == NULL && rerr == -6);
+        assert(sts_write_at(drv_file, INT64_MAX - 2, (const uint8_t *)"abc", 3, 0, 0, 0, 0, 0, 0, &sz, &is_short) == -6);
+        // FIFO MUST fail immediately without blocking (-5 non-regular)
+        char drv_fifo[256];
+        snprintf(drv_fifo, sizeof(drv_fifo), "/tmp/sts-drive-fifo-%d.pipe", (int)getpid());
+        unlink(drv_fifo);
+        assert(mkfifo(drv_fifo, 0600) == 0);
+        assert(sts_read_range_meta(drv_fifo, 0, 8, &rlen, &rtot, &rmtime, &rerr) == NULL && rerr == -5);
+        assert(sts_write_at(drv_fifo, 0, (const uint8_t *)"x", 1, 0, 0, 0, 0, 0, 0, &sz, &is_short) == -5);
+        assert(sts_sync_file(drv_fifo) == -5);
+        unlink(drv_fifo);
+        // `.part` symlink rejected via O_NOFOLLOW (-5)
+        char part_sym[256];
+        snprintf(part_sym, sizeof(part_sym), "/tmp/sts-drive-sym-%d.part", (int)getpid());
+        unlink(part_sym);
+        assert(symlink(drv_file, part_sym) == 0);
+        assert(sts_write_at(part_sym, 0, (const uint8_t *)"Z", 1, 0, 0, 0, 0, 0, 0, &sz, &is_short) == -5);
+        unlink(part_sym);
+        // Large offset > 4 GiB sparse pwrite + pread
+        int64_t big_off = ((int64_t)1 << 32) + 123;
+        assert(sts_write_at(drv_file, big_off, (const uint8_t *)"OVER4G!", 7, 0, 0, 0, 0, 0, 1, &sz, &is_short) == 0);
+        assert(sz == big_off + 7 && is_short == 0);
+        void *r4g = sts_read_range_meta(drv_file, big_off, 7, &rlen, &rtot, &rmtime, &rerr);
+        assert(r4g != NULL && rerr == 0 && rlen == 7 && rtot == big_off + 7);
+        assert(memcmp(r4g, "OVER4G!", 7) == 0);
+        sts_free(r4g);
+        // EACCES (-3) vs ENOENT (-2) on stat_err / lstat_err / realpath_err
+        int32_t serr = 0;
+        assert(sts_stat_err("/tmp/sts-no-such-file-999999", &st_len, &serr) == NULL && serr == -2);
+        assert(sts_lstat_err("/tmp/sts-no-such-file-999999", &st_len, &serr) == NULL && serr == -2);
+        assert(sts_realpath_err("/tmp/sts-no-such-file-999999", &st_len, &serr) == NULL && serr == -2);
+        if (geteuid() != 0) {
+            char locked_dir[256], locked_child[320];
+            snprintf(locked_dir, sizeof(locked_dir), "/tmp/sts-eacces-%d", (int)getpid());
+            snprintf(locked_child, sizeof(locked_child), "%s/secret.txt", locked_dir);
+            assert(sts_mkdir_p(locked_dir) == 1);
+            assert(sts_write_at(locked_child, 0, (const uint8_t *)"s", 1, 1, 0, 0, 0, 0, 0, &sz, &is_short) == 0);
+            assert(chmod(locked_dir, 0000) == 0);
+            assert(sts_stat_err(locked_child, &st_len, &serr) == NULL && serr == -3);
+            assert(sts_lstat_err(locked_child, &st_len, &serr) == NULL && serr == -3);
+            assert(sts_realpath_err(locked_child, &st_len, &serr) == NULL && serr == -3);
+            assert(chmod(locked_dir, 0700) == 0);
+            unlink(locked_child);
+            rmdir(locked_dir);
+        }
+        // POSIX uid / euid & sts_mkdir_exclusive
+        assert(sts_getuid() >= 0 && sts_geteuid() >= 0);
+        char excl_dir[256];
+        snprintf(excl_dir, sizeof(excl_dir), "/tmp/sts-excl-%d-%lld", (int)getpid(), (long long)sth_now_ms());
+        assert(sts_mkdir_exclusive(excl_dir) == 1);
+        assert(sts_mkdir_exclusive(excl_dir) == 0);
+        assert(sts_rmdir(excl_dir) == 1);
+        unlink(drv_file);
     }
 
     // 10. Atomic sts_mkdir_mode, sts_symlink, sts_getcwd, sts_read_file_strict, sts_write_file_atomic

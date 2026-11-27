@@ -1,0 +1,14 @@
+[package]
+name = "station_whole"
+version = "0.1.0"
+
+[dependencies]
+base_codec = { workspace = true }
+builders_core = { workspace = true }
+crypto = { workspace = true }
+host_shim = { workspace = true }
+nodepath = { workspace = true }
+station_drivers = { workspace = true }
+station_ops = { workspace = true }
+station_screens = { workspace = true }
+station_sys = { workspace = true }
