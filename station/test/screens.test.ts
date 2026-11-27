@@ -569,6 +569,51 @@ test("a helper picture split over pipe reads is joined once, with the next pictu
   assert.equal(await last, null);
 });
 
+test("FrameIn joins a multi-chunk frame once, handles zero-length and trailing frames, and rejects truncated or oversized frames", async (t) => {
+  const big = Buffer.alloc(40_000);
+  for (let i = 0; i < big.length; i += 4) big.writeUInt32BE(i, i);
+  const first = frame(KIND.video, big);
+  const empty = frame(KIND.keyframe, Buffer.alloc(0));
+  const trail = frame(KIND.sound, Buffer.from([1]));
+  const wire = Buffer.concat([first, empty, trail]);
+  const chunks: (Buffer | null)[] = [wire.subarray(2, 5), Buffer.alloc(0)];
+  for (let at = 5; at < wire.length; at += 8192) chunks.push(wire.subarray(at, at + 8192));
+
+  const reader = new FrameIn({ read: async () => chunks.shift() ?? null } as unknown as Stream, wire.subarray(0, 2));
+  const joins = t.mock.method(Buffer, "concat");
+  let f1;
+  let f2;
+  let f3;
+  let eof;
+  try {
+    f1 = await reader.next();
+    f2 = await reader.next();
+    f3 = await reader.next();
+    eof = await reader.next();
+  } finally {
+    joins.mock.restore();
+  }
+  const joined = joins.mock.calls.reduce((sum, call) => sum + (call.result?.length ?? 0), 0);
+  assert.ok(joined <= wire.length, `joined ${joined} bytes for ${wire.length} bytes of stream frames`);
+  assert.equal(f1?.kind, KIND.video);
+  assert.deepEqual(f1?.payload, big);
+  assert.equal(f2?.kind, KIND.keyframe);
+  assert.equal(f2?.payload.length, 0);
+  assert.equal(f3?.kind, KIND.sound);
+  assert.deepEqual(f3?.payload, Buffer.from([1]));
+  assert.equal(eof, null);
+
+  // Oversized frame header rejects as soon as the 5-byte header is read.
+  const huge = new FrameIn({ read: async () => null } as unknown as Stream, frame(KIND.video, Buffer.alloc(101)), 100);
+  await assert.rejects(huge.next(), /screen frame too large/);
+
+  // Truncated header and truncated body both reject at EOF.
+  const halfHeader = new FrameIn({ read: async () => null } as unknown as Stream, wire.subarray(0, 3));
+  await assert.rejects(halfHeader.next(), /stream ended inside a screen frame/);
+  const halfBody = new FrameIn({ read: async () => null } as unknown as Stream, first.subarray(0, 8192));
+  await assert.rejects(halfBody.next(), /stream ended inside a screen frame/);
+});
+
 test("the helper's view of a part of the display: the part asked with the bounds of a helper that frames parts (none of one from before them), each config saying the part its frames show as the helper said it", () => {
   const written: Buffer[] = [];
   const listeners: Record<string, ((chunk: Buffer) => void)[]> = {};
