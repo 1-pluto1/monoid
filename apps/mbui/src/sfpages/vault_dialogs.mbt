@@ -98,6 +98,10 @@ pub fn vault_editor_dialog(
   plain? : Bool = false,
   kinds? : Bool = true,
   targets? : Array[(String, String)] = [],
+  revoked? : @signals.Signal[Bool],
+  on_clear_handle? : (() -> Unit) -> Unit = fn(_) {  },
+  can_pop? : () -> Bool = fn() { true },
+  on_gone? : () -> Unit = fn() {  },
 ) -> Unit {
   let was = match editing {
     Some((_, p)) => Some(p)
@@ -165,6 +169,28 @@ pub fn vault_editor_dialog(
     vd_input_node(b, of(part), part, label, placeholder)
   }
   let said = fn(key : String) { fn() { @sf.t(key) } }
+  let closed : @signals.Signal[Bool] = @signals.signal(false)
+  let is_revoked = fn() {
+    closed.get() ||
+    (match revoked {
+      Some(r) => r.get()
+      None => false
+    })
+  }
+  let mark_revoked = fn() {
+    closed.set(true)
+    match revoked {
+      Some(r) => r.set(true)
+      None => ()
+    }
+  }
+  let clear_fields = fn() {
+    for _, f in fields {
+      f.set("")
+    }
+    file.set(("", ""))
+  }
+  on_clear_handle(clear_fields)
   let title = match was {
     None => @sf.t("web-pages.vault.editor.new")
     Some(p) => text(Some(p), "name")
@@ -216,7 +242,10 @@ pub fn vault_editor_dialog(
               f.box(fn(r) {
                 @sf.style_node(r, fn() { vd_file })
                 @sf.button_node(r, said("web-pages.vault.editor.pickFile"), fn() {
-                  pick_vault_file(core, fn(content, name) { file.set((content, name)) })
+                  pick_vault_file(core, fn(content, name) {
+                    guard !@signals.untracked(is_revoked) else { return }
+                    file.set((content, name))
+                  })
                 })
                 |> ignore
                 r.show(fn() { file.get().0 != "" }, fn(n) {
@@ -305,6 +334,11 @@ pub fn vault_editor_dialog(
       v.show(fn() { error.get() != "" }, fn(e) { @sf.words_node(e, fn() { error.get() }, fn() { @sf.list_note_bad }) |> ignore })
     },
     fn(v, shut) {
+      let dismiss_editor = fn() {
+        mark_revoked()
+        clear_fields()
+        shut()
+      }
       match row {
         Some(r) => {
           let on = [("workspace", ws), ("vault", vault)]
@@ -312,21 +346,28 @@ pub fn vault_editor_dialog(
             v,
             said("common.delete"),
             fn() {
+              guard !@signals.untracked(is_revoked) else { return }
               confirm(
                 @sf.t("web-pages.vault.deleteTitle", args=[("name", text(was, "name"))]),
                 @sf.t("web-pages.vault.deleteBody"),
                 @sf.t("common.delete"),
                 danger=true,
                 fn() {
-                  shut()
+                  guard !@signals.untracked(is_revoked) else { return }
+                  dismiss_editor()
                   vault_act(core, ws, "deleteItem", [("vault", str(vault)), ("item", str(text(Some(r), "id")))], @sf.t("web-pages.vault.deleteWhat"), done=@sf.t(
                       "web-pages.vault.deleted",
-                    ), then=fn(_) { (core.pop)() })
+                    ), then=fn(_) {
+                    if can_pop() {
+                      (core.pop)()
+                    }
+                  })
                 },
               )
             },
             tone=GhostDanger,
             busy=fn() { is_doing(core, ["vault.deleteItem"], on) },
+            disabled=is_revoked,
           )
           |> ignore
         }
@@ -338,7 +379,7 @@ pub fn vault_editor_dialog(
         said("common.cancel"),
         fn() {
           v.focus_let_go()
-          shut()
+          dismiss_editor()
         },
         tone=Ghost,
       )
@@ -347,6 +388,7 @@ pub fn vault_editor_dialog(
         v,
         said("common.save"),
         fn() {
+          guard !@signals.untracked(is_revoked) else { return }
           saving.set(true)
           error.set("")
           v.focus_let_go()
@@ -359,13 +401,13 @@ pub fn vault_editor_dialog(
             done=@sf.t("web-pages.vault.saved"),
             then=fn(_) {
               saving.set(false)
-              shut()
+              dismiss_editor()
             },
             failed=fn(err) {
               saving.set(false)
               // written elsewhere first: the vault was read again; what is here was written over that, so it goes
               if text(Some(err), "code") == "vault_conflict" {
-                shut()
+                dismiss_editor()
               } else {
                 error.set(vault_said(err).unwrap_or(""))
               }
@@ -374,9 +416,14 @@ pub fn vault_editor_dialog(
         },
         tone=Primary,
         busy=fn() { saving.get() },
-        disabled=fn() { vault_problem(k(), words(), agent.get(), mode.get()) != "" },
+        disabled=fn() { is_revoked() || vault_problem(k(), words(), agent.get(), mode.get()) != "" },
       )
       |> ignore
+    },
+    on_gone=fn() {
+      mark_revoked()
+      clear_fields()
+      on_gone()
     },
   )
 }
@@ -409,16 +456,39 @@ fn vd_input_node(
 /// An item's about written on its own (说明, from its page): what it is for and how it is used, the rest of the item as
 /// it was (`plain`: what it holds, opened; `row`: how agents may ask for it), written as the editor's 保存 writes it
 /// (`vault.putItem`), the dialog staying while it is saved (refused, why under it).
-pub fn vault_about_dialog(core : Core, ws : String, vault : String, row : Json, plain : Json) -> Unit {
-  vault_serial.val += 1
-  let key = "vault-about/" + vault_serial.val.to_string()
+pub fn vault_about_dialog(
+  core : Core,
+  ws : String,
+  vault : String,
+  row : Json,
+  plain : Json,
+  revoked? : @signals.Signal[Bool],
+  on_clear_handle? : (() -> Unit) -> Unit = fn(_) {  },
+  on_gone? : () -> Unit = fn() {  },
+) -> Unit {
   let was = Some(plain)
   let rv = Some(row)
-  let typed = field_of(key)
-  typed.set(text(was, "notes"))
+  let typed = @ui.Field::new(text=text(was, "notes"))
+  on_clear_handle(fn() { typed.set("") })
   let saving : @signals.Signal[Bool] = @signals.signal(false)
   let error : @signals.Signal[String] = @signals.signal("")
+  let closed : @signals.Signal[Bool] = @signals.signal(false)
+  let is_revoked = fn() {
+    closed.get() ||
+    (match revoked {
+      Some(r) => r.get()
+      None => false
+    })
+  }
+  let mark_revoked = fn() {
+    closed.set(true)
+    match revoked {
+      Some(r) => r.set(true)
+      None => ()
+    }
+  }
   let save = fn(shut : () -> Unit) {
+    guard !@signals.untracked(is_revoked) else { return }
     let k = text(was, "kind")
     // (what it holds and how agents get it, as the editor would have them: only its about changed)
     let words : Map[String, String] = Map([])
@@ -471,13 +541,18 @@ pub fn vault_about_dialog(core : Core, ws : String, vault : String, row : Json, 
       )
     },
     fn(v, shut) {
+      let dismiss_about = fn() {
+        mark_revoked()
+        typed.set("")
+        shut()
+      }
       @sf.foot_spacer_node(v)
       @sf.button_node(
         v,
         fn() { @sf.t("common.cancel") },
         fn() {
           v.focus_let_go()
-          shut()
+          dismiss_about()
         },
         tone=Ghost,
       )
@@ -486,13 +561,20 @@ pub fn vault_about_dialog(core : Core, ws : String, vault : String, row : Json, 
         v,
         fn() { @sf.t("common.save") },
         fn() {
+          guard !@signals.untracked(is_revoked) else { return }
           v.focus_let_go()
-          save(shut)
+          save(dismiss_about)
         },
         tone=Primary,
         busy=fn() { saving.get() },
+        disabled=is_revoked,
       )
       |> ignore
+    },
+    on_gone=fn() {
+      mark_revoked()
+      typed.set("")
+      on_gone()
     },
   )
 }
