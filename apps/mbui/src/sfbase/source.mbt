@@ -574,6 +574,29 @@ priv struct LastSaid {
 let last_said : Ref[Array[LastSaid]] = Ref([])
 
 ///|
+/// Live count and serialized UTF-8 byte size of the client's lasting lists `last_said` cache
+/// (places SWR lists only; parked pages release their own topic holds via `rest(drop_holds=true)` and are not in this cache).
+pub fn last_said_stats() -> (Int, Int) {
+  let mut bytes = 0
+  for entry in last_said.val {
+    let s = entry.value.stringify()
+    for ch in s {
+      let cp = ch.to_int()
+      if cp <= 0x7F {
+        bytes += 1
+      } else if cp <= 0x7FF {
+        bytes += 2
+      } else if cp <= 0xFFFF {
+        bytes += 3
+      } else {
+        bytes += 4
+      }
+    }
+  }
+  (last_said.val.length(), bytes)
+}
+
+///|
 let chats_kept : Int = topic_policy_keep("chat", empty_topic_params, true)
 
 ///|
