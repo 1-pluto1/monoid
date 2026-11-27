@@ -1098,69 +1098,28 @@ fn triple_body_node(
   // the model picked in view as the panel opens and as each level is come to (2026-11-05 用户「模型选择面板打开不会自动
   // 滚动到能看见已选择模型的地方」), not while what is typed filters them: the row to bring, by its key, once for each
   // level of each step (contents' `shown`), so what the person scrolled stays where they left it. A first level opening
-  // up from what opened it starts at its foot, nearest the hand, where the one picked shows from there; else at the one
-  // picked.
+  // up from what opened it (a sheet's too) starts at its foot, nearest the hand, those used most there, wherever the
+  // one picked is (2026-11-27 用户「默认滚到最下面吧，手机往上操作不方便」); else at the one picked.
   let level_now = fn() {
     (if !all() { "first" } else if kind_open() { "all/" + kind() } else { "all" }) + (if up { "/up" } else { "" })
   }
   let bring_key = fn() -> String {
-    let combos_now = combos()
-    let st = starred()
-    let ot = others()
-    let p = picked()
-    let model_key = fn(o : Json) { "model/" + text(Some(o), "model") }
-    let nearest = match (combos_now.get(0), st.last(), ot.last()) {
-      (Some(x), _, _) => triple_combo_key(Some(x))
-      (None, Some(o), _) | (None, None, Some(o)) => model_key(o)
-      _ => ""
+    if !all() && up {
+      match (combos().get(0), starred().last(), others().last()) {
+        (Some(x), _, _) => return triple_combo_key(Some(x))
+        (None, Some(o), _) | (None, None, Some(o)) => return "model/" + text(Some(o), "model")
+        _ => ()
+      }
     }
-    let is_picked = fn(o : Json) { text(Some(o), "model") == p }
     // (at the first level the configuration it runs on exactly, where one is, else its model)
-    let combo_on : Int? = if all() {
-      None
-    } else {
-      let mut found : Int? = None
-      for i = 0; i < combos_now.length(); i = i + 1 {
-        if flag(Some(combos_now[i]), "selected") {
-          found = Some(i)
-          break
+    if !all() {
+      for x in combos() {
+        if flag(Some(x), "selected") {
+          return triple_combo_key(Some(x))
         }
       }
-      found
     }
-    let mut st_idx : Int? = None
-    for i = 0; i < st.length(); i = i + 1 {
-      if is_picked(st[i]) {
-        st_idx = Some(i)
-        break
-      }
-    }
-    let mut ot_idx : Int? = None
-    for i = 0; i < ot.length(); i = i + 1 {
-      if is_picked(ot[i]) {
-        ot_idx = Some(i)
-        break
-      }
-    }
-    let (picked_key, from_foot) = match combo_on {
-      Some(i) => (triple_combo_key(Some(combos_now[i])), i)
-      None =>
-        (
-          "model/" + p,
-          (if combos_now.is_empty() { 0 } else { 1 }) +
-          (match (st_idx, ot_idx) {
-            (Some(j), _) => combos_now.length() + st.length() - 1 - j
-            (None, Some(k)) => combos_now.length() + st.length() + ot.length() - 1 - k
-            _ => 0
-          }),
-        )
-    }
-    let rows_in_view = ((if flat() { list_most() } else { list_most() - row_h() }) / row_h()).to_int()
-    if !all() && up && nearest != "" && from_foot < rows_in_view - 1 {
-      nearest
-    } else {
-      picked_key
-    }
+    "model/" + picked()
   }
   // (a row of the models' made: brought into view where it is the one to bring as its level is come to)
   let brought = fn(row : @view.View, key : String) {
@@ -1430,7 +1389,13 @@ fn triple_body_node(
       .height(By(fn() { if level_h() { Some(triple_list_h) } else { None } }))
       .lies_along(By(fn() { if level_h() || (!sheet && !flat()) { Between } else { Start } }))
       |> ignore
-      scroll(room, fn() { if flat() { list_most() } else { list_most() - row_h() } }, fn(scrolled) {
+      // (the way to all of them under them in a sheet as tall as it is laid out: its row and the line over it, as far
+      // over that as under it; one row's room alone left the sheet's body taller than the sheet holds, scrolling it
+      // that much, how hard it thinks cut and faded at its foot: 2026-11-27 用户「思考深度为啥模糊了」)
+      let to_all_h = fn() {
+        if sheet { row_h() + 2.0 * @ui.Space::px(S1_5) + triple_rule_thick } else { row_h() }
+      }
+      scroll(room, fn() { if flat() { list_most() } else { list_most() - to_all_h() } }, fn(scrolled) {
         // (the room between them each row's own: triple_first_gap)
         // (the room past the row at the panel's far end from what opened it taken back: none there, whichever row is
         // there as rows come and go, nothing of any row's said again at once)

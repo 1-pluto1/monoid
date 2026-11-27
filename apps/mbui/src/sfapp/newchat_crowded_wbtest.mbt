@@ -455,17 +455,15 @@ test "wide: how hard it thinks one under another, from the least to the most" {
 }
 
 ///|
-test "narrow, a short window, many models starred: the one picked in view as the sheet opens, the lowest of them though it is" {
+test "narrow, a short window, many models starred: the sheet opens at its foot, those used most in view nearest the hand, the one picked far over them though it is" {
   both_pages(fn() raise {
-    // (2026-11-05 用户「模型选择面板打开不会自动滚动到能看见已选择模型的地方」)
+    // (2026-11-27 用户「还是默认滚到最下面吧，手机往上操作不方便」, in place of 2026-11-05's the one picked in view)
     let t = crowded("newchat-providers-model-far", h=crowded_short)
     run_to_sheet_rest(t)
-    let sheet = t.get(@ui.Role::Dialog).rect
-    let picked = "Sonnet 5"
-    let row = t.get(Button, label=picked).rect
-    // (the configurations used most stay put under what scrolls: the one picked between the sheet's top and them)
     let used = t.get(Button, label="GPT-6 Astra · 中").rect
-    assert_true(row.1 >= sheet.1 && row.1 + row.3 <= used.1, msg="\{picked} \{Repr(row)}: the sheet \{Repr(sheet)}, those used most from \{Repr(used)}")
+    assert_true(wholly_in_view(t, used), msg="those used most from \{Repr(used)}")
+    let picked = t.get(Button, label="Sonnet 5").rect
+    assert_true(!wholly_in_view(t, picked), msg="the one picked \{Repr(picked)} in view: not at the foot")
   })
 }
 
@@ -614,4 +612,23 @@ test "narrow: model picker opened from chat agent sheet opens 全部模型 and m
   t.run_for(@ui.move_most_ms)
   assert_eq(new_fix.model, "claude-sonnet-5")
   assert_true(t.query(@ui.Role::Dialog) is None, msg="sheet closed after picking model")
+}
+
+///|
+test "narrow: the model's sheet holds how hard it thinks wholly in view under the models, none of it cut or faded at the foot of what scrolls, crowded, short or with larger words" {
+  both_pages(fn() raise {
+    // (the user, 2026-11-27: 「思考深度为啥模糊了」: the way to all of them one row's room in the sheet's sizing, the
+    // sheet's body taller than the sheet by its line and gaps, scrolling, how hard it thinks cut and faded at its foot)
+    for c in [
+      ("newchat-providers-model-far", 390.0, 700.0, 1.0), ("newchat-providers-model-far", 390.0, 844.0, 1.0),
+      ("newchat-providers-model", 360.0, crowded_short, 1.0), ("newchat-crowded-model", 360.0, 780.0, 1.0),
+      ("newchat-crowded-model", 390.0, 844.0, 1.3), ("newchat-providers-model-liked", 390.0, 700.0, 1.3),
+    ] {
+      let t = crowded(c.0, w=c.1, h=c.2)
+      t.set_font_scale(c.3)
+      t.run_for(@ui.move_most_ms)
+      let r = t.get(Slider, label="思考深度").rect
+      assert_true(wholly_in_view(t, r), msg="\{c.0} \{c.1}×\{c.2} at \{c.3}: 思考深度 \{Repr(r)} cut")
+    }
+  })
 }
