@@ -8,9 +8,10 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { test } from "node:test";
 import { Cloud } from "../src/cloud/state.ts";
-import { PEER_ALPN, PEER_BYTES_ALPN, PeerGone, PeerStopped, STOPPING, peerCall, servePeer } from "../src/mesh/peer.ts";
+import { PEER_ALPN, PEER_BYTES_ALPN, PeerGone, PeerStopped, STOPPING, mayHaveRun, peerCall, servePeer } from "../src/mesh/peer.ts";
+import { mayHaveTaken } from "../src/connects/workspace.ts";
 import type { Connection, Endpoint } from "../src/mesh/native.ts";
-import { type Bytes, withBytes } from "../src/mesh/bus.ts";
+import { type Bytes, Refused, withBytes } from "../src/mesh/bus.ts";
 import { given, settle } from "./hub-fakes.ts";
 import { memoryMesh, vanish } from "./memory-mesh.ts";
 
@@ -72,6 +73,7 @@ test("a request on a connection whose other end is gone fails as that, by the ch
     serving(back, [source.id()], async (r) => ({ ok: r.method }));
     const failed = await given(settled(call(target.id(), "ws", { method: "lost" })), "the request failed by the check");
     assert.ok("e" in failed && failed.e instanceof PeerGone, `failed as gone: ${"e" in failed ? failed.e.message : "answered"}`);
+    assert.equal(mayHaveRun(failed.e), true, "post-write PeerGone is marked mayHaveRun");
     assert.ok(!(failed.e instanceof PeerStopped), "killed, it said nothing: not a process stopping");
     assert.match(failed.e.message, /connection was gone/);
     assert.deepEqual(await given(call(target.id(), "ws", { method: "again" }), "answered on a new connection"), { ok: "again" });
@@ -186,6 +188,7 @@ test("a request in flight as the other station's process hands over to its next 
     for (const c of conns) c.close(0, STOPPING);
     const failed = await given(waiting, "the request in flight failed as its connection closed");
     assert.ok("e" in failed && failed.e instanceof PeerStopped, `failed as the other's process stopping: ${"e" in failed ? failed.e.message : "answered"}`);
+    assert.equal(mayHaveRun(failed.e), true, "post-write PeerStopped is marked mayHaveRun");
     assert.ok(failed.e instanceof PeerGone, "a PeerGone: no answer came, the next request dials anew");
     assert.deepEqual(await given(call(target.id(), "ws", { method: "again" }), "answered by the next process"), { ok: "again" });
   } finally { await Promise.all([source.close(), target.close()]); }
@@ -236,4 +239,54 @@ test("a request failed on a connection whose other end neither answers nor close
     assert.deepEqual(await given(call(target.id(), "ws", { method: "again" }), "answered on a new connection"), { ok: "again" });
     assert.equal(kept.length, 2, "the half-dead connection was let go and a new one dialed");
   } finally { await Promise.all([source.close(), target.close()]); }
+});
+
+test("mayHaveRun is false for pre-write openBi timeouts/failures and explicit Refused, and true for post-write timeouts", async () => {
+  const { source, target } = await pair();
+  const hang = held();
+  let starveOpen = false;
+  serving(target, [source.id()], async (r) => {
+    if (r.method === "refuse") throw new Error("not allowed");
+    if (r.method === "hang") await hang.promise;
+    return { ok: true };
+  });
+  const proxied = new Proxy(source, {
+    get(e, prop) {
+      if (prop === "connect") return async (...args: unknown[]) => {
+        const conn = await (e.connect as (...a: unknown[]) => Promise<Connection>)(...args);
+        return new Proxy(conn, {
+          get(c, p) {
+            if (p === "openBi" && starveOpen) return () => new Promise(() => {});
+            const v = (c as any)[p];
+            return typeof v === "function" ? v.bind(c) : v;
+          },
+        });
+      };
+      const v = (e as any)[prop];
+      return typeof v === "function" ? v.bind(e) : v;
+    },
+  });
+  const call = peerCall(proxied, cloudOf(source.id(), [target.id()]), (id) => ({ id }), undefined, 40, { checkMs: 60_000 });
+  try {
+    const refused = await settled(call(target.id(), "ws", { method: "refuse" }));
+    assert.ok("e" in refused && refused.e instanceof Refused);
+    assert.equal(mayHaveRun(refused.e), false, "explicit Refused is never marked mayHaveRun");
+    assert.equal(mayHaveTaken(refused.e), false);
+
+    // Pre-write stream starvation timeout: bytes were never written -> NOT marked mayHaveRun -> safe to fail over.
+    starveOpen = true;
+    const preWrite = await settled(call(target.id(), "ws", { method: "pre-write" }));
+    assert.ok("e" in preWrite && /peer request timed out/.test(preWrite.e.message));
+    assert.equal(mayHaveRun(preWrite.e), false, "pre-write openBi timeout must NOT be marked mayHaveRun");
+    assert.equal(mayHaveTaken(preWrite.e), false, "pre-write openBi timeout must allow failover");
+    starveOpen = false;
+
+    const timedOut = await settled(call(target.id(), "ws", { method: "hang" }));
+    assert.ok("e" in timedOut && /peer request timed out/.test(timedOut.e.message));
+    assert.equal(mayHaveRun(timedOut.e), true, "post-write timeout is marked mayHaveRun");
+    assert.equal(mayHaveTaken(timedOut.e), true, "post-write timeout must pin instead of failing over");
+  } finally {
+    hang.resolve();
+    await Promise.all([source.close(), target.close()]);
+  }
 });

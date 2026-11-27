@@ -1069,3 +1069,18 @@ test "P2-9: RelayRanker matches out-of-order samples by URL and retries failed a
   )
   assert(!r3.up && opt_bool_is(r3.public_relays, true) && apply_calls == 2)
 }
+
+test "peer_error_may_have_run distinguishes post-write ambiguous errors from pre-write and definite refusals" {
+  assert(peer_error_may_have_run(PeerError::Timeout("peer request timed out"), true))
+  assert(!peer_error_may_have_run(PeerError::Timeout("peer request timed out"), false))
+  assert(peer_error_may_have_run(PeerError::PeerGone("gone"), true))
+  assert(!peer_error_may_have_run(PeerError::PeerGone("gone"), false))
+  assert(peer_error_may_have_run(PeerError::PeerStopped("stopped"), true))
+  assert(!peer_error_may_have_run(PeerError::PeerStopped("stopped"), false))
+  assert(peer_error_may_have_run(PeerError::Refused("peer request timed out; execution may have happened"), false))
+  assert(!peer_error_may_have_run(PeerError::Refused("peer request timed out"), false))
+  assert(!peer_error_may_have_run(PeerError::Refused("retiring"), true))
+  assert(!peer_error_may_have_run(PeerError::NoLink("dial failed"), true))
+  assert(!peer_error_may_have_run(PeerError::NoBytes("chunks only"), true))
+  assert(!peer_error_may_have_run(PeerError::NotReady("mesh not ready"), true))
+}

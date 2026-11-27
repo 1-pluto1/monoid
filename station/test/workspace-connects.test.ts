@@ -2,13 +2,18 @@
 // station of the workspace. Two stations here, H (the connect's) and S, over a transport of the test's that carries
 // what the mesh does (a JSON head, bytes after it).
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
-import { type Inbox, PeerBus, bytesOf, withBytes } from "../src/mesh/bus.ts";
-import { WorkspaceConnects, fingerprint } from "../src/connects/workspace.ts";
+import { Cloud } from "../src/cloud/state.ts";
+import { type Inbox, NoLink, PeerBus, Refused, bytesOf, withBytes } from "../src/mesh/bus.ts";
+import { PEER_ALPN, PEER_BYTES_ALPN, PeerGone, PeerStopped, STOPPING, peerCall, servePeer } from "../src/mesh/peer.ts";
+import type { Connection, Endpoint } from "../src/mesh/native.ts";
+import { WorkspaceConnects, fingerprint, mayHaveTaken } from "../src/connects/workspace.ts";
+import { memoryMesh } from "./memory-mesh.ts";
 import { connectEdits } from "../src/api/routes/connects.ts";
 import { overview } from "../src/api/overview.ts";
 import { hubConfig } from "../src/sessions/config.ts";
@@ -1033,4 +1038,229 @@ test("once the station connected its connects, a call of one still not connected
   await assert.rejects(t.call("cl"), /that connect does not run on this station/);
   assert.deepEqual(t.slept, [], "nothing waited");
   await t.close();
+});
+
+test("multi-station allowlist with real peerCall: post-write timeouts and drops pin without failover, while pre-write timeouts and bare refusals fail over cleanly", async () => {
+  const { h, s1, s2, close } = multiWorkspace({
+    [S]: () => ({ sessions: true, acceptAutoChats: true, load: { running: { turns: 0 }, memory: { totalBytes: 100, availableBytes: 90 } } }),
+    [S2]: () => ({ sessions: true, acceptAutoChats: true, load: { running: { turns: 1 }, memory: { totalBytes: 100, availableBytes: 50 } } }),
+  });
+  h.rig.raw.connects.find((c: Json) => c.id === "cl").stations = [S, S2];
+
+  // Wire H -> S1 over real `peerCall` + `servePeer` on `memoryMesh`, so `peer.ts`'s `wrote` tracking and `mark` run for real.
+  const mesh = memoryMesh();
+  const bind = () => mesh.bind({ secretKey: randomBytes(32), alpns: [PEER_BYTES_ALPN, PEER_ALPN], relayUrls: [], discovery: false, bindAddr: "127.0.0.1:0" });
+  const [epH, epS1] = await Promise.all([bind(), bind()]);
+  const cloudOf = (station: string, peers: string[]): any =>
+    Object.assign(Object.create(Cloud.prototype), {
+      state: { workspace: "ws", workspace_name: "ws", name: "", station, peers: peers.map((id) => ({ id })), revocations: [], joined: [] },
+      lock: null,
+      peersCurrent: true,
+      relays: () => [],
+    });
+
+  let mode: "normal" | "post-write-timeout" | "post-write-stop" | "pre-write-timeout" = "normal";
+  const serverConns: Connection[] = [];
+  const origS1Handle = s1.bus.handle.bind(s1.bus);
+  void (async () => {
+    for (;;) {
+      const conn = await epS1.accept();
+      if (!conn) return;
+      serverConns.push(conn);
+      void servePeer(conn, cloudOf(epS1.id(), [epH.id()]), {
+        handle: async (ws: string, _peer: string, req: Json) => {
+          if (req?.method === "connect.event" && mode === "post-write-timeout") {
+            // Run the event on S1 while holding the RPC answer past peerCall's answerMs.
+            void origS1Handle(ws, H, req);
+            await new Promise(() => {});
+          }
+          if (req?.method === "connect.event" && mode === "post-write-stop") {
+            void origS1Handle(ws, H, req);
+            for (const c of serverConns) c.close(0, STOPPING);
+            await new Promise(() => {});
+          }
+          return origS1Handle(ws, H, req);
+        },
+      } as any).catch(() => {});
+    }
+  })();
+
+  const proxiedH = new Proxy(epH, {
+    get(e, prop) {
+      if (prop === "connect") return async (...args: unknown[]) => {
+        const conn = await (e.connect as (...a: unknown[]) => Promise<Connection>)(...args);
+        return new Proxy(conn, {
+          get(c, p) {
+            if (p === "openBi" && mode === "pre-write-timeout") return () => new Promise(() => {});
+            const v = (c as any)[p];
+            return typeof v === "function" ? v.bind(c) : v;
+          },
+        });
+      };
+      const v = (e as any)[prop];
+      return typeof v === "function" ? v.bind(e) : v;
+    },
+  });
+  const callS1 = peerCall(proxiedH, cloudOf(epH.id(), [epS1.id()]), (id) => ({ id }), undefined, 50, { checkMs: 60_000 });
+  const origAsk = h.bus.ask.bind(h.bus);
+  h.bus.ask = async (station, request) => {
+    if (station === S && request?.method === "connect.event") {
+      return callS1(epS1.id(), "ws", request);
+    }
+    return origAsk(station, request);
+  };
+
+  try {
+    // 1. Post-write timeout: S1 received and ran connect.event while H's peerCall timed out.
+    mode = "post-write-timeout";
+    const m1 = message({ text: "<@UBOT> heavy thread", threadTs: "5001.1", ts: "5001.2" });
+    await assert.rejects(h.connects.receive("cl", { type: "message", message: m1 }), /peer request timed out/);
+    await settle();
+    assert.equal(h.rig.store.connectThreadStation("cl", m1.channel, m1.threadTs), S, "post-write timeout pins thread to S1");
+    assert.equal(s1.rig.store.listSessions().length, 1, "S1 started the session");
+    assert.equal(s2.rig.store.listSessions().length, 0, "S2 must NEVER start a duplicate session on post-write timeout");
+    assert.equal(h.rig.store.listSessions().length, 0, "H must NEVER start a duplicate session on post-write timeout");
+
+    // Companion duplicate / Slack redelivery routes ONLY to S1 and deduplicates to 1 session.
+    mode = "normal";
+    await h.connects.receive("cl", { type: "message", message: m1 });
+    await settle();
+    assert.equal(s1.rig.store.listSessions().length, 1);
+    assert.equal(s2.rig.store.listSessions().length, 0);
+
+    // 2. Post-write PeerStopped: S1 received the request then closed with STOPPING -> pins to S1, no failover.
+    mode = "post-write-stop";
+    const m2 = message({ text: "<@UBOT> peer stopped", threadTs: "5002.1", ts: "5002.1" });
+    await assert.rejects(h.connects.receive("cl", { type: "message", message: m2 }), PeerStopped);
+    await settle();
+    assert.equal(h.rig.store.connectThreadStation("cl", m2.channel, m2.threadTs), S);
+    assert.equal(s2.rig.store.listSessions().length, 0, "post-write PeerStopped must not fail over to S2");
+
+    // 3. Pre-write openBi timeout (wrote === false): S1 never received bytes -> MUST fail over cleanly to S2!
+    mode = "pre-write-timeout";
+    const m3 = message({ text: "<@UBOT> pre-write timeout", threadTs: "5003.1", ts: "5003.1" });
+    await h.connects.receive("cl", { type: "message", message: m3 });
+    await settle();
+    assert.equal(h.rig.store.connectThreadStation("cl", m3.channel, m3.threadTs), S2, "pre-write timeout fails over to S2");
+    assert.ok(s2.rig.store.getSession(sessionKey(`cl@${H}`, m3.channel, m3.threadTs)));
+
+    // 4. Error classification invariants.
+    assert.equal(mayHaveTaken(new NoLink("dial failed")), false);
+    assert.equal(mayHaveTaken(new Refused("retiring")), false);
+    assert.equal(mayHaveTaken(new Refused("peer request timed out")), false, "bare callee read timeout never ran");
+    assert.equal(mayHaveTaken(new Refused("peer request timed out; execution may have happened — query the same task key")), true, "relayed ambiguous failure pins");
+    assert.equal(mayHaveTaken(new PeerGone()), false, "unmarked pre-write PeerGone fails over");
+    assert.equal(mayHaveTaken(new PeerStopped()), false, "unmarked pre-write PeerStopped fails over");
+    assert.equal(mayHaveTaken(new Error("peer request timed out; execution may have happened")), false, "unmarked plain Error fails over");
+  } finally {
+    await Promise.all([epH.close(), epS1.close()]);
+    await close();
+  }
+});
+
+test("single-station routing: relayed ambiguous timeout pins to target station without falling back locally to H", async () => {
+  const { h, s, close } = workspace();
+  h.rig.raw.connects.find((c: Json) => c.id === "cl").station = S;
+  const origHandle = s.bus.handle.bind(s.bus);
+  s.bus.handle = async (ws, from, req) => {
+    if (req?.method === "connect.event") {
+      void origHandle(ws, from, req);
+      throw new Refused("peer request timed out; execution may have happened — query the same task key");
+    }
+    return origHandle(ws, from, req);
+  };
+  const m = message({ text: "<@UBOT> single target slow", threadTs: "5101.1", ts: "5101.1" });
+  await assert.rejects(h.connects.receive("cl", { type: "message", message: m }), /peer request timed out/);
+  await settle();
+  assert.equal(h.rig.store.connectThreadStation("cl", m.channel, m.threadTs), S);
+  assert.equal(h.rig.store.listSessions().length, 0, "must not fall back to local H on timeout");
+  assert.equal(s.rig.store.listSessions().length, 1, "S owns the single session");
+  await close();
+});
+
+test("connect.event acknowledges early within acceptWaitMs when openSlackThread downloads are slow, preventing RPC timeout and keeping thread serialized", async () => {
+  const { h, s, close } = workspace();
+  h.rig.raw.connects.find((c: Json) => c.id === "cl").station = S;
+  // Re-wire S's connects with a controlled acceptWaitMs deadline so the test stays deterministic.
+  const acceptDeadline = Promise.withResolvers<void>();
+  const sConnects = new WorkspaceConnects({
+    data: s.rig.dir,
+    hub: () => s.rig.hub,
+    store: s.rig.store,
+    config: { raw: () => s.rig.raw, updateSoon: async (f) => f(s.rig.raw) },
+    bus: s.bus,
+    here: () => S,
+    home: () => "ws",
+    stations: (ws) => (ws === "ws" ? roster : []),
+    names: () => null,
+    sleep: () => acceptDeadline.promise,
+    acceptWaitMs: 5_000,
+  });
+  s.connects = sConnects;
+  // Re-point S's hub to the new remote connects instance.
+  s.rig.hub = s.rig.newHub({ chats: (c) => sConnects.remote.surface(c) });
+
+  // Simulate a mid-thread mention whose historical attachment download takes longer than acceptWaitMs.
+  const downloadGate = Promise.withResolvers<void>();
+  const downloadStarted = Promise.withResolvers<void>();
+  h.rig.chat.earlier.set("5201.1", [
+    { ts: "5201.1", user: "U1", text: "earlier with 4K PNG", fromBot: false, files: [{ id: "F1", name: "4k.png", size: 9_000_000, url: "https://files.example/4k.png" }] },
+  ]);
+  h.rig.chat.shared.set("F1", "png-bytes");
+  const origDownload = h.rig.chat.download.bind(h.rig.chat);
+  h.rig.chat.download = async (file) => {
+    downloadStarted.resolve();
+    await downloadGate.promise;
+    return origDownload(file);
+  };
+
+  const m = message({ text: "<@UBOT> take over", threadTs: "5201.1", ts: "5201.2" });
+  const receiving = h.connects.receive("cl", { type: "message", message: m });
+  await downloadStarted.promise;
+  // acceptWaitMs elapses while the download is still in flight -> connect.event returns { ok: true } early.
+  acceptDeadline.resolve();
+  await receiving;
+
+  assert.equal(h.rig.store.connectThreadStation("cl", m.channel, m.threadTs), S, "pinned to S before download finished");
+  assert.equal(h.rig.store.listSessions().length, 0, "never fell back to H");
+
+  // Companion duplicate event arrives while download is still in flight: routes to S and also returns promptly.
+  await h.connects.receive("cl", { type: "message", message: m });
+  // Now let the download complete and drain S's thread queue.
+  downloadGate.resolve();
+  await s.rig.hub.drained(`cl@${H}`, m.channel, m.threadTs);
+  await settle();
+
+  const key = sessionKey(`cl@${H}`, m.channel, m.threadTs);
+  assert.ok(s.rig.store.getSession(key), "S finished creating the session");
+  assert.equal(s.rig.store.listSessions().length, 1, "exactly one session on S");
+  const thread = s.rig.store.threadAt("slack:T1", m.channel, m.threadTs)!;
+  assert.deepEqual(s.rig.said(thread.id).map((x) => x.text), ["earlier with 4K PNG", "<@UBOT> take over"]);
+  assert.equal(s.rig.said(thread.id)[0]!.attachments.length, 1, "historical attachment preserved");
+  await close();
+});
+
+test("connect.event on a quieted (retiring) station refuses immediately before learning, letting allowlist fail over cleanly", async () => {
+  const { h, s1, s2, close } = multiWorkspace({
+    [S]: () => ({ sessions: true, load: { running: { turns: 0 }, memory: { totalBytes: 100, availableBytes: 90 } } }),
+    [S2]: () => ({ sessions: true, load: { running: { turns: 1 }, memory: { totalBytes: 100, availableBytes: 50 } } }),
+  });
+  h.rig.raw.connects.find((c: Json) => c.id === "cl").stations = [S, S2];
+  // Wrap S1's handler errors as Refused (matching real mesh/peer.ts).
+  const origHandle = s1.bus.handle.bind(s1.bus);
+  s1.bus.handle = async (ws, from, req) => {
+    try {
+      return await origHandle(ws, from, req);
+    } catch (e) {
+      throw new Refused((e as Error).message);
+    }
+  };
+  await s1.rig.hub.quiet("ws");
+  const m = message({ text: "<@UBOT> retiring primary", threadTs: "5301.1", ts: "5301.1" });
+  await h.connects.receive("cl", { type: "message", message: m });
+  await settle();
+  assert.equal(h.rig.store.connectThreadStation("cl", m.channel, m.threadTs), S2);
+  assert.equal(s1.rig.store.listSessions().length, 0);
+  assert.ok(s2.rig.store.getSession(sessionKey(`cl@${H}`, m.channel, m.threadTs)));
+  await close();
 });
