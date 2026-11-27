@@ -1444,6 +1444,7 @@ struct WholeRuntimeState {
   logins : station_whole::LoginsOsRuntime
   browser : station_whole::BrowserOsManager
   connects : station_whole::ConnectsOsRuntime
+  upkeep : AsyncUpkeepRunner
   connect_meta : Map[String, ConnectMeta]
   remote_connects : Map[String, RemoteConnectRecord]
   remote_connects_path : String
@@ -1455,6 +1456,7 @@ struct WholeRuntimeState {
   mcp_cb : station_http::ServerCallbacks
   serve : station_mesh::ServeEndpoint
   admin_conns : Map[Int64, AdminConnState]
+  seen_members : Map[String, Map[String, Map[String, SeenMember]]]
   admin_streams : Map[Int64, AdminStreamState]
   proxy_streams : Map[Int64, ProxyStreamState]
   proxy_by_sock : Map[Int64, Int64]
@@ -1499,7 +1501,7 @@ fn lookup_registered_device_sql(
   store : station_whole::WholeStore,
   ws : String,
   dev_id : String,
-) -> Option[station_devices::DeviceSpec] {
+) -> Option[station_devices::KeptDevice] {
   match store.require_open() {
     Err(_) => None
     Ok(st_db) => {
@@ -1529,16 +1531,82 @@ fn lookup_registered_device_sql(
                 Some(base_codec::Json::Str(s)) => s.trim()
                 _ => ""
               }
+              let baud = match base_codec::json_get(j, "baud") {
+                Some(base_codec::Json::Num(n, _)) => Some(n.to_int())
+                _ => None
+              }
+              let model = match base_codec::json_get(j, "model") {
+                Some(base_codec::Json::Str(s)) => if s.length() > 0 { Some(s) } else { None }
+                _ => None
+              }
+              let protocols = match base_codec::json_get(j, "protocols") {
+                Some(base_codec::Json::Arr(xs)) => {
+                  let ps : Array[String] = []
+                  for pi in 0..<xs.length() {
+                    match xs[pi] {
+                      base_codec::Json::Str(s) => ps.push(s)
+                      _ => ()
+                    }
+                  }
+                  Some(ps)
+                }
+                _ => None
+              }
+              let paired = match base_codec::json_get(j, "paired") {
+                Some(base_codec::Json::Bool(b)) => Some(b)
+                _ => None
+              }
+              let owner_sub = match base_codec::json_get(j, "ownerSub") {
+                Some(base_codec::Json::Str(s)) => s
+                _ => match base_codec::json_get(j, "owner") {
+                  Some(base_codec::Json::Obj(_)) => match base_codec::json_get(match base_codec::json_get(j, "owner") { Some(o) => o, None => base_codec::json_obj([]) }, "sub") {
+                    Some(base_codec::Json::Str(s)) => s
+                    _ => ""
+                  }
+                  _ => ""
+                }
+              }
+              let owner_email = match base_codec::json_get(j, "ownerEmail") {
+                Some(base_codec::Json::Str(s)) => s
+                _ => match base_codec::json_get(j, "owner") {
+                  Some(base_codec::Json::Obj(_)) => match base_codec::json_get(match base_codec::json_get(j, "owner") { Some(o) => o, None => base_codec::json_obj([]) }, "email") {
+                    Some(base_codec::Json::Str(s)) => s
+                    _ => ""
+                  }
+                  _ => ""
+                }
+              }
+              let owner_name = match base_codec::json_get(j, "ownerName") {
+                Some(base_codec::Json::Str(s)) => s
+                _ => match base_codec::json_get(j, "owner") {
+                  Some(base_codec::Json::Obj(_)) => match base_codec::json_get(match base_codec::json_get(j, "owner") { Some(o) => o, None => base_codec::json_obj([]) }, "name") {
+                    Some(base_codec::Json::Str(s)) => s
+                    _ => ""
+                  }
+                  _ => ""
+                }
+              }
+              let at_secs = match base_codec::json_get(j, "at") {
+                Some(base_codec::Json::Num(n, _)) => n.to_int64()
+                _ => 0L
+              }
               match station_devices::parse_device_kind(kind_str) {
-                Some(kind) => Some(station_devices::DeviceSpec::{
-                  id: id,
-                  name: name,
-                  kind: kind,
-                  target: target,
-                  baud: None,
-                  model: None,
-                  protocols: None,
-                  paired: None,
+                Some(kind) => Some(station_devices::KeptDevice::{
+                  ws: ws,
+                  device: station_devices::DeviceSpec::{
+                    id: id,
+                    name: name,
+                    kind: kind,
+                    target: target,
+                    baud: baud,
+                    model: model,
+                    protocols: protocols,
+                    paired: paired,
+                  },
+                  owner_sub: owner_sub,
+                  owner_email: owner_email,
+                  owner_name: owner_name,
+                  at_secs: at_secs,
                 })
                 None => None
               }
@@ -1828,7 +1896,8 @@ fn handle_device_tunnel(
       send_refusal(ctx, pstream.sid, 404, "no such device on this station")
       pstream.mode = ProxyStreamMode::Done
     }
-    Some(spec) => {
+    Some(kept) => {
+      let spec = kept.device
       // Rig workspaces require explicit owner approval (fail-closed 403 here).
       if ctx.cloud.rig_in(ws) is Some(_) {
         send_refusal(ctx, pstream.sid, 403, "that machine refused: rig device requires owner approval")
@@ -1889,18 +1958,8 @@ fn handle_device_tunnel(
         station_devices::DeviceKind::Serial
         | station_devices::DeviceKind::AirPlay
         | station_devices::DeviceKind::AndroidTv => {
-          let kind_name = match spec.kind {
-            station_devices::DeviceKind::Serial => "serial"
-            station_devices::DeviceKind::AirPlay => "airplay"
-            station_devices::DeviceKind::AndroidTv => "android_tv"
-            _ => "unsupported"
-          }
-          send_refusal(
-            ctx,
-            pstream.sid,
-            501,
-            "device kind '" + kind_name + "' is not supported by pion whole station yet",
-          )
+          // Honest 501 until full streaming device tunnel state machines are wired.
+          send_refusal(ctx, pstream.sid, 501, "device tunnel for this device kind is not yet implemented on Pion station")
           pstream.mode = ProxyStreamMode::Done
           return
         }
@@ -3311,11 +3370,20 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
             } else {
               base_role
             }
+            match state_opt {
+              Some(st) => record_seen_member(st.seen_members, sess.workspace, sess.user_sub, seen_member_session_key(aconn.sid_claim, aconn.conn_id), sess.email, aconn.effective_role, aconn.iat, aconn.sid_claim, sess.expires_unix)
+              None => ()
+            }
             true
           }
           Ok(None) => {
             if aconn.cred_role.length() > 0 {
               aconn.effective_role = aconn.cred_role
+            }
+            let r = if aconn.effective_role.length() > 0 { aconn.effective_role } else { sess.role }
+            match state_opt {
+              Some(st) => record_seen_member(st.seen_members, sess.workspace, sess.user_sub, seen_member_session_key(aconn.sid_claim, aconn.conn_id), sess.email, r, aconn.iat, aconn.sid_claim, sess.expires_unix)
+              None => ()
             }
             true
           }
@@ -3367,9 +3435,12 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
   ) -> station_whole::PeerIdentity {
     match st.serve.member_of(conn_id) {
       Some(sess) => {
-        let eff_role = match st.admin_conns.get(conn_id) {
-          Some(ac) => if ac.effective_role.length() > 0 { ac.effective_role } else { sess.role }
-          None => sess.role
+        let (eff_role, lock_base, lock_proof) = match st.admin_conns.get(conn_id) {
+          Some(ac) => {
+            let r = if ac.effective_role.length() > 0 { ac.effective_role } else { sess.role }
+            (r, ac.lock_base, ac.lock_proof)
+          }
+          None => (sess.role, None, None)
         }
         let is_home = sess.workspace == st.core.config.home_workspace
         let viewer = station_api::Viewer::{
@@ -3380,6 +3451,8 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
           home: is_home,
           role: eff_role,
           device: Some(sess.device_id),
+          lock_base: lock_base,
+          lock_proof: lock_proof,
         }
         station_whole::PeerIdentity::AuthenticatedMember(viewer, "ed25519:" + remote_id)
       }
@@ -3931,6 +4004,7 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
                     aconn.effective_role = vm.session.role
                     aconn.lock_base = vm.lock_base
                     aconn.lock_proof = vm.lock_proof
+                    record_seen_member(st.seen_members, vm.session.workspace, vm.session.user_sub, seen_member_session_key(vm.sid_claim, aconn.conn_id), vm.session.email, vm.session.role, vm.iat, vm.sid_claim, vm.session.expires_unix)
                     let reply = base_codec::json_obj([
                       ("ok", base_codec::json_bool(true)),
                       ("station", base_codec::json_str(st.core.config.station_id)),
@@ -3955,6 +4029,7 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
                     aconn.effective_role = vm.session.role
                     aconn.lock_base = vm.lock_base
                     aconn.lock_proof = vm.lock_proof
+                    record_seen_member(st.seen_members, vm.session.workspace, vm.session.user_sub, seen_member_session_key(vm.sid_claim, aconn.conn_id), vm.session.email, vm.session.role, vm.iat, vm.sid_claim, vm.session.expires_unix)
                     let reply = base_codec::json_obj([
                       ("ok", base_codec::json_bool(true)),
                       ("station", base_codec::json_str(st.core.config.station_id)),
@@ -5467,6 +5542,7 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
         cfg,
         thumb_port=thumb_port,
         verify_fn=verify_fn,
+        config_file_override=Some(ctx.config_file),
       )
       // Watch `config.json` directory so external edits hot-reload `disabledRuntimes` via `ConfigFile::listen`.
       match core.config_file {
@@ -6054,6 +6130,9 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
       }
 
       let now0 = host_shim::now_ms()
+      let seen_members : Map[String, Map[String, Map[String, SeenMember]]] = Map::new()
+      wire_whole_core_runtime_hooks(ctx, core, logins, browser, seen_members)
+      let upkeep = AsyncUpkeepRunner::new(ctx.data, ctx.sep, core.agents.jobs.fs, host_shim::now_ms())
       state_opt = Some(WholeRuntimeState::{
         core: core,
         replica: replica,
@@ -6062,6 +6141,7 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
         logins: logins,
         browser: browser,
         connects: connects,
+        upkeep: upkeep,
         connect_meta: connect_meta,
         remote_connects: remote_connects,
         remote_connects_path: remote_connects_path,
@@ -6073,6 +6153,7 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
         mcp_cb: mcp_cb,
         serve: station_mesh::ServeEndpoint::new(),
         admin_conns: Map::new(),
+        seen_members: seen_members,
         admin_streams: Map::new(),
         proxy_streams: Map::new(),
         proxy_by_sock: Map::new(),
@@ -7261,7 +7342,10 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
             _ => ()
           }
           let now_sys = host_shim::now_ms()
-          if st.devices.handle_sys_event(ev_id, sev) {
+          if st.devices.handle_sys_event(ev_id, sev, now_sys) {
+            return
+          }
+          if st.upkeep.handle_sys_event(ev_id, sev) {
             return
           }
           if st.terminals.handle_sys_event(ev_id, sev, now_sys) {
@@ -7314,6 +7398,15 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
       match state_opt {
         Some(st) => {
           st.core.on_tick(wall)
+          let mut clones_active = false
+          let active_jobs = st.core.agents.jobs.list()
+          for ji in 0..<active_jobs.length() {
+            if active_jobs[ji].state == station_jobs::JobState::Running {
+              clones_active = true
+              break
+            }
+          }
+          st.upkeep.tick(now, clones_active)
           let _ = st.core.agents.jobs.poll_followed(wall)
           let _ = st.core.remote.drain_queue(wall)
           let _ = st.devices.tick_expiry(now, wall)
@@ -7466,6 +7559,7 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
                       mesh_door::StreamGuardVerdict::Allow => ()
                       mesh_door::StreamGuardVerdict::Close(code, reason) => {
                         ctx.log("kicking live admin connection " + cid.to_string() + ": " + reason)
+                        revoke_seen_member_session(st.seen_members, sess.workspace, sess.user_sub, seen_member_session_key(aconn.sid_claim, cid))
                         ctx.close_mesh_conn(cid, aconn.is_front, code, reason)
                         let _ = st.serve.close_connection(cid, aconn.remote_id)
                         st.admin_conns.remove(cid)
@@ -7662,6 +7756,7 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
 
           // Cleanly stop all 4 Wave 16C edge OS adapters with zero orphan processes / leaked FDs.
           st.connects.stop()
+          st.upkeep.shutdown()
           st.browser.stop_all()
           let _ = st.browser.drain_kills_with_hub(max_ms=500L)
           st.terminals.stop_all()

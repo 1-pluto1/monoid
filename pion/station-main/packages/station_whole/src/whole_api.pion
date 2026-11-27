@@ -995,6 +995,9 @@ pub struct WholeApi {
   pub cpu_window : station_api::CpuWindow
   pub mut read_only_handover : Bool
   pub mut edge_status_fn : Option[() -> base_codec::Json]
+  pub hooks : WholeApiRuntimeHooks
+  pub waiting_trackers : Map[String, station_api::WaitingTracker]
+  pub mut waiting_tracker_factory : Option[(String) -> station_api::WaitingTracker]
   request_now_cell : Array[Int64]
 }
 
@@ -1032,7 +1035,44 @@ pub fn WholeApi::new_with_ports(
     cpu_window: station_api::CpuWindow::new(),
     read_only_handover: true,
     edge_status_fn: None,
+    hooks: WholeApiRuntimeHooks::new(),
+    waiting_trackers: Map::new(),
+    waiting_tracker_factory: None,
     request_now_cell: [0L],
+  }
+}
+
+pub fn WholeApi::waiting_tracker_for(self : WholeApi, ws : String) -> Option[station_api::WaitingTracker] {
+  match self.waiting_trackers.get(ws) {
+    Some(wt) => Some(wt)
+    None => match self.waiting_tracker_factory {
+      Some(factory) => {
+        let wt = factory(ws)
+        self.waiting_trackers.set(ws, wt)
+        Some(wt)
+      }
+      None => None
+    }
+  }
+}
+
+pub fn WholeApi::note_waiting_session(self : WholeApi, key : String) -> Unit {
+  let ks = self.waiting_trackers.keys()
+  for i in 0..<ks.length() {
+    match self.waiting_trackers.get(ks[i]) {
+      Some(wt) => wt.note("session", Some(key))
+      None => ()
+    }
+  }
+}
+
+pub fn WholeApi::note_waiting_all(self : WholeApi) -> Unit {
+  let ks = self.waiting_trackers.keys()
+  for i in 0..<ks.length() {
+    match self.waiting_trackers.get(ks[i]) {
+      Some(wt) => wt.reset()
+      None => ()
+    }
   }
 }
 
@@ -1046,7 +1086,15 @@ pub fn WholeApi::new(
   thumb_port : Option[station_screens::ThumbPort] = None,
   config_file : Option[station_ops::ConfigFile] = None,
   config_open_err : Option[station_ops::ConfigError] = None,
+  updates : Option[station_drivers::RuntimeUpdatesManager] = None,
+  waiting_tracker_factory : Option[(String) -> station_api::WaitingTracker] = None,
 ) -> WholeApi {
+  let eff_updates = match updates {
+    Some(u) => u
+    None => station_drivers::RuntimeUpdatesManager::new()
+  }
+  let hooks = WholeApiRuntimeHooks::new()
+  let runtime_port = WholeApiRuntimePort::production(whole_store, agents, auth_policy.home_workspace)
   let effective_fs = match drive_fs {
     Some(f) => f
     None => os_drive_fs()
@@ -1072,7 +1120,18 @@ pub fn WholeApi::new(
   )
   let screens = station_screens::ScreenHub::new()
   let seen_store = build_real_seen_store(whole_store)
-  let events = station_api::EventsHub::new(auth_policy.station_id, station_api::EventKeeps::default())
+  let in_vault_fn = fn(v : station_api::Viewer, vid : String) -> Bool {
+    match whole_store.vault_store {
+      Some(vs) => vs.in_vault(v.workspace, v.sub, vid)
+      None => false
+    }
+  }
+  let events = station_api::EventsHub::with_visibility(
+    auth_policy.station_id,
+    station_api::EventKeeps::default(),
+    Some(seen_store),
+    Some(in_vault_fn),
+  )
   let home_ws_str = auth_policy.home_workspace
   let station_id_str = auth_policy.station_id
   let request_now_cell : Array[Int64] = [0L]
@@ -1395,6 +1454,10 @@ pub fn WholeApi::new(
       }
       return Ok(listed.to_json())
     }
+    match dispatch_extra_read_op(op, req, args, agents, seen_store, runtime_port) {
+      Some(res) => return res
+      None => ()
+    }
     Err(station_api::ApiError::new(404, "unsupported read op: " + op))
   }
 
@@ -1685,12 +1748,27 @@ pub fn WholeApi::new(
       }
       return Ok(screens.listed_json(lang, Some(req.viewer.workspace)))
     }
-    if op == "vault.uses.get" {
-      return Ok(
-        base_codec::json_obj([
-          ("activeGrants", base_codec::json_int(whole_store.vault_grants.len())),
-        ]),
-      )
+    match dispatch_extra_call_op(
+      op,
+      req,
+      params,
+      body,
+      whole_store,
+      agents,
+      auth_policy,
+      seen_store,
+      drive,
+      screens,
+      events,
+      eff_updates,
+      config_file,
+      config_open_err,
+      hooks,
+      runtime_port,
+      now_ms,
+    ) {
+      Some(res) => return res
+      None => ()
     }
     Err(station_api::ApiError::new(404, "unsupported api op: " + op))
   }
@@ -1981,7 +2059,7 @@ pub fn WholeApi::new(
   let admin = station_api::AdminApi::new(api_host, seen_store, auth_policy.station_build)
   let ws_drives : Map[String, station_screens::Drive] = Map::new()
   ws_drives.set(auth_policy.home_workspace, drive)
-  WholeApi::{
+  let api = WholeApi::{
     auth_policy: auth_policy,
     admin: admin,
     drive: drive,
@@ -1999,8 +2077,15 @@ pub fn WholeApi::new(
     cpu_window: station_api::CpuWindow::new(),
     read_only_handover: true,
     edge_status_fn: None,
+    hooks: hooks,
+    waiting_trackers: Map::new(),
+    waiting_tracker_factory: waiting_tracker_factory,
     request_now_cell: request_now_cell,
   }
+  api.hooks.on_drive_roots_changed = Some(fn(ws : String, roots : Array[String]) -> Unit {
+    api.set_workspace_drive_roots(ws, roots)
+  })
+  api
 }
 
 /// Grant specific Drive roots to a workspace (home workspace gets `drive_roots` by default).
@@ -2187,6 +2272,8 @@ fn WholeApi::authenticate_peer(
         home: is_home,
         role: viewer.role,
         device: viewer.device,
+        lock_base: viewer.lock_base,
+        lock_proof: viewer.lock_proof,
       })
     }
     PeerIdentity::AuthenticatedStation(station_id, ws, _claimed_home) => {
@@ -2202,6 +2289,8 @@ fn WholeApi::authenticate_peer(
         home: is_home,
         role: "viewer",
         device: None,
+        lock_base: None,
+        lock_proof: None,
       })
     }
   }
@@ -2247,12 +2336,13 @@ pub fn WholeApi::handle_authenticated_api_with_status(
   }
 
   // 2. Read-only member gate & pre-handover read-only gate.
+  self.hooks.read_only_handover_cell[0] = self.read_only_handover
   if viewer.is_read_only() && !station_api::read_only_may(method, norm_path) {
     return station_http::HandlerAction::Respond(
       station_api::json_error(403, "read-only members cannot change this station"),
     )
   }
-  if self.read_only_handover && !station_api::read_only_may(method, norm_path) {
+  if self.read_only_handover && !station_api::read_only_may(method, norm_path) && !norm_path.starts_with("/vault/") {
     return station_http::HandlerAction::Respond(
       station_api::json_error(403, "station is in read-only handover mode"),
     )
@@ -2261,6 +2351,13 @@ pub fn WholeApi::handle_authenticated_api_with_status(
   // 3. `GET /status` (or `/api/status`): workspace-scoped `LocalStatus` gated by `OLDEST_CORE`.
   if method == "GET" && norm_path == "/status" {
     let (running, processes) = status_snapshot(viewer)
+    let waiting_list : Array[station_api::WaitingSessionInfo] = match self.waiting_tracker_for(viewer.workspace) {
+      Some(wt) => {
+        let since = now_ms - station_api::STATUS_WAITING_DAYS.to_int64() * 86400000L
+        wt.read(since, station_api::STATUS_TASKS_MOST)
+      }
+      None => []
+    }
     let st_out = station_api::status_of(station_api::StatusInput::{
       version: self.auth_policy.station_build,
       cloud: Some(station_api::StatusCloudState::{
@@ -2273,7 +2370,7 @@ pub fn WholeApi::handle_authenticated_api_with_status(
       reached: true,
       running: running,
       processes: processes,
-      waiting: [],
+      waiting: waiting_list,
       health: None,
     })
     let base_status_json = st_out.to_json()
