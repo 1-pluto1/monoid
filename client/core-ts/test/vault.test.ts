@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mock, test } from "node:test";
 import { ed25519 } from "@noble/curves/ed25519.js";
-import { Effect } from "effect";
+import { Deferred, Effect } from "effect";
 import { Core } from "../src/core.ts";
 import { apply as applyOps } from "../src/delta.ts";
 import { CoreError, HostError } from "../src/error.ts";
@@ -29,7 +29,7 @@ import { checkLock } from "../src/vault/lock-check.ts";
 import { OAUTH_WAIT_MS, SLACK, handedTo, stateOf as oauthState } from "../src/vault/oauth.ts";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { checkWith, forgetVerifiedHere, keepVerified } from "../src/vault/verified.ts";
-import { BOX_KEY, BOX_PUB, UNLOCK_MS, askAnswers, levelVaults, pairBoxCerts, readStation, tookOut, vaultCome, vaultsView, waitingAs, waitingChecks } from "../src/views/vault.ts";
+import { BOX_KEY, BOX_PUB, UNLOCK_MS, askAnswers, levelVaults, pairBoxCerts, readStation, spread, tookOut, vaultCome, vaultsView, waitingAs, waitingChecks } from "../src/views/vault.ts";
 import { handOver, inForceOf, leftIn, pairs, pendingHeld, read as readLock, roster, signerKnown } from "../src/views/lock.ts";
 import { type Duplex, dialer, personalBegin, personalProve, serveTrusted } from "../src/views/pair.ts";
 import { PERSONAL_KEY } from "../src/personal-lock.ts";
@@ -408,7 +408,7 @@ async function rig(web = false, two = false, more: Answers = {}, also?: Record<s
     ui = s.core.connect();
     r.core = s.core;
   };
-  const r = { ...s, st, st2, phone, other, lock, me, ask, watch, take, restart, putLock: () => s.core.inner.data.put("lock", "ws", lock) };
+  const r = { ...s, st, st2, phone, other, lock, me, ask, watch, take, restart, putLock: () => { s.core.inner.data.put("lock", "ws", lock); s.core.inner.syncWorkspaceAuth?.("ws"); } };
   return r;
 }
 
@@ -420,7 +420,7 @@ function grow(r: Awaited<ReturnType<typeof rig>>, kind: string, body: unknown, b
   const entry: Entry = { ...e, sig: { key: signer.id, alg: "Ed25519", sig: signer.signBytes(new Uint8Array([...utf8("stillfail-lock/1 sig\0"), ...unhex(entryHash(e))])) } };
   r.lock.entries.push(entry);
   r.lock.head = { seq: entry.seq, hash: entryHash(entry), genesis: r.lock.head.genesis };
-  r.putLock();
+  r.core.inner.data.put("lock", "ws", r.lock);
 }
 
 const fails = async (p: Promise<unknown>, code: string) => {
@@ -4905,4 +4905,381 @@ test("vault calls r18: recover with startSnap allows newly-discovered vault when
     }
     r.core.close();
   }
+});
+
+test("Direction 2A R3 P1-2: expired old-epoch key after rekey does not bumpVault or lock live new-epoch key", async () => {
+  const r = await rig();
+  r.putLock();
+  const { made: id } = await r.ask("vault.setup", {});
+  const put = await r.ask("vault.putItem", {
+    vault: id,
+    plain: { kind: "token", name: "GitHub", fields: { value: "ghp_x" } },
+    listing: { name: "gh", kind: "token", modes: ["proxy"], hosts: ["api.github.com"] },
+  });
+  const phoneCert = sign({ v: 1 as const, ws: "ws", device: r.phone.hex, box: boxPublic(fill(7)), at: 2000 }, TAG.box, r.phone);
+  r.st.boxes.set(r.phone.hex, phoneCert);
+  r.push("vault-box", phoneCert);
+  await r.host.time.pass(500);
+  r.take();
+  assert.equal(r.st.vaults.get(id)!.seq, 1, "phone given key");
+
+  stationReplies(r.host, (req) => (req.url.includes("/v1/workspaces/ws/lock") ? r.lock : r.st.reply(req)));
+  grow(r, "device.remove", { id: r.phone.hex });
+  await r.core.inner.runner.run(readLock(r.core.inner, "ws"));
+  await r.host.time.pass(500, 10);
+  r.take();
+  assert.equal(r.st.vaults.get(id)!.epoch, 1, "vault rekeyed to epoch 1 (epoch 0 + epoch 1 keys live)");
+
+  // Advance half of UNLOCK_MS, then add and remove a second device so a second rekey produces epoch 2
+  // (extending epoch 1 + epoch 2 TTLs to t + UNLOCK_MS while epoch 0 still expires at the original UNLOCK_MS).
+  await r.host.time.pass(UNLOCK_MS / 2, 1000);
+  const peer2 = key(fill(99));
+  grow(r, "device", { id: peer2.hex, sub: "s1", kind: "app", label: "ipad", sign_key: peer2.id });
+  await r.core.inner.runner.run(readLock(r.core.inner, "ws"));
+  const peer2Cert = sign({ v: 1 as const, ws: "ws", device: peer2.hex, box: boxPublic(fill(98)), at: 3000 }, TAG.box, peer2);
+  r.st.boxes.set(peer2.hex, peer2Cert);
+  r.push("vault-box", peer2Cert);
+  await r.host.time.pass(500);
+  r.take();
+  grow(r, "device.remove", { id: peer2.hex });
+  await r.core.inner.runner.run(readLock(r.core.inner, "ws"));
+  await r.host.time.pass(500, 10);
+  r.take();
+  assert.equal(r.st.vaults.get(id)!.epoch, 2, "vault rekeyed to epoch 2");
+
+  const vaults = await r.watch(1, { topic: "vaults", workspace: "ws" });
+  assert.equal(vaults().vaults.find((v: any) => v.id === id)?.open, true, "epoch 2 key unlocked after second rekey");
+
+  const genBeforeOldExpiry = r.core.inner.store.authGen.vaultGen("ws", id);
+  const askedBeforeOldExpiry = r.host.secureAsked.length;
+
+  // Advance past old epoch 0 expiry (UNLOCK_MS / 2 + 2000 ms) while new epoch 2 still has ~half UNLOCK_MS left.
+  await r.host.time.pass(UNLOCK_MS / 2 + 2000, 1000);
+  assert.equal(
+    r.core.inner.store.authGen.vaultGen("ws", id),
+    genBeforeOldExpiry,
+    "expiring historical epoch 0 key must NOT bumpVault and invalidate live epoch 2 key",
+  );
+  assert.equal(
+    vaults().vaults.find((v: any) => v.id === id)?.open,
+    true,
+    "vault must remain unlocked under live epoch 2 key after old epoch 0 expires",
+  );
+  const openedAfter = await r.ask("vault.open", { item: put.id, vault: id });
+  assert.equal(openedAfter.plain.fields.value, "ghp_x");
+  assert.equal(r.host.secureAsked.length, askedBeforeOldExpiry, "live epoch 2 key must stay usable without re-prompting");
+  r.core.close();
+});
+
+test("Direction 2A R3 P1-4: #describe strictly targets declared r.vault when two vaults share the same item ID", async () => {
+  const r = await rig();
+  r.putLock();
+  // Fake station stores items by `${vault}/${id}` so colliding item IDs across two vaults can coexist.
+  const perVaultItems = new Map<string, Item>();
+  stationReplies(r.host, (httpReq) => {
+    if (httpReq.method === "PUT" && httpReq.url.includes("/vault/items")) {
+      const body = JSON.parse(new TextDecoder().decode(httpReq.body ?? new Uint8Array())) as Item;
+      perVaultItems.set(`${body.vault}/${body.id}`, body);
+      r.st.items.set(body.id, body);
+      return { item: body };
+    }
+    return r.st.reply(httpReq);
+  });
+  const { made: v1 } = await r.ask("vault.setup", {});
+  const { id: v2 } = await r.ask("vault.create", { name: "Second" });
+  const sharedId = "i_01M4871X3MTC0903ZX5CPB8J99";
+  await r.ask("vault.putItem", {
+    vault: v1,
+    id: sharedId,
+    plain: { kind: "token", name: "Alpha", fields: { value: "tok_v1" }, notes: "v1-note" },
+    listing: { name: "Alpha", kind: "token", modes: ["proxy"], hosts: ["a.example.com"], about: "v1-note" },
+  });
+  await r.ask("vault.putItem", {
+    vault: v2,
+    id: sharedId,
+    plain: { kind: "token", name: "Beta", fields: { value: "tok_v2" }, notes: "v2-note" },
+    listing: { name: "Beta", kind: "token", modes: ["proxy"], hosts: ["b.example.com"], about: "v2-note" },
+  });
+
+  const req: Request = {
+    id: "r_desc_collide",
+    ws: "ws",
+    vault: v2,
+    item: sharedId,
+    session: "s-desc",
+    chat: "Desc Test",
+    mode: "proxy",
+    hosts: ["b.example.com"],
+    reason: "rename beta",
+    box: "",
+    at: 3000,
+    status: "pending",
+    describe: { name: "BetaRenamed", about: "v2-updated", was: { name: "Beta", about: "v2-note" } },
+  };
+  r.st.requests.push(req);
+  r.push("vault-request", req);
+  await r.host.time.pass(200);
+  r.take();
+
+  await r.ask("vault.approve", { request: "r_desc_collide", scope: "once" });
+
+  const openedV2 = await r.ask("vault.open", { item: sharedId, vault: v2 });
+  assert.equal(openedV2.vault, v2);
+  assert.equal(openedV2.plain.name, "BetaRenamed");
+  assert.equal(openedV2.plain.notes, "v2-updated");
+  assert.equal(openedV2.version, 1, "declared target vault v2 item must be updated to version 1");
+
+  const openedV1 = await r.ask("vault.open", { item: sharedId, vault: v1 });
+  assert.equal(openedV1.vault, v1);
+  assert.equal(openedV1.plain.name, "Alpha", "other vault v1 item with colliding ID must remain untouched");
+  assert.equal(openedV1.plain.notes, "v1-note");
+  assert.equal(openedV1.version, 0, "other vault v1 item must remain at version 0");
+  r.core.close();
+});
+
+test("Direction 2A R4 P1-2: current epoch expiring while older migration key is still in mem.keys immediately bumps vaultGen and evicts old slot", async () => {
+  const r = await rig();
+  const { id, item: oldItem } = await keyedAnewHalfWay(r);
+  // Restart so no keys are in memory, then unlock current epoch 1 at t=0 via a new item write,
+  // while leaving `oldItem` at epoch 0.
+  await r.restart();
+  const putNew = await r.ask("vault.putItem", {
+    vault: id,
+    plain: { kind: "token", name: "Fresh", fields: { value: "fresh_1" } },
+    listing: { name: "fresh", kind: "token", modes: ["proxy"], hosts: ["f.example.com"] },
+  });
+  assert.ok(putNew.id);
+
+  // Capture an entry capability at t=0 and watch vaults view.
+  const entryCap = r.core.inner.store.authGen.vaultCapability("ws", id);
+  const genAtUnlock = r.core.inner.store.authGen.vaultGen("ws", id);
+  const vaults = await r.watch(1, { topic: "vaults", workspace: "ws" });
+  assert.equal(vaults().vaults.find((v: any) => v.id === id)?.open, true, "current epoch 1 unlocked at t=0");
+
+  // At t = UNLOCK_MS / 2, open the epoch-0 item -> #carryNow unseals & caches epoch 0 key with TTL until 1.5 * UNLOCK_MS.
+  await r.host.time.pass(UNLOCK_MS / 2, 1000);
+  const openedOld = await r.ask("vault.open", { item: oldItem, vault: id });
+  assert.equal(openedOld.plain.fields.value, "ghp_x");
+  assert.equal(entryCap.isValid(), true, "entryCap still valid before current epoch expires");
+
+  // Advance to t = UNLOCK_MS + 2000: current epoch 1 expires FIRST while older migration epoch 0 still has ~0.5 * UNLOCK_MS left.
+  await r.host.time.pass(UNLOCK_MS / 2 + 2000, 1000);
+  assert.ok(
+    r.core.inner.store.authGen.vaultGen("ws", id) > genAtUnlock,
+    "expiring current epoch must immediately bump vaultGen even when an older migration epoch key has a later TTL",
+  );
+  assert.equal(entryCap.isValid(), false, "in-flight entry capability must be invalidated immediately on current epoch expiry");
+  const guardedRes = await Effect.runPromise(Effect.result(entryCap.assertValid()));
+  assert.equal(guardedRes._tag, "Failure");
+  assert.equal(guardedRes.failure.code, "auth_stale");
+  assert.equal(vaults().vaults.find((v: any) => v.id === id)?.open, false, "vault must be locked once current epoch expires");
+
+  // Advance past 1.5 * UNLOCK_MS (old migration key's original expiry): remains locked with no error.
+  const genAfterLock = r.core.inner.store.authGen.vaultGen("ws", id);
+  await r.host.time.pass(UNLOCK_MS / 2 + 2000, 1000);
+  assert.equal(vaults().vaults.find((v: any) => v.id === id)?.open, false, "vault remains locked after old timer fires");
+  assert.equal(r.core.inner.store.authGen.vaultGen("ws", id), genAfterLock, "evicted old migration slot must not double-bump");
+  r.core.close();
+});
+
+test("Direction 2A R4 P1-3: background spread pre-captures per-vault caps (branch A: global/ws bump halts v2; branch B: v1-only lock allows v2)", async () => {
+  for (const branch of ["ws-bump", "v1-only-lock"] as const) {
+    const r = await rig(false, true);
+    r.putLock();
+    const { made: v1 } = await r.ask("vault.setup", {});
+    const { id: v2 } = await r.ask("vault.create", { name: "Second" });
+    await r.host.time.pass(500);
+    r.take();
+
+    // Mark st2 as holding neither v1 nor v2 (so lacks() plans both v1 and v2 for st2).
+    const h0 = r.core.inner.data.record("vault", "ws") as {
+      on: Record<string, Record<string, unknown>>;
+      keeps: string[];
+    };
+    const nextOn = structuredClone(h0.on);
+    if (nextOn[v1]) delete nextOn[v1].st2;
+    if (nextOn[v2]) delete nextOn[v2].st2;
+    r.core.inner.data.put("vault", "ws", { ...h0, on: nextOn, keeps: ["st", "st2"] });
+    r.st2.vaults.delete(v1);
+    r.st2.vaults.delete(v2);
+
+    const enteredV1 = Deferred.makeUnsafe<void>();
+    const releaseV1 = Deferred.makeUnsafe<void>();
+    const st2CopyVaultPuts: string[] = [];
+    stationLater(r.host, (req) => {
+      const target = req.headers.find(([k]) => k === "x-test-station")?.[1];
+      if (target !== "st2" || req.method !== "PUT" || !req.url.includes("/vault/vaults?copy=1")) return undefined;
+      const body = JSON.parse(new TextDecoder().decode(req.body ?? new Uint8Array())) as Vault;
+      st2CopyVaultPuts.push(body.id);
+      if (body.id === v1) {
+        Effect.runSync(Deferred.succeed(enteredV1, undefined));
+        return Effect.runPromise(Deferred.await(releaseV1)).then(() => jsonResponse(200, r.st2.reply(req)));
+      }
+      return undefined;
+    });
+
+    const spreadPromise = r.core.inner.runner.run(spread(r.core.inner, "ws/st2"));
+    await Effect.runPromise(Deferred.await(enteredV1));
+
+    if (branch === "ws-bump") {
+      r.core.inner.store.authGen.bumpWorkspace("ws");
+    } else {
+      r.core.inner.store.authGen.bumpVault("ws", v1);
+    }
+
+    Effect.runSync(Deferred.succeed(releaseV1, undefined));
+    await spreadPromise;
+    stationLater(r.host, () => undefined);
+
+    const hAfter = r.core.inner.data.record("vault", "ws") as { on: Record<string, Record<string, unknown>> };
+    assert.equal(hAfter.on[v1]?.st2, undefined, `${branch}: stale v1 ACK must NOT write back h.on[v1].st2`);
+
+    if (branch === "ws-bump") {
+      assert.deepEqual(st2CopyVaultPuts, [v1], "ws-bump: v2 must have 0 ?copy=1 PUTs once wsAuthGen advanced");
+      assert.equal(hAfter.on[v2]?.st2, undefined, "ws-bump: v2 must have 0 ACK write-backs");
+    } else {
+      assert.deepEqual(st2CopyVaultPuts, [v1, v2], "v1-only-lock: v2 must still execute ?copy=1 PUT");
+      assert.ok(hAfter.on[v2]?.st2 !== undefined, "v1-only-lock: v2 must still commit its ACK to h.on[v2].st2");
+    }
+    r.core.close();
+  }
+});
+
+test("Direction 2A R4 P1-3: migrate() re-checks ownCap after spread and never calls deletePlain when capability expires mid-spread", async () => {
+  const r = await rig();
+  r.putLock();
+  const { made: ownId } = await r.ask("vault.setup", {});
+  // Pre-populate the exact same secret in ownId so migrate() hits `had.has(sig)` and skips putItem,
+  // ensuring the intercepted `?copy=1` PUT comes strictly from migrate()'s own spread() call.
+  await r.ask("vault.putItem", {
+    vault: ownId,
+    plain: { kind: "token", name: "PlainTok", fields: { value: "plain_val" } },
+    listing: { name: "plain_tok", kind: "token", modes: ["proxy"], hosts: ["p.example.com"] },
+  });
+  const plainId = "i_01JAPLAIN000000000000MIG1";
+  r.st.plain.set(plainId, {
+    id: plainId,
+    version: 0,
+    kind: "token",
+    name: "PlainTok",
+    fields: { value: "plain_val" },
+    notes: "",
+    listing: { name: "plain_tok", kind: "token", modes: ["proxy"], hosts: ["p.example.com"] },
+    at: 1000,
+    owner: "a@x.com",
+  });
+  await r.core.inner.runner.run(readStation(r.core.inner, "ws/st"));
+  await r.host.time.pass(200);
+  r.take();
+
+  // Force spread() to perform a ?copy=1 PUT to `st` during migrate() by clearing `st` from h.on[ownId].
+  const h0 = r.core.inner.data.record("vault", "ws") as {
+    on: Record<string, Record<string, unknown>>;
+    keeps: string[];
+  };
+  const nextOn = structuredClone(h0.on);
+  if (nextOn[ownId]) delete nextOn[ownId].st;
+  r.core.inner.data.put("vault", "ws", { ...h0, on: nextOn, keeps: ["st"] });
+
+  const enteredSpread = Deferred.makeUnsafe<void>();
+  const releaseSpread = Deferred.makeUnsafe<void>();
+  let plainDeletes = 0;
+  let itemPuts = 0;
+  stationLater(r.host, (req) => {
+    if (req.method === "PUT" && req.url.includes("/vault/items") && !req.url.includes("?copy=1")) {
+      itemPuts++;
+      return undefined;
+    }
+    if (req.method === "PUT" && req.url.includes("/vault/plain")) {
+      const body = JSON.parse(new TextDecoder().decode(req.body ?? new Uint8Array())) as { deleted?: boolean };
+      if (body.deleted) plainDeletes++;
+      return undefined;
+    }
+    if (req.method === "PUT" && req.url.includes("?copy=1")) {
+      Effect.runSync(Deferred.succeed(enteredSpread, undefined));
+      return Effect.runPromise(Deferred.await(releaseSpread)).then(() => jsonResponse(200, r.st.reply(req)));
+    }
+    return undefined;
+  });
+
+  const migratePromise = r.ask("vault.migrate", {});
+  await Effect.runPromise(Deferred.await(enteredSpread));
+  // Revoke ownCap while migrate()'s own spread() is in flight.
+  r.core.inner.store.authGen.bumpVault("ws", ownId);
+  Effect.runSync(Deferred.succeed(releaseSpread, undefined));
+
+  await fails(migratePromise, "auth_stale");
+  assert.equal(itemPuts, 0, "putItem must have been skipped via dedup so ?copy=1 came strictly from migrate()'s spread()");
+  assert.equal(plainDeletes, 0, "migrate() must NOT call deletePlain after ownCap becomes stale during spread()");
+  assert.equal(r.st.plain.get(plainId).deleted, undefined, "plain item on station must remain undeleted");
+  r.core.close();
+});
+
+test("Direction 2A R5: migrate() threads entry snapshot into unsealOwn so mid-unseal revocation fails auth_stale with 0 key caching or writes", async () => {
+  const r = await rig();
+  r.putLock();
+  const { made: ownId } = await r.ask("vault.setup", {});
+  await r.ask("vault.putItem", {
+    vault: ownId,
+    plain: { kind: "token", name: "Existing", fields: { value: "existing_val" } },
+    listing: { name: "existing", kind: "token", modes: ["proxy"], hosts: ["e.example.com"] },
+  });
+  const plainId = "i_01JAPLAIN000000000000MIG2";
+  r.st.plain.set(plainId, {
+    id: plainId,
+    version: 0,
+    kind: "token",
+    name: "PlainTwo",
+    fields: { value: "plain_val_2" },
+    notes: "",
+    listing: { name: "plain_two", kind: "token", modes: ["proxy"], hosts: ["p2.example.com"] },
+    at: 1000,
+    owner: "a@x.com",
+  });
+  // Restart so mem.keys is cold and unsealOwn must read BOX_KEY via secureGet.
+  await r.restart();
+  await r.core.inner.runner.run(readStation(r.core.inner, "ws/st"));
+  await r.host.time.pass(200);
+  r.take();
+
+  const vaults = await r.watch(1, { topic: "vaults", workspace: "ws" });
+  assert.equal(vaults().vaults.find((v: any) => v.id === ownId)?.open, false, "vault starts locked after restart");
+
+  const enteredBoxKey = Deferred.makeUnsafe<void>();
+  const releaseBoxKey = Deferred.makeUnsafe<void>();
+  const origSecGet = r.host.secureGet!.bind(r.host);
+  r.host.secureGet = (k, reason) => {
+    if (k === BOX_KEY) {
+      return Effect.gen(function* () {
+        yield* Deferred.succeed(enteredBoxKey, undefined);
+        yield* Deferred.await(releaseBoxKey);
+        return yield* origSecGet(k, reason);
+      });
+    }
+    return origSecGet(k, reason);
+  };
+
+  let itemWrites = 0;
+  let plainDeletes = 0;
+  stationReplies(r.host, (req) => {
+    if (req.method === "PUT" && req.url.includes("/vault/items")) itemWrites++;
+    if (req.method === "PUT" && req.url.includes("/vault/plain")) {
+      const body = JSON.parse(new TextDecoder().decode(req.body ?? new Uint8Array())) as { deleted?: boolean };
+      if (body.deleted) plainDeletes++;
+    }
+    return r.st.reply(req);
+  });
+
+  const migratePromise = r.ask("vault.migrate", {});
+  await Effect.runPromise(Deferred.await(enteredBoxKey));
+  // Revoke vault capability while unsealOwn is awaiting BOX_KEY.
+  r.core.inner.store.authGen.bumpVault("ws", ownId);
+  Effect.runSync(Deferred.succeed(releaseBoxKey, undefined));
+
+  await fails(migratePromise, "auth_stale");
+  assert.equal(vaults().vaults.find((v: any) => v.id === ownId)?.open, false, "stale unsealOwn must NOT populate mem.keys via #keep");
+  assert.equal(itemWrites, 0, "stale unsealOwn must perform 0 item/carryOn writes");
+  assert.equal(plainDeletes, 0, "stale unsealOwn must perform 0 deletePlain writes");
+  assert.equal(r.st.plain.get(plainId).deleted, undefined, "plain item on station must remain undeleted");
+  r.core.close();
 });
