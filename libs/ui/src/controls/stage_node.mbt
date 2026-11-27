@@ -54,8 +54,11 @@ fn stage_node(
       .presses(Is(true))
       .on_press(fn() {  })
       |> ignore
-      // what it holds: as tall as it is laid out at the stage's width, giving way to what the column leaves it
-      stage_fit_node(d, x.w, fn() { look().words }, fn(b) { (nodes.body)(b, close) })
+      // what it holds: scrolled vertically at readable width when `stage_scroll` is given, else scaled to fit whole
+      match x.stage_scroll {
+        Some(sc) => stage_scroll_node(d, x.w, sc, x.stage_bg, fn() { look().words }, fn(b) { (nodes.body)(b, close) })
+        None => stage_fit_node(d, x.w, fn() { look().words }, fn(b) { (nodes.body)(b, close) })
+      }
       // under it: what is chosen of it over 关闭 and its foot's buttons, on the night
       d.box(fn(u) {
         style_node(u, fn() { stage_under })
@@ -80,6 +83,39 @@ fn stage_node(
 }
 
 ///|
+/// Preview slot for a scrollable stage: vertically centers short previews that hug their own height.
+// kept across runs: a value (no field of it changes)
+let stage_scroll_slot : @ui.Style = @ui.css("justify=JCenter w=Full")
+
+///|
+/// Shared poster layout box inside a stage's `by_room`: laid out `most` wide out of flow, horizontally centered in
+/// `room.width()`, scaled by `scale_fn` about its top center, with a companion spacer reserving `room.tall * across`.
+/// Returns the measured poster node so callers can read `room.tall(whole)` directly.
+#callsite(autofill(loc))
+fn stage_poster_box(
+  holder : @view.View,
+  room : @view.Room,
+  most : Double,
+  scale_fn : (@view.View) -> () -> Double,
+  body : (@view.View) -> Unit,
+  loc~ : SourceLoc,
+) -> @view.View {
+  let made : Ref[@view.View?] = Ref(None)
+  holder.box(made_for=loc, fn(b) {
+    made.val = Some(b)
+    b.over(Is(true), edges=(Some(0.0), Some(0.0), None, None)).width(Is(Some(most))) |> ignore
+    body(b)
+  })
+  |> ignore
+  let whole = made.val.unwrap()
+  let across = fn() { dmin(1.0, room.width() / most) }
+  whole.offset(By(fn() { ((room.width() - most) / 2.0, 0.0) })).scale(By(scale_fn(whole)), about=@view.Pivot::At(0.5, 0.0))
+  |> ignore
+  holder.box(fn(r) { r.height(By(fn() { Some(room.tall(whole) * across()) })) |> ignore }) |> ignore
+  whole
+}
+
+///|
 /// What a stage holds in `parent` (a column that gives it what it leaves under the rest), as opaque as `seen` says (its
 /// words' way in, after the night's, as a dialog's are): made by `body` `most` wide,
 /// whatever the stage's width, and drawn smaller from its top's middle where the stage has not that width, or not the
@@ -87,28 +123,92 @@ fn stage_node(
 /// it out: View::by_room's height); its room as large as it is drawn, in the column's middle.
 fn stage_fit_node(parent : @view.View, most : Double, seen : () -> Double, body : (@view.View) -> Unit) -> Unit {
   parent.by_room(fn(held, room) {
-    // (laid out `most` wide over its room from its top, out of its flow: the room as tall as it is drawn, not as it is
-    // laid out)
-    let made : Ref[@view.View?] = Ref(None)
-    held.box(fn(b) {
-      made.val = Some(b)
-      b.over(Is(true), edges=(Some(0.0), Some(0.0), None, None)).width(Is(Some(most))) |> ignore
-      body(b)
+    let across = fn() { dmin(1.0, room.width() / most) }
+    stage_poster_box(
+      held,
+      room,
+      most,
+      fn(whole) {
+        fn() {
+          let tall = room.tall(whole)
+          match room.height() {
+            Some(h) if tall > 0.0 => dmin(across(), h / tall)
+            _ => across()
+          }
+        }
+      },
+      body,
+    )
+    |> ignore
+  })
+  .shrink(Is(1.0))
+  .min_height(Is(Some(0.0)))
+  .alpha(By(seen))
+  |> ignore
+}
+
+///|
+/// What a scrollable stage holds in `parent` (a column that gives it what it leaves under the rest): laid out `most`
+/// wide, scaled horizontally only when the stage is narrower than `most`, and scrolled vertically inside a
+/// `pane_corner` clipped viewport whenever taller than the room the column leaves it — keeping long lists readable
+/// instead of shrinking them into a narrow strip. Short pictures hug their own height with zero scroll, while the slot
+/// holds the highest height seen while open (monotonic non-shrinking) so switching provider filters to a shorter group
+/// never shifts the controls below under the person's finger or pointer.
+fn stage_scroll_node(
+  parent : @view.View,
+  most : Double,
+  scroll : @view.Scroll,
+  bg : (() -> Int64)?,
+  seen : () -> Double,
+  body : (@view.View) -> Unit,
+) -> Unit {
+  let peak_h : Ref[Double] = Ref(0.0)
+  parent.by_room(fn(held, room) {
+    let across = fn() { dmin(1.0, room.width() / most) }
+    held.shrink(Is(1.0)).min_height(Is(Some(0.0))) |> ignore
+    let whole_ref : Ref[@view.View?] = Ref(None)
+    held.box(fn(slot) {
+      style_node(slot, fn() { stage_scroll_slot })
+      slot.shrink(Is(1.0)).min_height(Is(Some(0.0))) |> ignore
+      // Outer rounded viewport clips both top and bottom smoothly while scrolling; keeping `.scrolls` on an inner child
+      // places the vertical scroll container strictly between scrolled cards and this rounded frame (corners.mbt).
+      slot.box(fn(frame) {
+        frame.shrink(Is(1.0)).min_height(Is(Some(0.0))).radius(By(fn() { pane_corner * across() })).clips(Is(true))
+        |> ignore
+        match bg {
+          Some(g) => frame.ground(By(g)) |> ignore
+          None => ()
+        }
+        frame.box(fn(sc) {
+          sc
+          .shrink(Is(1.0))
+          .min_height(Is(Some(0.0)))
+          .scrolls(
+            scroll,
+            slop=@ui.touch_slop(),
+            bar=@ui.tree_scroll_bar(),
+            bar_clear=fn() { (pane_corner * across() / 2.0, pane_corner * across() / 2.0) },
+            fn(content) { whole_ref.val = Some(stage_poster_box(content, room, most, fn(_) { across }, body)) },
+          )
+          |> ignore
+        })
+        |> ignore
+      })
+      |> ignore
+      let whole = whole_ref.val.unwrap()
+      // Monotonic unscaled peak height: hugs short previews on open (zero extra gap under short cards like share-pool),
+      // scales cleanly with `across()` if the window narrows, and never shrinks when a filter switches to fewer rows so
+      // bottom tabs & buttons stay stationary. Idempotent local Ref monotonic max; does not affect `whole`'s own layout.
+      slot.height(By(fn() {
+        let tall = room.tall(whole)
+        if tall > peak_h.val {
+          peak_h.val = tall
+        }
+        Some(peak_h.val * across())
+      }))
+      |> ignore
     })
     |> ignore
-    let whole = made.val.unwrap()
-    // (how much smaller it is drawn at the stage's width, and in the room the column gave it)
-    let across = fn() { dmin(1.0, room.width() / most) }
-    let drawn = fn() {
-      let tall = room.tall(whole)
-      match room.height() {
-        Some(h) if tall > 0.0 => dmin(across(), h / tall)
-        _ => across()
-      }
-    }
-    whole.offset(By(fn() { ((room.width() - most) / 2.0, 0.0) })).scale(By(drawn), about=@view.Pivot::At(0.5, 0.0)) |> ignore
-    // (its room: as tall as it is drawn at the stage's width, given less by the column where it has not that)
-    held.box(fn(r) { r.height(By(fn() { Some(room.tall(whole) * across()) })) |> ignore }) |> ignore
   })
   .shrink(Is(1.0))
   .min_height(Is(Some(0.0)))

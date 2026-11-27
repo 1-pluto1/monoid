@@ -683,3 +683,104 @@ test "the subscriptions' picture: 完全打码 over it keeps each name laid out 
   assert_eq(t.corner_faults(), [])
   assert_eq(t.contrast_faults(), [])
 }
+
+///|
+test "share-accounts-many: tall 24-account preview scrolls at readable width and filters by provider cleanly" {
+  for at in [(390.0, 844.0, 2), (1440.0, 1000.0, 0)] {
+    let src = fixture_app("share-accounts-many")
+    let t = @ui.Tester::new(fn(c) { view(c, src) }, tree=app_tree(src), w=at.0, h=at.1, platform=at.2)
+    t.run_for(@motion.presence_in_ms)
+    assert_true(picture_says(t, "24 个订阅账号"), msg="initial count \{Repr(at)}")
+    assert_true(picture_says(t, "Claude 订阅"), msg="initial Claude group \{Repr(at)}")
+    // Provider filter tabs are present (short labels without repeated 订阅 suffix)
+    assert_true(t.query(Tab, label="全部") is Some(_), msg="All tab \{Repr(at)}")
+    assert_true(t.query(Tab, label="Claude") is Some(_), msg="Claude tab \{Repr(at)}")
+    assert_true(t.query(Tab, label="ChatGPT") is Some(_), msg="ChatGPT tab \{Repr(at)}")
+    assert_true(t.query(Tab, label="Google") is Some(_), msg="Google tab \{Repr(at)}")
+    assert_true(t.query(Tab, label="OpenCode Go") is Some(_), msg="OpenCode Go tab \{Repr(at)}")
+    assert_eq(t.squeeze_faults(), [])
+    assert_eq(t.corner_faults(), [])
+    assert_eq(t.contrast_faults(), [])
+    // Capture bottom controls' resting Y positions so we can verify zero jump when switching provider filters.
+    let claude_tab_y0 = t.query(Tab, label="Claude").unwrap().rect.1
+    let close_btn_y0 = t.query(Button, label="关闭").unwrap().rect.1
+    // Readable width: verify vertical scroll genuinely moves lower groups upward into view.
+    let head_y0 = t.find("24 个订阅账号").unwrap().1
+    let chatgpt_y0 = t.find("ChatGPT 订阅").unwrap().1
+    t.wheel(at.0 / 2.0, at.1 / 2.0, 360.0)
+    t.run_for(@motion.presence_in_ms)
+    let chatgpt_y1 = t.find("ChatGPT 订阅").unwrap().1
+    assert_true(chatgpt_y1 < chatgpt_y0 - 150.0 && chatgpt_y1 > 0.0 && chatgpt_y1 < at.1, msg="tall share stage scrolls vertically: \{chatgpt_y0} -> \{chatgpt_y1} at \{Repr(at)}")
+    assert_eq(t.squeeze_faults(), [])
+    assert_eq(t.corner_faults(), [])
+    assert_eq(t.contrast_faults(), [])
+    // Filter to Claude (8 accounts): count updates, other providers hide, scroll resets to top, controls stay put
+    t.click(Tab, label="Claude")
+    t.run_for(@motion.presence_in_ms)
+    assert_true(picture_says(t, "8 个订阅账号"), msg="Claude filtered count \{Repr(at)}")
+    assert_true(picture_says(t, "Claude 订阅"), msg="Claude filtered heading \{Repr(at)}")
+    assert_true(!picture_says(t, "ChatGPT 订阅"), msg="ChatGPT hidden under Claude filter \{Repr(at)}")
+    assert_true(!picture_says(t, "OpenCode Go 订阅"), msg="OpenCode hidden under Claude filter \{Repr(at)}")
+    let head_claude = t.find("8 个订阅账号").unwrap().1
+    let group_claude = t.find("Claude 订阅").unwrap().1
+    assert_true(head_claude >= head_y0 - 5.0 && head_claude < group_claude, msg="filter switch resets scroll to top: head=\{head_claude} group=\{group_claude} init=\{head_y0}")
+    assert_true((t.query(Tab, label="Claude").unwrap().rect.1 - claude_tab_y0).abs() < 0.5, msg="Claude tab stays stationary at \{Repr(at)}")
+    assert_true((t.query(Button, label="关闭").unwrap().rect.1 - close_btn_y0).abs() < 0.5, msg="Close button stays stationary at \{Repr(at)}")
+    assert_eq(t.squeeze_faults(), [])
+    assert_eq(t.corner_faults(), [])
+    assert_eq(t.contrast_faults(), [])
+    // Filter to OpenCode Go (5 short rows): controls still stay completely stationary under the finger/pointer
+    t.click(Tab, label="OpenCode Go")
+    t.run_for(@motion.presence_in_ms)
+    assert_true(picture_says(t, "5 个订阅账号"), msg="OpenCode filtered count \{Repr(at)}")
+    assert_true(picture_says(t, "OpenCode Go 订阅"), msg="OpenCode filtered heading \{Repr(at)}")
+    assert_true(!picture_says(t, "Claude 订阅"), msg="Claude hidden under OpenCode filter \{Repr(at)}")
+    assert_true((t.query(Tab, label="Claude").unwrap().rect.1 - claude_tab_y0).abs() < 0.5, msg="Tabs stay stationary on short OpenCode filter at \{Repr(at)}")
+    assert_true((t.query(Button, label="关闭").unwrap().rect.1 - close_btn_y0).abs() < 0.5, msg="Buttons stay stationary on short OpenCode filter at \{Repr(at)}")
+    assert_eq(t.squeeze_faults(), [])
+    assert_eq(t.corner_faults(), [])
+    assert_eq(t.contrast_faults(), [])
+    // Filter to Google (5 accounts, groupTitle "Google" matching prod): fits cleanly, count updates
+    t.click(Tab, label="Google")
+    t.run_for(@motion.presence_in_ms)
+    assert_true(picture_says(t, "5 个订阅账号"), msg="Google filtered count \{Repr(at)}")
+    assert_true(picture_says(t, "Gemini"), msg="Google filtered pool visible \{Repr(at)}")
+    assert_true(!picture_says(t, "Claude 订阅"), msg="Claude hidden under Google filter \{Repr(at)}")
+    assert_true((t.query(Tab, label="Claude").unwrap().rect.1 - claude_tab_y0).abs() < 0.5, msg="Tabs stay stationary on Google filter at \{Repr(at)}")
+    assert_eq(t.squeeze_faults(), [])
+    assert_eq(t.corner_faults(), [])
+    assert_eq(t.contrast_faults(), [])
+    // Back to 全部, then export full vs filtered PNG to verify exported image follows the active filter
+    t.click(Tab, label="全部")
+    t.run_for(@motion.presence_in_ms)
+    assert_true(picture_says(t, "24 个订阅账号"), msg="back to all count \{Repr(at)}")
+    let export_png = fn() -> (Int, Int) {
+      let png = if at.2 == 2 {
+        t.click(Button, label="保存到相册")
+        t.run_for(@motion.presence_in_ms)
+        t.kept()[t.kept().length() - 1].2
+      } else {
+        t.click(Button, label="复制图片")
+        t.run_for(@motion.presence_in_ms)
+        t.clipboard_png().unwrap()
+      }
+      png_size(png).unwrap()
+    }
+    let (all_w, all_h) = export_png()
+    assert_eq(all_w, 1080)
+    if at.2 == 0 {
+      assert_true(t.query(Button, label="已复制") is Some(_), msg="inline copied feedback avoids toast over footer")
+    }
+    t.click(Tab, label="Claude")
+    t.run_for(@motion.presence_in_ms)
+    if at.2 == 0 {
+      assert_true(t.query(Button, label="复制图片") is Some(_), msg="switching provider resets copied button label")
+    }
+    let (claude_w, claude_h) = export_png()
+    assert_eq(claude_w, 1080)
+    assert_true(claude_h < all_h / 2, msg="filtered PNG shorter than full: \{claude_h} vs \{all_h}")
+    assert_eq(t.squeeze_faults(), [])
+    assert_eq(t.corner_faults(), [])
+    assert_eq(t.contrast_faults(), [])
+  }
+}
