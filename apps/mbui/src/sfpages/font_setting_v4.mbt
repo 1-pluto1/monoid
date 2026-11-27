@@ -49,26 +49,51 @@ fn fonts_page_v4_node(
   said? : (@sf.PageSaid) -> Unit,
   width? : () -> Double,
 ) -> Unit {
-  let ctx : FontPageCtx = { core, }
+  fonts_instances.val += 1
+  let me = fonts_instances.val
+  let ctx : FontPageCtx = {
+    core,
+    me,
+    fonts_trying: @signals.signal("", same=fn(a, b) { a == b }),
+    preset_trying: @signals.signal(-1, same=fn(a, b) { a == b }),
+    cjk_scale_drag: @signals.signal(None, same=fn(a, b) { a == b }),
+    text_size_drag: @signals.signal(None, same=fn(a, b) { a == b }),
+    code_scale_drag: @signals.signal(None, same=fn(a, b) { a == b }),
+    fonts_undo_snap: @signals.signal(None),
+  }
   let scroll = @view.Scroll::list()
   if fx_local_up.val {
     fx_local_up.val = false
     @settings.fonts_at.set(0)
     @settings.fonts_script_at.set(1)
+    fonts_picker_owner.set(me)
     font_picker_open.set(1)
     local_open.set(true)
   } else if fx_code_up.val {
     fx_code_up.val = false
     @settings.fonts_at.set(2)
     @settings.fonts_script_at.set(0)
+    fonts_picker_owner.set(me)
     font_picker_open.set(4)
     local_open.set(true)
   }
-  v.owns(fn() {
-    fonts_undo_snap.set(None)
-    font_picker_open.set(-1)
-    local_open.set(false)
-  }) |> ignore
+  let release_instance = fn(clear_undo : Bool) {
+    if fonts_picker_owner.untracked() == me {
+      fonts_picker_owner.set(0)
+      font_picker_open.set(-1)
+      local_open.set(false)
+    }
+    ctx.fonts_trying.set("")
+    ctx.preset_trying.set(-1)
+    ctx.text_size_drag.set(None)
+    ctx.code_scale_drag.set(None)
+    ctx.cjk_scale_drag.set(None)
+    if clear_undo {
+      ctx.fonts_undo_snap.set(None)
+    }
+  }
+  v.on_rest(fn() { release_instance(false) }, while_covered=true) |> ignore
+  v.owns(fn() { release_instance(true) }) |> ignore
   @sf.page_node(
     v,
     fn() { @sf.t("web-pages.appearance.fonts.title") },
@@ -96,7 +121,7 @@ fn fonts_header_actions_node(row : @view.View, ctx : FontPageCtx) -> Unit {
   row.box(fn(g) {
     g.row(Is(true)).lines_up(Is(Some(Middle))) |> ignore
     g.box(fn(anchor) { anchor.width(Is(Some(0.0))).height(Is(Some(0.0))) |> ignore }) |> ignore
-    g.show(along_row=true, fn() { fonts_undo_snap.get() is Some(_) }, fn(uw) {
+    g.show(along_row=true, fn() { ctx.fonts_undo_snap.get() is Some(_) }, fn(uw) {
       @sf.action_box_node(uw, fn() { @sf.t("web-pages.appearance.fonts.undoReset") }, fn(_) { ctx.undo_reset() }, fn(btn) {
         @sf.style_node(btn, fn() { if @sf.lit_node(btn) { fp_v8_reset_hot } else { fp_v8_reset } })
         @sf.words_node(btn, fn() { @sf.t("web-pages.appearance.fonts.undoReset") }, fn() { fp_v8_undo_words }) |> ignore
@@ -131,8 +156,11 @@ fn font_preview_block_node(parent : @view.View, ctx : FontPageCtx) -> Unit {
           match chat.val {
             Some(card_host) => {
               let tall = r.tall(card_host)
-              let lock = font_picker_open.get() >= 0 || preset_trying.get() >= 0 || cjk_scale_drag.get() is Some(_) ||
-                text_size_drag.get() is Some(_) || code_scale_drag.get() is Some(_)
+              let lock = (fonts_picker_owner.get() == ctx.me && font_picker_open.get() >= 0) ||
+                ctx.preset_trying.get() >= 0 ||
+                ctx.cjk_scale_drag.get() is Some(_) ||
+                ctx.text_size_drag.get() is Some(_) ||
+                ctx.code_scale_drag.get() is Some(_)
               if lock {
                 tallest.val = dmax(tallest.val, tall)
                 Some(tallest.val)
@@ -166,18 +194,19 @@ fn font_preview_v8_node(parent : @view.View, ctx : FontPageCtx) -> Unit {
   let code_scale = fn() { ctx.preview_code_scale() }
   let line_scale = fn() { ctx.preview_line_scale() }
   let open_role = fn(idx : Int) {
-    fonts_trying.set("")
+    ctx.fonts_trying.set("")
     let lat_slot = idx * 2
     let cjk_slot = idx * 2 + 1
-    let target = if font_picker_open.untracked() == lat_slot { cjk_slot } else { lat_slot }
+    let target = if fonts_picker_owner.untracked() == ctx.me && font_picker_open.untracked() == lat_slot { cjk_slot } else { lat_slot }
     @settings.fonts_at.set(idx)
     @settings.fonts_script_at.set(target % 2)
+    fonts_picker_owner.set(ctx.me)
     font_picker_open.set(target)
     local_open.set(true)
   }
   let zone = fn(col : @view.View, role_idx : Int, role_key : String, body : (@view.View) -> Unit) {
     let active = fn() {
-      let cur = font_picker_open.get()
+      let cur = if fonts_picker_owner.get() == ctx.me { font_picker_open.get() } else { -1 }
       cur >= 0 && cur / 2 == role_idx
     }
     @sf.action_box_node(col, fn() { @sf.t("web-pages.appearance.fonts." + role_key) }, fn(_) { open_role(role_idx) }, fn(z) {
@@ -276,11 +305,11 @@ fn font_presets_strip_node(parent : @view.View, ctx : FontPageCtx) -> Unit {
         row.box(fn(slot) {
           slot.grow(Is(1.0)).shrink(Is(1.0)).basis(Is(Some(148.0))).min_width(Is(Some(142.0))) |> ignore
           slot.reacts(fn() { @sf.lit_in_node(slot) }, fn(lit) {
-            if lit { preset_trying.set(i) } else if preset_trying.untracked() == i { preset_trying.set(-1) }
+            if lit { ctx.preset_trying.set(i) } else if ctx.preset_trying.untracked() == i { ctx.preset_trying.set(-1) }
           })
-          slot.owns(fn() { if preset_trying.untracked() == i { preset_trying.set(-1) } }) |> ignore
+          slot.owns(fn() { if ctx.preset_trying.untracked() == i { ctx.preset_trying.set(-1) } }) |> ignore
           @sf.action_box_node(slot, title, fn(_) {
-            clear_fonts_undo()
+            ctx.clear_undo()
             for id in [preset.ui, preset.ui_cjk, preset.text, preset.text_cjk, preset.code, preset.code_cjk] {
               if id is Some(s) && s != "" {
                 @sfbase.face_retry(s)
@@ -330,22 +359,30 @@ fn font_slot_trigger_node(
     let script = script_label()
     if @sf.language() == "en" { role + " " + script } else { role + script }
   }
-  let is_open = fn() { font_picker_open.get() == slot_idx }
+  let is_open = fn() { fonts_picker_owner.get() == ctx.me && font_picker_open.get() == slot_idx }
   parent.box(fn(wrap) {
     wrap.grow(Is(1.0)).shrink(Is(1.0)).width(Is(Some(0.0))).min_width(Is(Some(0.0))) |> ignore
     let anchor : Ref[@view.View?] = Ref(None)
     let mine = Ref(0)
+    let close_mine = fn() {
+      if mine.val != 0 && @sf.presented_open_of(mine.val) {
+        @sf.close_presented_of(mine.val)
+      }
+      mine.val = 0
+    }
     @sf.action_box_node(
       wrap,
       a11y_label,
       fn(_) {
-        fonts_trying.set("")
-        if font_picker_open.untracked() == slot_idx {
+        ctx.fonts_trying.set("")
+        if fonts_picker_owner.untracked() == ctx.me && font_picker_open.untracked() == slot_idx {
+          fonts_picker_owner.set(0)
           font_picker_open.set(-1)
           local_open.set(false)
         } else {
           @settings.fonts_at.set(role_idx)
           @settings.fonts_script_at.set(if is_cjk { 1 } else { 0 })
+          fonts_picker_owner.set(ctx.me)
           font_picker_open.set(slot_idx)
           local_open.set(true)
         }
@@ -375,9 +412,7 @@ fn font_slot_trigger_node(
     ) |> ignore
     wrap.reacts(is_open, fn(on) {
       if !on {
-        if mine.val != 0 && @sf.presented_open_of(mine.val) {
-          @sf.close_presented_of(mine.val)
-        }
+        close_mine()
         return
       }
       guard mine.val == 0 || !@sf.presented_open_of(mine.val) else { return }
@@ -394,8 +429,9 @@ fn font_slot_trigger_node(
         side=panel_side,
         along=panel_along,
         gone=fn() {
-          fonts_trying.set("")
-          if font_picker_open.untracked() == slot_idx {
+          ctx.fonts_trying.set("")
+          if fonts_picker_owner.untracked() == ctx.me && font_picker_open.untracked() == slot_idx {
+            fonts_picker_owner.set(0)
             font_picker_open.set(-1)
             local_open.set(false)
           }
@@ -403,11 +439,8 @@ fn font_slot_trigger_node(
       )
       mine.val = @sf.last_presented()
     })
-    wrap.owns(fn() {
-      if mine.val != 0 && @sf.presented_open_of(mine.val) {
-        @sf.close_presented_of(mine.val)
-      }
-    }) |> ignore
+    wrap.on_rest(close_mine, while_covered=true) |> ignore
+    wrap.owns(close_mine) |> ignore
   }) |> ignore
 }
 
@@ -457,9 +490,9 @@ fn fp_divider_node(parent : @view.View) -> Unit {
 ///|
 /// Compact 1-row 2-column Reading Comfort card: 正文阅读字号 (left) + 正文行距 (right), zero wasted white voids.
 fn font_reading_bar_node(parent : @view.View, ctx : FontPageCtx) -> Unit {
-  let set_typo = fn(m : Map[String, Json]) { clear_fonts_undo(); @settings.set_typography(ctx.core, Json::object(m)) }
+  let set_typo = fn(m : Map[String, Json]) { ctx.clear_undo(); @settings.set_typography(ctx.core, Json::object(m)) }
   let lh_keys = ["compact", "normal", "relaxed"]
-  let text_v = fn() { text_size_drag.get().unwrap_or(font_typo_num(ctx.typo(), "textSize", 100.0)) }
+  let text_v = fn() { ctx.text_size_drag.get().unwrap_or(font_typo_num(ctx.typo(), "textSize", 100.0)) }
   parent.box(fn(sec) {
     @sf.style_node(sec, fn() { fp_v8_block_pad })
     sec.box(fn(card) {
@@ -484,7 +517,9 @@ fn font_reading_bar_node(parent : @view.View, ctx : FontPageCtx) -> Unit {
               ctrl,
               fn() { @sf.t("web-pages.appearance.fonts.advanced.textSize") },
               text_v,
-              fn(x) { text_size_drag.set(Some(x)) },
+              fn(x) {
+                ctx.text_size_drag.set(Some(x))
+              },
               min=85.0,
               max=130.0,
               step=5.0,
@@ -494,7 +529,7 @@ fn font_reading_bar_node(parent : @view.View, ctx : FontPageCtx) -> Unit {
                 let m : Map[String, Json] = Map([])
                 m["textSize"] = ToJson::to_json(x.round().to_int())
                 set_typo(m)
-                text_size_drag.set(None)
+                ctx.text_size_drag.set(None)
               },
             ).grow(Is(1.0)) |> ignore
             @sf.words_node(ctrl, fn() { "A" }, fn() { fp_v8_glyph_lg }) |> ignore
@@ -540,11 +575,11 @@ fn font_reading_bar_node(parent : @view.View, ctx : FontPageCtx) -> Unit {
 ///|
 /// Compact 2-column advanced typography card (global CJK scale/weight — zero role sub-switcher!).
 fn font_advanced_card_node(slot : @view.View, ctx : FontPageCtx) -> Unit {
-  let set_typo = fn(m : Map[String, Json]) { clear_fonts_undo(); @settings.set_typography(ctx.core, Json::object(m)) }
+  let set_typo = fn(m : Map[String, Json]) { ctx.clear_undo(); @settings.set_typography(ctx.core, Json::object(m)) }
   let w_vals = [-100, 0, 100]
-  let code_v = fn() { code_scale_drag.get().unwrap_or(font_typo_num(ctx.typo(), "codeScale", 100.0)) }
+  let code_v = fn() { ctx.code_scale_drag.get().unwrap_or(font_typo_num(ctx.typo(), "codeScale", 100.0)) }
   let cjk_v = fn() {
-    match cjk_scale_drag.get() {
+    match ctx.cjk_scale_drag.get() {
       Some(("*", v)) => v
       _ => font_typo_num(ctx.typo(), "uiCjkScale", 100.0)
     }
@@ -569,7 +604,9 @@ fn font_advanced_card_node(slot : @view.View, ctx : FontPageCtx) -> Unit {
           left,
           fn() { @sf.t("web-pages.appearance.fonts.advanced.codeScale") },
           code_v,
-          fn(x) { code_scale_drag.set(Some(x)) },
+          fn(x) {
+            ctx.code_scale_drag.set(Some(x))
+          },
           min=85.0,
           max=110.0,
           step=5.0,
@@ -579,7 +616,7 @@ fn font_advanced_card_node(slot : @view.View, ctx : FontPageCtx) -> Unit {
             let m : Map[String, Json] = Map([])
             m["codeScale"] = ToJson::to_json(x.round().to_int())
             set_typo(m)
-            code_scale_drag.set(None)
+            ctx.code_scale_drag.set(None)
           },
         ) |> ignore
       }) |> ignore
@@ -594,7 +631,9 @@ fn font_advanced_card_node(slot : @view.View, ctx : FontPageCtx) -> Unit {
           right,
           fn() { @sf.t("web-pages.appearance.fonts.advanced.cjkScale") },
           cjk_v,
-          fn(v) { cjk_scale_drag.set(Some(("*", v))) },
+          fn(v) {
+            ctx.cjk_scale_drag.set(Some(("*", v)))
+          },
           min=85.0,
           max=115.0,
           step=5.0,
@@ -608,7 +647,7 @@ fn font_advanced_card_node(slot : @view.View, ctx : FontPageCtx) -> Unit {
             let inherits = ctx.chosen_of("textCjk") == "" && ctx.chosen_of("uiCjk") != ""
             m["textCjkScale"] = if inherits { Json::null() } else { ToJson::to_json(pct) }
             set_typo(m)
-            cjk_scale_drag.set(None)
+            ctx.cjk_scale_drag.set(None)
           },
         ) |> ignore
       }) |> ignore
@@ -715,7 +754,7 @@ fn font_advanced_v8_node(parent : @view.View, ctx : FontPageCtx) -> Unit {
       }) |> ignore
       hdr.show(at_once=true, fn() { font_advanced_custom_count(ctx.typo()) > 0 }, fn(rw) {
         @sf.action_box_node(rw, fn() { @sf.t("web-pages.appearance.fonts.advanced.reset") }, fn(_) {
-          clear_fonts_undo()
+          ctx.clear_undo()
           let m : Map[String, Json] = Map([])
           for k in ["codeScale", "uiCjkScale", "textCjkScale", "codeCjkScale", "uiCjkWeight", "textCjkWeight", "codeCjkWeight", "codeLigatures", "cjkAutoSpace"] {
             m[k] = Json::null()

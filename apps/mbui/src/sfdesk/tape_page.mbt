@@ -45,6 +45,7 @@ fn tape_page_pane(v : @view.View, src : Source) -> Unit {
         None => None
       }
     })
+    @sfbase.configure_wide_kept_left_limits(src)
     @ui.nav_flat_view(
       panel,
       app.nav,
@@ -68,8 +69,8 @@ fn tape_page_pane(v : @view.View, src : Source) -> Unit {
       shown=fn(ks) { shown_keys.set(ks) },
       // (back its while the page is in use: the side panel's, the sidebar's first)
       takes_back=fn() { wide.tape_at.get() == Page },
-      // (a chat's page made as nodes left kept, taken back as it is opened again: sfbase's chat_page_left_key)
-      keeps_left=@sfbase.chat_page_left_key,
+      // (wide allowlist: chats and 5 audited settings kept at rest, per-kind quotas chat<=3, setting<=3, total<=6)
+      keeps_left=fn(p) { @sfbase.wide_page_left_key(src, p) },
       keeps_made=true,
       transition=@ui.NavTransition::layered(),
     )
@@ -311,7 +312,12 @@ fn tape_made(
         kind,
         fn(v : @view.View, _page : () -> Page, _under : Page?, stint : () -> Int, k : Int) {
           let told = fn(s : @sf.PageSaid) { tape_bar_of(k).page_said.set(Some(s)) }
-          v.switch_by(fn() { @sfbase.workspace_in_view(src).0.map(fn(w) { w.id }) }, fn(p, _id) {
+          v.switch_by(
+            fn() {
+              @sfbase.workspace_owners_version.get() |> ignore
+              @sfbase.workspace_in_view(src).0.map(fn(w) { (w.id, @sfbase.workspace_explicit_owner_of(w.id)) })
+            },
+            fn(p, _id) {
             // (what the page made in `p` does in the bar, its own while `p` is: given as it is made, let go with `p`
             // where none since gave the bar another's)
             let last_gen = Ref(0)
@@ -329,14 +335,19 @@ fn tape_made(
             |> ignore
             match @signals.untracked(fn() { @sfbase.workspace_in_view(src).0 }) {
               Some(w) => {
+                @sfbase.record_entry_identity(k, w.id)
                 let core = settings_core(src, w)
                 let here = fn() { @settings.here_of(core, w.id, w.name) }
                 @settings.frame(core, @signals.untracked(here))
                 // (a dialog a fixture's mode puts up over its page, before the page is made: setting_page's)
                 settings_fixture(src, core)
                 // (made in a panel of its own: lent to all it makes, however late, its cards the panel's: @sf.pane_lent)
-                p.lends(@sf.pane_lent, true) |> ignore
-                f(p, core, here, stint, told, acts)
+                p.grow(Is(1.0)).min_height(Is(Some(0.0))).lends(@sf.pane_lent, true) |> ignore
+                p.covered_box(fn() { wide.tape_at.get() != Page }, fn(a) {
+                  a.grow(Is(1.0)).min_height(Is(Some(0.0))) |> ignore
+                  f(a, core, here, stint, told, acts)
+                })
+                |> ignore
               }
               None => ()
             }
@@ -400,8 +411,14 @@ fn tape_made(
         (
           "place/remote",
           fn(v, _page, _under, _stint, k) {
-            v.switch_by(fn() { @sfbase.workspace_in_view(src).0.map(fn(w) { w.id }) }, fn(p, ws_id) {
-              guard ws_id is Some(wid) else { return }
+            v.switch_by(
+              fn() {
+                @sfbase.workspace_owners_version.get() |> ignore
+                @sfbase.workspace_in_view(src).0.map(fn(w) { (w.id, @sfbase.workspace_explicit_owner_of(w.id)) })
+              },
+              fn(p, ws_id) {
+              guard ws_id is Some((wid, _)) else { return }
+              @sfbase.record_entry_identity(k, wid)
               context_node(p)
               p.lends(@sf.pane_lent, true) |> ignore
               @sfpages.remote_workbench_node(
@@ -466,7 +483,7 @@ fn tape_made(
         context_node(p)
         // (recording while it is the one on top of the stack: its stay there, stint's)
         @sfpages.shortcuts_node(p, core, on_back=core.pop, frame=fn() { tape_made_frame }, active=fn() {
-          app.nav.top_stay().1 == stint()
+          wide.tape_at.get() == Page && app.nav.top_stay().1 == stint()
         }, said=told, width~)
       })
     Setting(Network) =>
@@ -715,6 +732,15 @@ fn tape_made(
         (
           @sfbase.chat_page_kind(),
           fn(v, _page, _under, stint, k) {
+            match @signals.untracked(fn() {
+              match app.nav.page_of(k) {
+                Some((Chat(r), _)) => Some(@sfbase.workspace_of(r.station))
+                _ => @sfbase.workspace_in_view(src).0.map(fn(w) { w.id })
+              }
+            }) {
+              Some(ws) if ws != "" => @sfbase.record_entry_identity(k, ws)
+              _ => ()
+            }
             // (its bar the tree's, over the page: chat_bar_wide_node, keeping clear of the panel's corners as a
             // page's bar on the tape does; the tape's head over it none, tape_bar_head)
             let page_src = @sfbase.chat_page_made(

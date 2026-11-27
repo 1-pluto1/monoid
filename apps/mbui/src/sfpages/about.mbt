@@ -27,6 +27,9 @@ pub fn about_node(
   said? : (@sf.PageSaid) -> Unit,
   width? : () -> Double,
 ) -> Unit {
+  let page_active = Ref(false)
+  let page_disposed = Ref(false)
+  let active_gen = Ref(0)
   // (this machine's station as its host says it, as it said it last, where the app looks after the station here
   // (local_station_managed: a Mac's, Windows', Linux's): a signal of that input, read again every few seconds from when
   // the page is made, as 本机 Station's page reads it, for it is added, stops and updates on its own time; "" elsewhere)
@@ -34,6 +37,23 @@ pub fn about_node(
   let host : @signals.Signal[String] = @signals.signal(if managed { @hostapi.app_said("local_station") } else { "" }, same=fn(a, b) {
     a == b
   })
+  v.when_active(while_covered=true, fn() {
+    page_active.val = true
+    active_gen.val += 1
+    if managed {
+      host.set(@hostapi.app_said("local_station"))
+    }
+    fn() { page_active.val = false }
+  })
+  |> ignore
+  v.owns(fn() { page_disposed.val = true }) |> ignore
+  let active_token = fn() {
+    if page_disposed.val || !page_active.val {
+      -1
+    } else {
+      active_gen.val
+    }
+  }
   if managed {
     v.while_active_every(@settings.local_read_ms, fn() {
       host.set(@hostapi.app_said("local_station"))
@@ -69,7 +89,7 @@ pub fn about_node(
       "version" =>
         section("web-pages.settings.nav.version", fn(s) {
           @sf.group_node(s, fn(g) {
-            version_rows_node(g, core)
+            version_rows_node(g, core, active_token)
             @sf.row_box_node(g, fn() { @sf.t("web-pages.settings.nav.changelog") }, press=fn() { (core.push)(Changelog) }, fn(row) {
               row.chevron()
             })
@@ -78,7 +98,7 @@ pub fn about_node(
       // this machine's station, under the app's own: its version and the way to its newer release
       "station" =>
         section("web-pages.localStation.title", fn(s) {
-          @sf.group_node(s, fn(g) { about_station_node(g, core, station, tips) })
+          @sf.group_node(s, fn(g) { about_station_node(g, core, managed, station, tips, active_token) })
         })
       // a build that sends nothing has nothing to turn off (a card of words on a wide page)
       "reporting" =>
@@ -135,12 +155,16 @@ pub fn about_node(
             )
             if opens {
               @sf.link_row_node(g, fn() { @sf.t("web-pages.about.perf.open") }, acts=true, fn() {
-                @hostapi.perf_open() |> ignore
+                if active_token() > 0 {
+                  @hostapi.perf_open() |> ignore
+                }
               })
             } else {
               g.show(fn() { size() > 0.0 }, fn(r) {
                 @sf.link_row_node(r, fn() { @sf.t("web-pages.about.perf.share") }, acts=true, fn() {
-                  @hostapi.share("", "still.fail-perf.log", "text/plain", @hostapi.perf_read()) |> ignore
+                  if active_token() > 0 {
+                    @hostapi.share("", "still.fail-perf.log", "text/plain", @hostapi.perf_read()) |> ignore
+                  }
                 })
               })
             }
@@ -162,7 +186,11 @@ pub fn about_node(
 /// (A spinner at its end while how far was not known, the bar only while it was, made the row taller and shorter again
 /// as it went, 2026-10-28. A button at the row's end took what its words left: the name cut to 「still.fail…」 on a
 /// phone, 2026-10-26.)
-fn version_rows_node(g : @view.View, core : Core) -> Unit {
+fn version_rows_node(
+  g : @view.View,
+  core : Core,
+  active_token : () -> Int,
+) -> Unit {
   // (its name as the core's preferences say it, still.fail where they say none)
   @sf.row_box_node(
     g,
@@ -181,6 +209,9 @@ fn version_rows_node(g : @view.View, core : Core) -> Unit {
       fn() { @sf.t("android-settings.version.auto") },
       fn() { @settings.pref(core, "appUpdate") != "off" },
       fn(on) {
+        if active_token() <= 0 {
+          return
+        }
         @settings.set_pref(core, "appUpdate", if on { "" } else { "off" })
         if on {
           (core.update_auto_on)()
@@ -191,7 +222,11 @@ fn version_rows_node(g : @view.View, core : Core) -> Unit {
   })
   // (what is done at once where it is, in the link's ink: checking, and the update's row under it)
   g.show(fn() { v().asks }, fn(r) {
-    @sf.row_box_node(r, fn() { @sf.t("android-settings.version.check") }, press=fn() { (core.version_check)() }, fn(row) {
+    @sf.row_box_node(r, fn() { @sf.t("android-settings.version.check") }, press=fn() {
+      if active_token() > 0 {
+        (core.version_check)()
+      }
+    }, fn(row) {
       row.title(tone=@sf.RowTone::RowAccent)
     })
   })
@@ -205,7 +240,11 @@ fn version_rows_node(g : @view.View, core : Core) -> Unit {
       open.said()
       open.value_at(r.drawn_while(fn(t) { open.goes_at(t) }))
     }
-    @sf.row_box_node(r, fn() { v().label }, press=fn() { (core.version_tap)() }, fn(row) {
+    @sf.row_box_node(r, fn() { v().label }, press=fn() {
+      if active_token() > 0 {
+        (core.version_tap)()
+      }
+    }, fn(row) {
       row.title(tone=@sf.RowTone::RowAccent)
       row.note(fn() { v().note })
       row.below(
@@ -227,6 +266,29 @@ fn version_rows_node(g : @view.View, core : Core) -> Unit {
 let version_bar_room : Double = 9.0
 
 ///|
+/// Authoritative station address parsed from live `local_station` JSON (`""` if uninstalled, removed, rig, or absent).
+fn host_station_address(v : Json?) -> String {
+  let ws = field(v, "workspace")
+  let gone = flag(v, "uninstalled") || flag(ws, "removed") || flag(ws, "rig")
+  if !gone && text(ws, "id") != "" && text(ws, "station") != "" {
+    text(ws, "id") + "/" + text(ws, "station")
+  } else {
+    ""
+  }
+}
+
+///|
+/// Synchronous authoritative local station address read directly from the host (never waiting on the 3s polling timer).
+fn live_local_station_address(managed : Bool) -> String {
+  if managed {
+    let parsed = Some(@json.parse(@hostapi.app_said("local_station")) catch { _ => Json::null() })
+    host_station_address(parsed)
+  } else {
+    this_machine()
+  }
+}
+
+///|
 /// 关于's 本机 Station: the station here updates on its own, apart from the app, and its newer release was said only on
 /// its own page, where it was missed (the user, 2026-11-10: 「关于菜单里面的那个更新，应该还有一个板块提及本机 station 的
 /// 更新，这样子大家就不会漏掉了」). `host`: what its host says of it (本机 Station's word). While it is up in a workspace
@@ -235,11 +297,24 @@ let version_bar_room : Double = 9.0
 /// (`stationPart`'s `updates`, its `station`), and why an update asked here failed under it. Otherwise (in no workspace
 /// of this account's, away, its software not read yet) its version as its host says it, and while it is away, that its
 /// update is seen once it is up.
-fn about_station_node(g : @view.View, core : Core, host : () -> Json?, tips : @sf.TipLayer) -> Unit {
-  // (its address in its workspace as the block is made, "" where it is in none: this_machine's)
-  let address = this_machine()
+fn about_station_node(
+  g : @view.View,
+  core : Core,
+  managed : Bool,
+  host : () -> Json?,
+  tips : @sf.TipLayer,
+  active_token : () -> Int,
+) -> Unit {
+  // (its address in its workspace as it stands now from live host JSON, never the stale `this_machine()` cache)
+  let cur_address = fn() {
+    if managed {
+      host_station_address(host())
+    } else {
+      this_machine()
+    }
+  }
   // (that workspace as this account is in it; none where it is not, and nothing of it asked then)
-  let here = fn() -> Here? {
+  let here = fn(address : String) -> Here? {
     guard address != "" else { return None }
     let h = @settings.here_of(core, @settings.workspace_of(address), "")
     if h.sub == "" {
@@ -249,41 +324,57 @@ fn about_station_node(g : @view.View, core : Core, host : () -> Json?, tips : @s
     }
   }
   // (its row in its workspace's stations)
-  let row = fn() -> Json? {
-    guard here() is Some(h) else { return None }
+  let row = fn(address : String) -> Json? {
+    guard here(address) is Some(h) else { return None }
     match @settings.stations_of(core, h).value {
       Some(Array(rows)) => rows.iter().find_first(fn(r) { text(Some(r), "station") == address })
       _ => None
     }
   }
   // (its own software, while it is up)
-  let own = fn() -> Json? {
-    guard here() is Some(h) else { return None }
-    guard flag(row(), "online") else { return None }
+  let own = fn(address : String) -> Json? {
+    guard here(address) is Some(h) else { return None }
+    guard flag(row(address), "online") else { return None }
     match @settings.station_part(core, h, address, "updates") {
       Some(Array(updates)) => updates.iter().find_first(fn(u) { text(Some(u), "id") == "station" })
       _ => None
     }
   }
   // (its workspace's owners and admins: theirs to turn its 自动更新, as on its page)
-  let manager = fn() {
-    guard here() is Some(h) else { return false }
+  let manager = fn(address : String) {
+    guard here(address) is Some(h) else { return false }
     let role = text(@settings.workspace_view(core, h).value, "role")
     role == "owner" || role == "admin"
   }
   g.pick(
     fn() {
-      let up = own() is Some(_)
-      (up, up && manager())
+      let address = cur_address()
+      let up = own(address) is Some(_)
+      (address, up, up && manager(address))
     },
     fn(r, k) {
-      if k.0 {
+      let (address, up, is_mgr) = k
+      if up {
+        let guarded_core : Core = {
+          ..core,
+          call: fn(name, params, done) {
+            // Re-verify live role, synchronous host station address, online state, and page liveness at invocation time
+            // (guards against role downgrade, host station change within the 3s poll window, and stale park/wake clicks).
+            let allowed = active_token() > 0 &&
+              address != "" &&
+              live_local_station_address(managed) == address &&
+              @signals.untracked(fn() { own(address) is Some(_) && manager(address) })
+            if allowed {
+              (core.call)(name, params, done)
+            }
+          },
+        }
         software_row_node(
           r,
-          core,
+          guarded_core,
           address,
-          own,
-          k.1,
+          fn() { own(address) },
+          is_mgr,
           fn() {
             is_doing(core, ["software.updateAll"], [("station", address)]) ||
             is_doing(core, ["software.update"], [("station", address), ("id", "station")])
@@ -291,6 +382,7 @@ fn about_station_node(g : @view.View, core : Core, host : () -> Json?, tips : @s
           fn() { false },
           fn() { true },
           tips,
+          active_token~,
         )
       } else {
         said_row_node(
@@ -302,7 +394,7 @@ fn about_station_node(g : @view.View, core : Core, host : () -> Json?, tips : @s
             }
           },
           note=fn() {
-            if row() is Some(_) && !flag(row(), "online") {
+            if row(address) is Some(_) && !flag(row(address), "online") {
               @sf.t("web-pages.stations.softwareOffline")
             } else {
               ""
@@ -313,9 +405,9 @@ fn about_station_node(g : @view.View, core : Core, host : () -> Json?, tips : @s
     },
   )
   // (why an update asked here failed, under it: as under its page's software)
-  g.show(fn() { software_failed.get(address) is Some(_) }, fn(foot) {
+  g.show(fn() { software_failed.get(cur_address()) is Some(_) }, fn(foot) {
     @sf.style_node(foot, fn() { sw_foot })
-    @sf.words_node(foot, fn() { software_failed.get(address).unwrap_or("") }, fn() { sw_failed_line }) |> ignore
+    @sf.words_node(foot, fn() { software_failed.get(cur_address()).unwrap_or("") }, fn() { sw_failed_line }) |> ignore
   })
 }
 

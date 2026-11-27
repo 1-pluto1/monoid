@@ -737,6 +737,32 @@ pub fn workspace_explicit_owner_of(ws : String) -> String? {
 }
 
 ///|
+/// Clear any cached explicit owner for `ws` on a `Workspace(ws)` auth boundary until the next authoritative
+/// `workspaces` snapshot arrives, without disturbing unrelated workspaces. Marks `ws` as pending explicit loss so
+/// an unloaded fallback candidate cannot be prematurely confirmed, and emits a targeted `(ws, old, "")` revocation.
+pub fn workspace_owner_invalidate(ws : String) -> Unit {
+  guard ws != "" else { return }
+  let old_owner = workspace_owners.get(ws)
+  let was_revoked = workspace_revoked.get(ws) == Some(true)
+  let was_pending = workspace_pending_ws.contains(ws)
+  let was_explicit_loss = workspace_pending_explicit_loss.contains(ws)
+  workspace_owners.remove(ws)
+  workspace_pending_ws[ws] = true
+  workspace_pending_explicit_loss[ws] = true
+  workspace_revoked.remove(ws)
+  if old_owner is Some(_) || was_revoked || !was_pending || !was_explicit_loss {
+    workspace_owners_version.set(workspace_owners_version.untracked() + 1)
+  }
+  match old_owner {
+    Some(old) if old != "" =>
+      for f in workspace_owner_change_listeners {
+        f(ws, old, "")
+      }
+    _ => ()
+  }
+}
+
+///|
 /// Workspaces that disappeared from a complete `workspaces` snapshot (no signed-in account still has access).
 /// Distinguished from "snapshot not yet received" so `workspace_owner_of` never falls back to `account_principal_sig`.
 // kept across runs: put back as a run begins (last_reset)
@@ -970,7 +996,10 @@ pub fn workspace_owners_sync_json(v : Json?) -> Unit {
   if has_core_owned {
     for id, pair in core_owned {
       let (owner, acc_loaded) = pair
-      if !acc_loaded && (workspace_pending_explicit_loss.contains(id) || prev_owner_lost(id, owner)) {
+      let was_explicitly_lost = workspace_pending_explicit_loss.contains(id) ||
+        workspace_revoked.get(id) == Some(true) ||
+        prev_owner_lost(id, owner)
+      if !acc_loaded && was_explicitly_lost {
         pending_ws[id] = true
         next_explicit_loss[id] = true
       } else {
@@ -980,7 +1009,9 @@ pub fn workspace_owners_sync_json(v : Json?) -> Unit {
     for id, _ in listed_ws {
       if !seen.contains(id) && !pending_ws.contains(id) {
         pending_ws[id] = true
-        if workspace_pending_explicit_loss.contains(id) || prev_owner_lost(id, "") {
+        if workspace_pending_explicit_loss.contains(id) ||
+          workspace_revoked.get(id) == Some(true) ||
+          prev_owner_lost(id, "") {
           next_explicit_loss[id] = true
         }
       }
@@ -1015,11 +1046,12 @@ pub fn workspace_owners_sync_json(v : Json?) -> Unit {
         for w in ws_list {
           let id = text(Some(w), "id")
           if id != "" && !seen.contains(id) {
+            let was_revoked = workspace_revoked.get(id) == Some(true)
             if earlier_unloaded_empty && workspace_owners.get(id) != Some(owner) {
               pending_ws[id] = true
-            } else if workspace_pending_ws.contains(id) || prev_owner_lost(id, owner) {
+            } else if workspace_pending_ws.contains(id) || was_revoked || prev_owner_lost(id, owner) {
               pending_ws[id] = true
-              if workspace_pending_explicit_loss.contains(id) || prev_owner_lost(id, owner) {
+              if workspace_pending_explicit_loss.contains(id) || was_revoked || prev_owner_lost(id, owner) {
                 next_explicit_loss[id] = true
               }
             } else {
@@ -1043,9 +1075,13 @@ pub fn workspace_owners_sync_json(v : Json?) -> Unit {
   }
   workspace_owners_seen_snapshot.val = true
   let prev_pending_ws = workspace_pending_ws.keys().collect()
+  let prev_explicit_loss = workspace_pending_explicit_loss.copy()
   workspace_pending_ws.clear()
   for id, _ in pending_ws {
     if !seen.contains(id) {
+      if prev_explicit_loss.contains(id) || workspace_revoked.get(id) == Some(true) {
+        next_explicit_loss[id] = true
+      }
       workspace_pending_ws[id] = true
       workspace_revoked.remove(id)
     }
@@ -1093,6 +1129,8 @@ pub fn workspace_owners_sync_json(v : Json?) -> Unit {
       for f in workspace_owner_change_listeners {
         f(ws, "\u{3}revoked", owner)
       }
+    } else if prev_explicit_loss.contains(ws) {
+      workspace_owners[ws] = owner
     } else {
       workspace_owner_set(ws, owner)
     }

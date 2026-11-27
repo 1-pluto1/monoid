@@ -8,8 +8,15 @@ pub fn wire_core_client(client : @core.Client, src : Source) -> () -> Unit {
   client.sanitize_kept(@sfbase.sanitize_kept_json)
   let unsub = client.on_auth_boundary(fn(scope) {
     match scope {
-      Global | VaultAll => (@sfbase.clear_vault_secrets.val)("", "")
-      Workspace(ws) => (@sfbase.clear_vault_secrets.val)(ws, "")
+      Global => {
+        (@sfbase.clear_vault_secrets.val)("", "")
+        @sfbase.kept_left_invalidate_global()
+      }
+      VaultAll => (@sfbase.clear_vault_secrets.val)("", "")
+      Workspace(ws) => {
+        (@sfbase.clear_vault_secrets.val)(ws, "")
+        @sfbase.kept_left_invalidate_workspace(ws)
+      }
       Vault(ws, v) => (@sfbase.clear_vault_secrets.val)(ws, v)
       VaultWorkspace(_) => ()
     }
