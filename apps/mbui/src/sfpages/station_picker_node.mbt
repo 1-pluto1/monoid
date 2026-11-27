@@ -12,19 +12,21 @@ let station_table_from : Int = 6
 
 ///|
 /// Table column widths (pt) shared strictly between header cells and data cells.
-let sp_col_running_w : Double = 56.0
+/// Sized to accommodate both Chinese and English column headers alongside the permanent 12pt sort indicator slot
+/// while leaving enough room for station names at 600pt desk/touch widths.
+let sp_col_running_w : Double = 66.0
 
 ///|
-let sp_col_cpu_w : Double = 52.0
+let sp_col_cpu_w : Double = 50.0
 
 ///|
-let sp_col_mem_w : Double = 70.0
+let sp_col_mem_w : Double = 68.0
 
 ///|
-let sp_col_disk_w : Double = 68.0
+let sp_col_disk_w : Double = 62.0
 
 ///|
-let sp_col_net_w : Double = 128.0
+let sp_col_net_w : Double = 116.0
 
 ///|
 let sp_mark_size : Double = 16.0
@@ -40,17 +42,6 @@ let sp_table_row_min_h : Double = 36.0
 
 ///|
 let sp_table_row_pad_y : Double = 14.0
-
-///|
-#derive(Eq)
-priv enum StationSortCol {
-  Name
-  Running
-  Cpu
-  Memory
-  Disk
-  Network
-}
 
 ///|
 priv struct StationPickEntry {
@@ -76,27 +67,31 @@ priv struct StationPickRole {
 /// The many-station picker's rows and what it is searched and sorted by, shared by its wide table and narrow drawer.
 priv struct StationPickList {
   entries : Array[StationPickEntry]
+  entry_by_key : Map[String, Int]
   busy : @signals.Computed[Bool]
   query_field : @ui.Field
   search_at : @signals.Signal[Int]
   navigated : @signals.Signal[Bool]
-  sort_col : @signals.Signal[StationSortCol?]
-  sort_asc : @signals.Signal[Bool]
+  sort : @signals.Signal[@sf.TableSort?]
   visible_indices : @signals.Computed[Array[Int]]
+  visible_keys : @signals.Computed[Array[String]]
 }
 
 ///|
 fn station_pick_list(src : Source, stations : Array[Json]) -> StationPickList {
   let entries : Array[StationPickEntry] = []
+  let entry_by_key : Map[String, Int] = Map([])
   for i, s in stations {
     let st = Some(s)
     let addr = text(st, "station")
     let id = text(st, "id")
     let name = text(st, "name")
     let net = src.topic("stationNet", { "station": Json::string(addr) })
+    let key = if addr != "" { addr } else { id + "#" + i.to_string() }
+    entry_by_key[key] = i
     entries.push({
       index: i,
-      key: if addr != "" { addr } else { id + "#" + i.to_string() },
+      key,
       id,
       name: if name != "" { name } else { addr },
       station: s,
@@ -105,8 +100,7 @@ fn station_pick_list(src : Source, stations : Array[Json]) -> StationPickList {
   }
   let busy = @signals.computed(fn(_) { cpu_busy(src) })
   let query_field = @ui.Field::new()
-  let sort_col : @signals.Signal[StationSortCol?] = @signals.signal(None)
-  let sort_asc : @signals.Signal[Bool] = @signals.signal(true)
+  let sort : @signals.Signal[@sf.TableSort?] = @signals.signal(None)
   let visible_indices = @signals.computed(fn(_) {
     let q = query_field.text()
     let matched : Array[StationPickEntry] = []
@@ -115,25 +109,27 @@ fn station_pick_list(src : Source, stations : Array[Json]) -> StationPickList {
         matched.push(e)
       }
     }
-    match sort_col.get() {
-      Some(col) => {
-        let asc = sort_asc.get()
+    match sort.get() {
+      Some(ts) => {
+        let asc = ts.dir is Asc
         let b = busy.get()
-        matched.sort_by(fn(a, c) { sp_compare_entries(a, c, col, asc, b) })
+        matched.sort_by(fn(a, c) { sp_compare_entries(a, c, ts.col, asc, b) })
       }
       None => ()
     }
     matched.map(fn(e) { e.index })
   })
+  let visible_keys = @signals.computed(fn(_) { visible_indices.get().map(fn(i) { entries[i].key }) })
   {
     entries,
+    entry_by_key,
     busy,
     query_field,
     search_at: @signals.signal(0),
     navigated: @signals.signal(false),
-    sort_col,
-    sort_asc,
+    sort,
     visible_indices,
+    visible_keys,
   }
 }
 
@@ -161,14 +157,8 @@ fn StationPickList::enter(self : StationPickList, role : StationPickRole) -> Uni
 }
 
 ///|
-fn StationPickList::toggle_sort(self : StationPickList, col : StationSortCol) -> Unit {
-  match self.sort_col.untracked() {
-    Some(cur) if cur == col => self.sort_asc.set(!self.sort_asc.untracked())
-    _ => {
-      self.sort_col.set(Some(col))
-      self.sort_asc.set(sp_default_asc(col))
-    }
-  }
+fn StationPickList::toggle_sort(self : StationPickList, col : String) -> Unit {
+  @sf.toggle_table_sort(self.sort, col, default_dir=sp_default_dir(col), allow_clear=false)
   self.search_at.set(0)
 }
 
@@ -634,10 +624,10 @@ fn sp_entry_matches(q : String, entry : StationPickEntry) -> Bool {
 
 ///|
 /// Default sort direction on first click of a column header.
-fn sp_default_asc(col : StationSortCol) -> Bool {
+fn sp_default_dir(col : String) -> @sf.SortDir {
   match col {
-    Name | Running | Cpu | Network => true
-    Memory | Disk => false
+    "memory" | "disk" => Desc
+    _ => Asc
   }
 }
 
@@ -666,7 +656,7 @@ fn sp_cmp_opt_double(a : Double?, b : Double?, asc : Bool) -> Int {
 fn sp_compare_entries(
   a : StationPickEntry,
   b : StationPickEntry,
-  col : StationSortCol,
+  col : String,
   asc : Bool,
   busy : Bool,
 ) -> Int {
@@ -675,18 +665,18 @@ fn sp_compare_entries(
   let oa = flag(sa, "online")
   let ob = flag(sb, "online")
   let primary = match col {
-    Name => {
+    "name" => {
       let na = a.name.to_lower()
       let nb = b.name.to_lower()
       let c = na.compare(nb)
       if asc { c } else { -c }
     }
-    Running => {
+    "running" => {
       let va = if oa { Some(number(field(field(sa, "overview"), "counts"), "running")) } else { None }
       let vb = if ob { Some(number(field(field(sb, "overview"), "counts"), "running")) } else { None }
       sp_cmp_opt_double(va, vb, asc)
     }
-    Cpu => {
+    "cpu" => {
       let cpu_used = fn(st : Json?, on : Bool) -> Double? {
         if !on { return None }
         let ms = @settings.meters_said(items(field(st, "host"), "meters"), busy)
@@ -697,25 +687,26 @@ fn sp_compare_entries(
       }
       sp_cmp_opt_double(cpu_used(sa, oa), cpu_used(sb, ob), asc)
     }
-    Memory => {
+    "memory" => {
       let mem_gb = fn(st : Json?, on : Bool) -> Double? {
         if !on { return None }
         sp_meter_gb(sp_meter_of(items(field(st, "host"), "meters"), 1))
       }
       sp_cmp_opt_double(mem_gb(sa, oa), mem_gb(sb, ob), asc)
     }
-    Disk => {
+    "disk" => {
       let disk_gb = fn(st : Json?, on : Bool) -> Double? {
         if !on { return None }
         sp_meter_gb(sp_meter_of(items(field(st, "host"), "meters"), 2))
       }
       sp_cmp_opt_double(disk_gb(sa, oa), disk_gb(sb, ob), asc)
     }
-    Network => {
+    "network" => {
       let va = if oa { sp_net_rtt_ms(a.net.get().value) } else { None }
       let vb = if ob { sp_net_rtt_ms(b.net.get().value) } else { None }
       sp_cmp_opt_double(va, vb, asc)
     }
+    _ => 0
   }
   if primary != 0 {
     primary
@@ -823,7 +814,7 @@ fn sp_wide_table_node(
   pill~ : (@view.View) -> Unit,
 ) -> Unit {
   let tips = body.lent(@sf.panel_tips_lent)
-  let { entries, busy, visible_indices, sort_col, sort_asc, .. } = list
+  let { entries, entry_by_key, busy, visible_keys, sort, .. } = list
   let toggle_sort = fn(col) { list.toggle_sort(col) }
   // Top bar: full-width search + optional pill
   body.box(fn(top) {
@@ -836,206 +827,200 @@ fn sp_wide_table_node(
     pill(top)
   })
   |> ignore
-  // Sortable table header + hairline divider + scrollable body grouped tightly (no excess dialog column gap)
-  body.box(fn(tbl) {
-    @sf.style_node(tbl, fn() { sp_table_wrap })
-    tbl.box(fn(hdr) {
-      @sf.style_node(hdr, fn() { sp_table_header })
-      sp_sort_head_cell(hdr, Name, fn() { @sf.t("web-main.newChat.stationColStation") }, None, true, sort_col, sort_asc, toggle_sort)
-      sp_sort_head_cell(hdr, Running, fn() { @sf.t("web-main.newChat.stationColRunning") }, Some(sp_col_running_w), false, sort_col, sort_asc, toggle_sort)
-      sp_sort_head_cell(hdr, Cpu, fn() { @sf.t("web-main.newChat.stationColCpu") }, Some(sp_col_cpu_w), false, sort_col, sort_asc, toggle_sort)
-      sp_sort_head_cell(hdr, Memory, fn() { @sf.t("web-main.newChat.stationColMemory") }, Some(sp_col_mem_w), false, sort_col, sort_asc, toggle_sort)
-      sp_sort_head_cell(hdr, Disk, fn() { @sf.t("web-main.newChat.stationColDisk") }, Some(sp_col_disk_w), false, sort_col, sort_asc, toggle_sort)
-      sp_sort_head_cell(hdr, Network, fn() { @sf.t("web-main.newChat.stationColNetwork") }, Some(sp_col_net_w), false, sort_col, sort_asc, toggle_sort)
+  // Sortable table header + hairline divider + non-virtualized scrollable body via `@sf.data_table_node(Plain)`
+  @sf.data_table_node(body, surface=Plain, max_height=fn() { sp_table_body_max_h }, fn(dt) {
+    dt.head(fn(h) {
+      h.col(fn() { @sf.t("web-main.newChat.stationColStation") }, sort_key="name", sort=fn() { sort.get() }, on_sort=toggle_sort)
+      h.col(
+        fn() { @sf.t("web-main.newChat.stationColRunning") },
+        width=fn() { Some(sp_col_running_w) },
+        align=End,
+        sort_key="running",
+        sort=fn() { sort.get() },
+        on_sort=toggle_sort,
+      )
+      h.col(
+        fn() { @sf.t("web-main.newChat.stationColCpu") },
+        width=fn() { Some(sp_col_cpu_w) },
+        align=End,
+        sort_key="cpu",
+        sort=fn() { sort.get() },
+        on_sort=toggle_sort,
+      )
+      h.col(
+        fn() { @sf.t("web-main.newChat.stationColMemory") },
+        width=fn() { Some(sp_col_mem_w) },
+        align=End,
+        sort_key="memory",
+        sort=fn() { sort.get() },
+        on_sort=toggle_sort,
+      )
+      h.col(
+        fn() { @sf.t("web-main.newChat.stationColDisk") },
+        width=fn() { Some(sp_col_disk_w) },
+        align=End,
+        sort_key="disk",
+        sort=fn() { sort.get() },
+        on_sort=toggle_sort,
+      )
+      h.col(
+        fn() { @sf.t("web-main.newChat.stationColNetwork") },
+        width=fn() { Some(sp_col_net_w) },
+        align=End,
+        sort_key="network",
+        sort=fn() { sort.get() },
+        on_sort=toggle_sort,
+      )
     })
-    |> ignore
-    tbl.box(fn(d) {
-      @sf.style_node(d, fn() { sp_header_rule_wrap })
-      d.box(fn(line) { @sf.style_node(line, fn() { @sf.rule_line }) }) |> ignore
+    dt.empty(fn(empty) {
+      @sf.style_node(empty, fn() { sp_empty_box })
+      @sf.words_node(empty, fn() { @sf.t("common.noMatch") }, fn() { sp_empty_words }) |> ignore
     })
-    |> ignore
-    // Scrollable table body
-    @sf.capped_node(tbl, fn() { sp_table_body_max_h }, fn(rows) {
-      // (apart as rows that light up stand: the keys' row kept lit beside the hand's)
-      rows.gap(Is(@sf.lit_apart)) |> ignore
-      rows.show(at_once=true, fn() { visible_indices.get().is_empty() }, fn(empty) {
-        @sf.style_node(empty, fn() { sp_empty_box })
-        @sf.words_node(empty, fn() { @sf.t("common.noMatch") }, fn() { sp_empty_words }) |> ignore
-      })
-      rows.each(fn() { visible_indices.get() }, fn(i) { i }, fn(row_host, i_sig) {
-        let idx = i_sig.untracked()
-        let entry = entries[idx]
-        let st = Some(entry.station)
-        let online = flag(st, "online")
-        let running = number(field(field(st, "overview"), "counts"), "running")
-        let chosen = fn() { (role.chosen)(entry) }
-        let press = fn() {
-          list.pointed_at(idx)
-          (role.press)(entry)
-        }
-        let meters = @signals.computed(fn(_) { @settings.meters_said(items(field(st, "host"), "meters"), busy.get()) })
-        @sf.action_box_node(
-          row_host,
-          fn() { entry.name },
-          fn(_) { press() },
-          check=fn() { if chosen() { On } else { Off } },
-          fn(row) {
-            @sf.style_node(row, fn() { sp_table_row.then(@ui.style(radius=@sf.panel_in)) })
-            row.min_height(By(fn() { Some(dmax(sp_table_row_min_h, @sf.theme().t.ui_line + sp_table_row_pad_y)) }))
-            |> ignore
-            @sf.hover_ground_node(
-              row,
-              lit=Some(fn() { (@sf.hovered_in_node(row) && !list.keys_elsewhere(idx)) || row.focus_shown() }),
-              extra=fn() { list.highlighted(idx) },
-            )
-            // (the hand come onto a row after the keys stepped: the hand's again, the keys' row no longer kept lit)
-            row.reacts(fn() { @sf.hovered_in_node(row) }, fn(on) {
-              if on {
-                list.navigated.set(false)
-              }
-            })
-            @sf.rippled_node(row, press, @sf.row_corner, fn() { entry.name })
-            // Column 1: (check box +) Station mark + name (with repeats=true tooltip on name node) (+ check)
-            row.box(fn(c1) {
-              @sf.style_node(c1, fn() { sp_cell_station }, in_row=true)
-              c1.grow(Is(1.0)).basis(Is(Some(0.0))).shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
-              if role.many {
-                sp_check_box(c1, chosen)
-              }
-              sp_station_mark_box(c1, st, single_line=true)
-              let name_v = @sf.words_node(c1, fn() { entry.name }, fn() { sp_row_name })
-                .grow(Is(1.0))
-                .basis(Is(Some(0.0)))
-                .shrink(Is(1.0))
-                .min_width(Is(Some(0.0)))
-                .cuts(Is(true))
-                .allow_ellipsis(Is(true))
-              if tips is Some(tl) {
-                @sf.tip_node(tl, name_v, fn() { entry.name }, within=true, repeats=true, pressed=fn() { row.pressed() })
-                |> ignore
-              }
-              if !role.many {
-                c1.show(at_once=true, chosen, fn(k) {
-                  k.row(Is(true)).lines_up(Is(Some(Middle))) |> ignore
-                  @sf.icon_node(k, "check", new_mark, By(fn() { @sf.theme().p.accent_text })) |> ignore
-                })
-              }
-            })
-            |> ignore
-            // Column 2: Running
-            row.box(fn(c2) {
-              @sf.style_node(c2, fn() { sp_cell_num }, in_row=true)
-              c2.width(Is(Some(sp_col_running_w))).shrink(Is(0.0)) |> ignore
-              if online && running > 0.0 {
-                @sf.state_dot_node(c2, fn() { "up" }, size=station_dot_side)
-                @sf.words_node(c2, fn() { running.to_int().to_string() }, fn() { sp_cell_accent }) |> ignore
-              } else if online {
-                @sf.words_node(c2, fn() { @sf.t("web-main.newChat.stationIdle") }, fn() { sp_cell_muted }) |> ignore
-              } else {
-                @sf.state_dot_node(c2, fn() { "offline" }, size=station_dot_side)
-                @sf.words_node(c2, fn() { text(st, "summary") }, fn() { sp_cell_muted })
-                .shrink(Is(1.0))
-                .min_width(Is(Some(0.0)))
-                .cuts(Is(true))
-                .allow_ellipsis(Is(true))
-                |> ignore
-              }
-            })
-            |> ignore
-            // Column 3: CPU
-            row.box(fn(c3) {
-              @sf.style_node(c3, fn() { sp_cell_num }, in_row=true)
-              c3.width(Is(Some(sp_col_cpu_w))).shrink(Is(0.0)) |> ignore
-              if online {
-                let m = fn() { sp_meter_of(meters.get(), 0) }
-                @sf.words_node(c3, fn() { sp_meter_wide(m()) }, fn() { sp_table_meter_style(text(m(), "level")) })
-                |> ignore
-              } else {
-                @sf.words_node(c3, fn() { "—" }, fn() { sp_cell_muted }) |> ignore
-              }
-            })
-            |> ignore
-            // Column 4: Memory
-            row.box(fn(c4) {
-              @sf.style_node(c4, fn() { sp_cell_num }, in_row=true)
-              c4.width(Is(Some(sp_col_mem_w))).shrink(Is(0.0)) |> ignore
-              if online {
-                let m = fn() { sp_meter_of(meters.get(), 1) }
-                @sf.words_node(c4, fn() { sp_meter_wide(m()) }, fn() { sp_table_meter_style(text(m(), "level")) })
-                |> ignore
-              } else {
-                @sf.words_node(c4, fn() { "—" }, fn() { sp_cell_muted }) |> ignore
-              }
-            })
-            |> ignore
-            // Column 5: Disk
-            row.box(fn(c5) {
-              @sf.style_node(c5, fn() { sp_cell_num }, in_row=true)
-              c5.width(Is(Some(sp_col_disk_w))).shrink(Is(0.0)) |> ignore
-              if online {
-                let m = fn() { sp_meter_of(meters.get(), 2) }
-                @sf.words_node(c5, fn() { sp_meter_wide(m()) }, fn() { sp_table_meter_style(text(m(), "level")) })
-                |> ignore
-              } else {
-                @sf.words_node(c5, fn() { "—" }, fn() { sp_cell_muted }) |> ignore
-              }
-            })
-            |> ignore
-            // Column 6: Network
-            row.box(fn(c6) {
-              @sf.style_node(c6, fn() { sp_cell_num }, in_row=true)
-              c6.width(Is(Some(sp_col_net_w))).shrink(Is(0.0)) |> ignore
-              if online {
-                @sf.words_node(c6, fn() { sp_net_wide(entry.net.get().value) }, fn() { sp_cell_muted })
-                .shrink(Is(1.0))
-                .min_width(Is(Some(0.0)))
-                .cuts(Is(true))
-                .allow_ellipsis(Is(true))
-                |> ignore
-              } else {
-                @sf.words_node(c6, fn() { "—" }, fn() { sp_cell_muted }) |> ignore
-              }
-            })
-            |> ignore
-          },
-        )
-        |> ignore
-      })
+    dt.rows(fn() { visible_keys.get() }, fn(tr, row_key) {
+      guard entry_by_key.get(row_key) is Some(idx) else { return }
+      let entry = entries[idx]
+      let st = Some(entry.station)
+      let online = flag(st, "online")
+      let running = number(field(field(st, "overview"), "counts"), "running")
+      let chosen = fn() { (role.chosen)(entry) }
+      let press = fn() {
+        list.pointed_at(idx)
+        (role.press)(entry)
+      }
+      let meters = @signals.computed(fn(_) { @settings.meters_said(items(field(st, "host"), "meters"), busy.get()) })
+      @sf.action_box_node(
+        tr.view(),
+        fn() { entry.name },
+        fn(_) { press() },
+        check=fn() { if chosen() { On } else { Off } },
+        fn(row) {
+          @sf.style_node(row, fn() { sp_table_row.then(@ui.style(radius=@sf.panel_in)) })
+          row.min_height(By(fn() { Some(dmax(sp_table_row_min_h, @sf.theme().t.ui_line + sp_table_row_pad_y)) }))
+          |> ignore
+          @sf.hover_ground_node(
+            row,
+            lit=Some(fn() { (@sf.hovered_in_node(row) && !list.keys_elsewhere(idx)) || row.focus_shown() }),
+            extra=fn() { list.highlighted(idx) },
+          )
+          // (the hand come onto a row after the keys stepped: the hand's again, the keys' row no longer kept lit)
+          row.reacts(fn() { @sf.hovered_in_node(row) }, fn(on) {
+            if on {
+              list.navigated.set(false)
+            }
+          })
+          @sf.rippled_node(row, press, @sf.row_corner, fn() { entry.name })
+          // Column 1: (check box +) Station mark + name (with repeats=true tooltip on name node) (+ check)
+          row.box(fn(c1) {
+            tr.mark_cell(c1)
+            @sf.style_node(c1, fn() { sp_cell_station }, in_row=true)
+            c1.grow(Is(1.0)).basis(Is(Some(0.0))).shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
+            if role.many {
+              sp_check_box(c1, chosen)
+            }
+            sp_station_mark_box(c1, st, single_line=true)
+            let name_v = @sf.words_node(c1, fn() { entry.name }, fn() { sp_row_name })
+              .grow(Is(1.0))
+              .basis(Is(Some(0.0)))
+              .shrink(Is(1.0))
+              .min_width(Is(Some(0.0)))
+              .cuts(Is(true))
+              .allow_ellipsis(Is(true))
+            if tips is Some(tl) {
+              @sf.tip_node(tl, name_v, fn() { entry.name }, within=true, repeats=true, pressed=fn() { row.pressed() })
+              |> ignore
+            }
+            if !role.many {
+              c1.show(at_once=true, chosen, fn(k) {
+                k.row(Is(true)).lines_up(Is(Some(Middle))) |> ignore
+                @sf.icon_node(k, "check", new_mark, By(fn() { @sf.theme().p.accent_text })) |> ignore
+              })
+            }
+          })
+          |> ignore
+          // Column 2: Running
+          row.box(fn(c2) {
+            tr.mark_cell(c2)
+            @sf.style_node(c2, fn() { sp_cell_num }, in_row=true)
+            c2.width(Is(Some(sp_col_running_w))).shrink(Is(0.0)) |> ignore
+            if online && running > 0.0 {
+              @sf.state_dot_node(c2, fn() { "up" }, size=station_dot_side)
+              @sf.words_node(c2, fn() { running.to_int().to_string() }, fn() { sp_cell_accent }) |> ignore
+            } else if online {
+              @sf.words_node(c2, fn() { @sf.t("web-main.newChat.stationIdle") }, fn() { sp_cell_muted }) |> ignore
+            } else {
+              @sf.state_dot_node(c2, fn() { "offline" }, size=station_dot_side)
+              @sf.words_node(c2, fn() { text(st, "summary") }, fn() { sp_cell_muted })
+              .shrink(Is(1.0))
+              .min_width(Is(Some(0.0)))
+              .cuts(Is(true))
+              .allow_ellipsis(Is(true))
+              |> ignore
+            }
+          })
+          |> ignore
+          // Column 3: CPU
+          row.box(fn(c3) {
+            tr.mark_cell(c3)
+            @sf.style_node(c3, fn() { sp_cell_num }, in_row=true)
+            c3.width(Is(Some(sp_col_cpu_w))).shrink(Is(0.0)) |> ignore
+            if online {
+              let m = fn() { sp_meter_of(meters.get(), 0) }
+              @sf.words_node(c3, fn() { sp_meter_wide(m()) }, fn() { sp_table_meter_style(text(m(), "level")) })
+              |> ignore
+            } else {
+              @sf.words_node(c3, fn() { "—" }, fn() { sp_cell_muted }) |> ignore
+            }
+          })
+          |> ignore
+          // Column 4: Memory
+          row.box(fn(c4) {
+            tr.mark_cell(c4)
+            @sf.style_node(c4, fn() { sp_cell_num }, in_row=true)
+            c4.width(Is(Some(sp_col_mem_w))).shrink(Is(0.0)) |> ignore
+            if online {
+              let m = fn() { sp_meter_of(meters.get(), 1) }
+              @sf.words_node(c4, fn() { sp_meter_wide(m()) }, fn() { sp_table_meter_style(text(m(), "level")) })
+              |> ignore
+            } else {
+              @sf.words_node(c4, fn() { "—" }, fn() { sp_cell_muted }) |> ignore
+            }
+          })
+          |> ignore
+          // Column 5: Disk
+          row.box(fn(c5) {
+            tr.mark_cell(c5)
+            @sf.style_node(c5, fn() { sp_cell_num }, in_row=true)
+            c5.width(Is(Some(sp_col_disk_w))).shrink(Is(0.0)) |> ignore
+            if online {
+              let m = fn() { sp_meter_of(meters.get(), 2) }
+              @sf.words_node(c5, fn() { sp_meter_wide(m()) }, fn() { sp_table_meter_style(text(m(), "level")) })
+              |> ignore
+            } else {
+              @sf.words_node(c5, fn() { "—" }, fn() { sp_cell_muted }) |> ignore
+            }
+          })
+          |> ignore
+          // Column 6: Network
+          row.box(fn(c6) {
+            tr.mark_cell(c6)
+            @sf.style_node(c6, fn() { sp_cell_num }, in_row=true)
+            c6.width(Is(Some(sp_col_net_w))).shrink(Is(0.0)) |> ignore
+            if online {
+              @sf.words_node(c6, fn() { sp_net_wide(entry.net.get().value) }, fn() { sp_cell_muted })
+              .shrink(Is(1.0))
+              .min_width(Is(Some(0.0)))
+              .cuts(Is(true))
+              .allow_ellipsis(Is(true))
+              |> ignore
+            } else {
+              @sf.words_node(c6, fn() { "—" }, fn() { sp_cell_muted }) |> ignore
+            }
+          })
+          |> ignore
+        },
+      )
+      |> ignore
     })
-    |> ignore
-  })
-  |> ignore
-}
-
-///|
-/// Clickable sortable column header cell.
-fn sp_sort_head_cell(
-  parent : @view.View,
-  col : StationSortCol,
-  label : () -> String,
-  fixed_w : Double?,
-  left_align : Bool,
-  sort_col : @signals.Signal[StationSortCol?],
-  sort_asc : @signals.Signal[Bool],
-  toggle_sort : (StationSortCol) -> Unit,
-) -> Unit {
-  let active = fn() { sort_col.get() == Some(col) }
-  let words = fn() {
-    let base = label()
-    if active() {
-      base + (if sort_asc.get() { " ↑" } else { " ↓" })
-    } else {
-      base
-    }
-  }
-  @sf.action_box_node(parent, label, fn(_) { toggle_sort(col) }, fn(cell) {
-    @sf.style_node(cell, fn() { if left_align { sp_head_left } else { sp_head_right } }, in_row=true)
-    match fixed_w {
-      Some(w) => cell.width(Is(Some(w))).shrink(Is(0.0)) |> ignore
-      None => cell.grow(Is(1.0)).basis(Is(Some(0.0))).shrink(Is(1.0)).min_width(Is(Some(0.0))) |> ignore
-    }
-    @sf.hover_ground_node(cell, lit=Some(fn() { @sf.hovered_in_node(cell) || cell.focus_shown() }))
-    @sf.words_node(cell, words, fn() { if active() { sp_head_words_on } else { sp_head_words } }) |> ignore
   })
   |> ignore
 }
@@ -1140,18 +1125,6 @@ let sp_auto_pill_on : @ui.Style = @ui.css("row px=S3 gap=S1_5 align=ACenter radi
 
 ///|
 // kept across runs: a value (no field of it changes)
-let sp_table_wrap : @ui.Style = @ui.css("w=Full")
-
-///|
-// kept across runs: a value (no field of it changes)
-let sp_table_header : @ui.Style = @ui.css("row w=Full pl=S0_5 pr=S2 py=S1 gap=S2 align=ACenter")
-
-///|
-// kept across runs: a value (no field of it changes)
-let sp_header_rule_wrap : @ui.Style = @ui.css("w=Full pb=S1_5")
-
-///|
-// kept across runs: a value (no field of it changes)
 let sp_table_row : @ui.Style = @ui.css("row w=Full px=S2 py=S1_5 gap=S2 align=ACenter").then(@ui.style(radius=@sf.panel_in))
 
 ///|
@@ -1160,15 +1133,7 @@ let sp_cell_station : @ui.Style = @ui.css("row gap=S2 align=ACenter")
 
 ///|
 // kept across runs: a value (no field of it changes)
-let sp_cell_num : @ui.Style = @ui.css("row pr=S1_5 gap=S1_25 align=ACenter justify=JEnd")
-
-///|
-// kept across runs: a value (no field of it changes)
-let sp_head_left : @ui.Style = @ui.css("row px=S1_5 py=S0_5 align=ACenter justify=JStart radius=Full")
-
-///|
-// kept across runs: a value (no field of it changes)
-let sp_head_right : @ui.Style = @ui.css("row px=S1_5 py=S0_5 align=ACenter justify=JEnd radius=Full")
+let sp_cell_num : @ui.Style = @ui.css("row pr=S1 gap=S1_25 align=ACenter justify=JEnd")
 
 ///|
 // kept across runs: a value (no field of it changes)
@@ -1196,19 +1161,19 @@ let sp_meta_danger : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color
 
 ///|
 // kept across runs: a value (no field of it changes)
-let sp_cell_fg : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color=Fg, wrap=false, w=Hug)
+let sp_cell_fg : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color=Fg, wrap=false, w=Hug, tabular=true)
 
 ///|
 // kept across runs: a value (no field of it changes)
-let sp_cell_muted : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color=Muted, wrap=false, w=Hug)
+let sp_cell_muted : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color=Muted, wrap=false, w=Hug, tabular=true)
 
 ///|
 // kept across runs: a value (no field of it changes)
-let sp_cell_accent : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color=AccentText, wrap=false, w=Hug)
+let sp_cell_accent : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color=AccentText, wrap=false, w=Hug, tabular=true)
 
 ///|
 // kept across runs: a value (no field of it changes)
-let sp_cell_warn : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color=WarnInk, wrap=false, w=Hug)
+let sp_cell_warn : @ui.TextStyle = @ui.text_style(size=Meta, leading=L5, color=WarnInk, wrap=false, w=Hug, tabular=true)
 
 ///|
 // kept across runs: a value (no field of it changes)
@@ -1219,15 +1184,8 @@ let sp_cell_danger : @ui.TextStyle = @ui.text_style(
   dark=@ui.text_patch(color=Over(Danger, A(Fg, O25))),
   wrap=false,
   w=Hug,
+  tabular=true,
 )
-
-///|
-// kept across runs: a value (no field of it changes)
-let sp_head_words : @ui.TextStyle = @ui.text_style(size=Caption, leading=L4, color=Muted, wrap=false, w=Hug)
-
-///|
-// kept across runs: a value (no field of it changes)
-let sp_head_words_on : @ui.TextStyle = @ui.text_style(size=Caption, leading=L4, weight=Medium, color=AccentText, wrap=false, w=Hug)
 
 ///|
 // kept across runs: a value (no field of it changes)
