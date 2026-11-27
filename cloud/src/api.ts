@@ -86,7 +86,7 @@ async function mailAdded(env: Env, lang: Lang, workspace: string, mail: AddedMai
   return failed;
 }
 
-async function directory<T>(run: () => Promise<T> | T, status = 200): Promise<Response> {
+export async function directory<T>(run: () => Promise<T> | T, status = 200): Promise<Response> {
   try {
     const value = await run();
     return reply(value ?? { ok: true }, status);
