@@ -48,7 +48,8 @@ fn test_side_at(laid_w : Double, tape : Bool) -> SideAt {
     list_brand: 0.0,
     list_band: 0.0,
     bar: false,
-    glass: false,
+    glass: 0.0,
+    seen: 1.0,
     tape,
   }
 }

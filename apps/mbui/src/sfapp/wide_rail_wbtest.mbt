@@ -1374,3 +1374,63 @@ test "wide: folded rail blends into theme background at rest and switches to tra
     assert_eq(t.contrast_faults(), [])
   }
 }
+
+///|
+test "wide: dismissing the peeking glass drawer fades its glass over time, still there as it reaches the rail" {
+  let calls : Array[Made] = []
+  let t = wide_tester(calls, window_inset=true)
+  t.key(@ui.key_of_char('\\'), mods=@ui.mod_cmd)
+  t.move_to(1000.0, 400.0)
+  t.run_for(@ui.move_most_ms)
+  let (rx, ry, rw, rh) = t.query(Button, label="文件").unwrap().rect
+  t.move_to(rx + rw / 2.0, ry + rh / 2.0)
+  t.run_for(@sfdesk.peek_enter_ms)
+  t.frame()
+  t.run_for(@ui.move_most_ms)
+  assert_true(@sfdesk.wide.peeking.get())
+  t.move_to(1000.0, 400.0)
+  t.frame()
+  t.run_for(@sfdesk.peek_leave_ms)
+  t.frame()
+  assert_false(@sfdesk.wide.peeking.get())
+  // (the block's width and its glass's strength, every 16 ms, as it goes back to the rail and past)
+  let seen = t.sample_frames(@ui.move_most_ms + @sf.dur_ms * 2.0, fn(_tt, _ms) {
+    let mut w = 0.0
+    let mut k = 0.0
+    for d in @ui.view_tree().unwrap().drawn() {
+      if d.x == @sfdesk.closed_bar_in && d.h > 400.0 {
+        w = if d.w > w { d.w } else { w }
+        match d.glass {
+          Some(gl) => k = if gl.strength > k { gl.strength } else { k }
+          None => ()
+        }
+      }
+    }
+    (w, k)
+  })
+  let mut rest_w = 1.0e9
+  for p in seen {
+    rest_w = if p.1.0 < rest_w { p.1.0 } else { rest_w }
+  }
+  // (as the drawer first comes to the rail's width its glass still shows, and goes from there over frames)
+  let mut at_rail : Double? = None
+  let mut fading = 0
+  let mut was = 2.0
+  for p in seen {
+    let (w, k) = p.1
+    if at_rail is None && w <= rest_w + 0.5 {
+      at_rail = Some(k)
+    }
+    assert_true(k <= was + 1.0e-9, msg="glass came back \{was} -> \{k}")
+    assert_true(was > 1.0 || was - k <= 0.2, msg="glass cut \{was} -> \{k} in 16 ms")
+    if k > 0.02 && k < 0.98 {
+      fading = fading + 1
+    }
+    was = k
+  }
+  assert_true(at_rail.unwrap_or(0.0) > 0.05, msg="glass gone \{at_rail.unwrap_or(0.0)} as the drawer reached the rail")
+  assert_true(was <= 0.0, msg="glass left \{was} at rest")
+  assert_true(fading >= 8, msg="glass faded over only \{fading} frames")
+  assert_eq(t.corner_faults(), [])
+  assert_eq(t.contrast_faults(), [])
+}
