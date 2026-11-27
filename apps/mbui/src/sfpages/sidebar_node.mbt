@@ -41,6 +41,7 @@ pub fn chats_lists_node(
   frame : ListsNodeFrame,
   tips : @sf.TipLayer,
   stint : () -> Int,
+  keep_rows? : () -> Bool = fn() { false },
 ) -> Unit {
   // (as large as what holds it gives it: over all of it, its frame's)
   v.clips(Is(true)) |> ignore
@@ -183,7 +184,7 @@ pub fn chats_lists_node(
       lane.show(fn() { shown_once[i].get() }, at_once=true, fn(l) {
         l.grow(Is(1.0)).min_height(Is(Some(0.0))) |> ignore
         if i < list_filters.length() {
-          chats_pane_node(l, src, id, list_filters[i], key, frame, fn() { (frame.shown)() == i }, tips, stint)
+          chats_pane_node(l, src, id, list_filters[i], key, frame, fn() { (frame.shown)() == i }, tips, stint, keep_rows)
         } else {
           (frame.others[i - list_filters.length()])(l)
         }
@@ -276,6 +277,7 @@ fn chats_pane_node(
   current : () -> Bool,
   tips : @sf.TipLayer,
   stint : () -> Int,
+  keep_rows : () -> Bool,
 ) -> Unit {
   let query = fn() { @sfbase.pane_list_query(src, id, filter) }
   let pane_grouped = @signals.untracked(fn() { query().group_by == "project" })
@@ -354,7 +356,8 @@ fn chats_pane_node(
         Some(view) => (view.days, view.syncing is Some(_))
         None => ([], false)
       }
-      if !physical_equal(days, seen.val) {
+      // Keep rows already on screen during the push. A chat opened before the first frame still has Home under it.
+      if !physical_equal(days, seen.val) && (seen.val.is_empty() || !keep_rows()) {
         seen.val = days
         stamp.val += 1
       }
