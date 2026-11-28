@@ -127,6 +127,7 @@ int64_t sts_proc_start_time_ms(int32_t pid);
 int64_t sts_proc_start_ticks(int32_t pid);
 int32_t sts_proc_ppid(void);
 void *sts_proc_cmdline(int32_t pid, int64_t *out_len);
+int32_t sts_is_child_pgroup_leader(int32_t child_pid, int32_t expected_ppid, int32_t expected_pgid);
 void *sts_boot_id(int64_t *out_len);
 
 // 3. Launcher control channel (Unix control fd > 4 e.g. fd 5, Windows named pipe).
@@ -345,6 +346,25 @@ int32_t sts_same_cloneable_volume(const char *dir_a, const char *dir_b);
 int32_t sts_clone_file(const char *src, const char *dst, int32_t excl);
 int32_t sts_clone_file_only(const char *src, const char *dst, int32_t excl);
 int32_t sts_clone_tree(const char *src_dir, const char *dst_dir);
+
+// Connect to a local `stillfail-runner` Unix socket / Windows named pipe, verify the connected
+// peer's OS kernel PID (`SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS, `GetNamedPipeServerProcessId`
+// on Windows) equals `expected_pid`, and ONLY if equal write all `len` bytes within `timeout_ms`.
+// Returns:
+//   0  peer verified == `expected_pid` and all `len` bytes written,
+//  -1  definitely not submitted (0 bytes written; safe to retry),
+//  -2  peer identity mismatch or unverifiable (0 bytes written!),
+//  -3  submission in flight or partial write (outcome unknown; MUST NOT retry in parallel).
+int32_t sts_runner_sock_send_verified(
+    const char *sock_path,
+    int32_t expected_pid,
+    const uint8_t *data,
+    int64_t len,
+    int32_t timeout_ms);
+
+// Deterministic self-test exercising the production lock-free `sts_vs_*` verified-send
+// cancel/submit state machine across all 4 interleavings. Returns 0 on pass, non-zero error code on failure.
+int32_t sts_selftest_verified_send_cancel(void);
 
 // Free any buffer returned by `sts_*`.
 void sts_free(void *ptr);

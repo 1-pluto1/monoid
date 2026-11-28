@@ -32,6 +32,7 @@ extern "C" fn sts_proc_start_time_ms(pid : Int) -> Int64
 extern "C" fn sts_proc_start_ticks(pid : Int) -> Int64
 extern "C" fn sts_proc_ppid() -> Int
 extern "C" fn sts_proc_cmdline(pid : Int, out_len : Ptr) -> Ptr
+extern "C" fn sts_is_child_pgroup_leader(child_pid : Int, expected_ppid : Int, expected_pgid : Int) -> Int
 extern "C" fn sts_boot_id(out_len : Ptr) -> Ptr
 
 extern "C" fn sts_ctrl_open_fd(event_id : Int64, fd : Int) -> Int64
@@ -114,6 +115,8 @@ extern "C" fn sts_same_cloneable_volume(dir_a : Ptr, dir_b : Ptr) -> Int
 extern "C" fn sts_clone_file(src : Ptr, dst : Ptr, excl : Int) -> Int
 extern "C" fn sts_clone_file_only(src : Ptr, dst : Ptr, excl : Int) -> Int
 extern "C" fn sts_clone_tree(src_dir : Ptr, dst_dir : Ptr) -> Int
+extern "C" fn sts_runner_sock_send_verified(sock_path : Ptr, expected_pid : Int, data : Ptr, len : Int64, timeout_ms : Int) -> Int
+extern "C" fn sts_selftest_verified_send_cancel() -> Int
 
 extern "C" fn sts_peer_process(fd : Int, out_len : Ptr) -> Ptr
 extern "C" fn sts_process_usage(pids : Ptr, count : Int, out_len : Ptr) -> Ptr
@@ -609,8 +612,18 @@ pub fn ChildProcess::close(self : ChildProcess) -> Bool {
   sts_proc_close(self.handle) != 0
 }
 
+pub let ERR_ESRCH : Int = -3
+pub let ERR_EPERM : Int = -1
+
 pub fn proc_kill(pid : Int, sig : Int, group : Bool) -> Int {
   sts_proc_kill(pid, sig, if group { 1 } else { 0 })
+}
+
+/// Returns true ONLY when `proc_kill(pid, SIG_PROBE, false)` confirmed the target process does not exist
+/// (POSIX `-ESRCH == -3`; Windows `STS_SIG_PROBE` returns `0` on `ERROR_ACCESS_DENIED` and `-3` when exited/missing).
+/// `EPERM` (`-1`) returns `false` so permission errors are NEVER misclassified as process death.
+pub fn proc_kill_is_esrch(rc : Int) -> Bool {
+  rc == ERR_ESRCH
 }
 
 pub fn proc_start_time_ms(pid : Int) -> Option[Int64] {
@@ -637,6 +650,12 @@ pub fn proc_cmdline(pid : Int) -> Option[String] {
   let n = ptr_read_i64(out_len, 0.to_int64())
   sts_free(out_len)
   take_owned_string(p, n)
+}
+
+/// Kernel-level verification that `child_pid` is currently a direct child of `expected_ppid`
+/// AND is the process group leader of `expected_pgid` (`child_pid == expected_pgid`).
+pub fn is_child_pgroup_leader(child_pid : Int, expected_ppid : Int, expected_pgid : Int) -> Bool {
+  sts_is_child_pgroup_leader(child_pid, expected_ppid, expected_pgid) != 0
 }
 
 pub fn boot_id() -> Option[String] {
@@ -1726,4 +1745,35 @@ pub fn clone_tree(src_dir : String, dst_dir : String) -> Result[Unit, Int] {
   } else {
     Err(rc)
   }
+}
+
+/// R33 4-state return codes for `runner_sock_send_verified`:
+/// - `RUNNER_SEND_OK` (0): kernel peer PID matched and full payload written.
+/// - `RUNNER_SEND_NOT_SUBMITTED` (-1): definitely 0 bytes submitted (safe to retry).
+/// - `RUNNER_SEND_PEER_MISMATCH` (-2): kernel peer PID mismatch (0 bytes written).
+/// - `RUNNER_SEND_OUTCOME_UNKNOWN` (-3): submission in flight / partial write (MUST NOT retry in parallel).
+pub let RUNNER_SEND_OK : Int = 0
+
+pub let RUNNER_SEND_NOT_SUBMITTED : Int = -1
+
+pub let RUNNER_SEND_PEER_MISMATCH : Int = -2
+
+pub let RUNNER_SEND_OUTCOME_UNKNOWN : Int = -3
+
+/// R28/R33: Connect to a `stillfail-runner` Unix socket / Windows named pipe, verify the connected
+/// peer's OS kernel PID (`SO_PEERCRED` / `LOCAL_PEERPID` / `GetNamedPipeServerProcessId`) equals
+/// `expected_pid`, and ONLY if equal write `payload` within `timeout_ms`.
+/// Returns `0` (verified + written), `-1` (definitely not submitted), `-2` (peer mismatch, 0 bytes),
+/// or `-3` (in-flight/partial outcome unknown, do not retry in parallel).
+pub fn runner_sock_send_verified(sock_path : String, expected_pid : Int, payload : Bytes, timeout_ms : Int) -> Int {
+  let rc = sts_runner_sock_send_verified(sock_path.as_cstr(), expected_pid, bytes_data_ptr(payload), payload.length().to_int64(), timeout_ms)
+  let _ = sock_path.length()
+  let _ = payload.length()
+  rc
+}
+
+/// R34: Execute the production C lock-free `sts_vs_*` verified-send cancel/submit state-machine
+/// selftest (4 deterministic interleavings). Returns `0` on pass.
+pub fn selftest_verified_send_cancel() -> Int {
+  sts_selftest_verified_send_cancel()
 }

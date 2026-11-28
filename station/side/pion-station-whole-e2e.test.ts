@@ -1374,7 +1374,14 @@ test("W16B.3-6: REAL Rust Launcher + MB Front: admin/1 JWT auth, anti-escalation
   assert.ok(liveRunnerProc.pid && liveRunnerProc.pid > 1);
   assert.ok(bystanderProc.pid && bystanderProc.pid > 1);
   mkdirSync(join(data, "run", "runners"), { recursive: true });
-  const runnerSockPath = join(data, "run", "runners", "claude-sess-unicode-1.sock");
+  // Wave 17C-1 now spawns a real `stillfail-runner` on `POST /threads/:id/messages`; terminate any
+  // real runner for `claude-sess-unicode-1` before seeding the synthetic adoption socket test below.
+  try {
+    const existingInfo = JSON.parse(readFileSync(join(data, "run", "runners", "claude-sess-unicode-1.json"), "utf8"));
+    if (existingInfo.pgid > 1) try { process.kill(-existingInfo.pgid, "SIGKILL"); } catch {}
+    if (existingInfo.runner > 1) try { process.kill(existingInfo.runner, "SIGKILL"); } catch {}
+  } catch {}
+  const runnerSockPath = join(data, "run", "runners", "synthetic-sess-unicode-1.sock");
   const bystanderSockPath = join(data, "run", "runners", "claude-bystander-unclaimed.sock");
   let runnerAttached = false;
   let runnerAckOut = 0;
@@ -2991,7 +2998,7 @@ test("W17C2.14: --smoke-vault-sqlite + live Admin/1 Vault HTTP routes, unified C
   const unknownVaultItems = await adminCall(conn, "GET", "/vault/items?vault=nonexistent");
   assert.equal(unknownVaultItems.status, 404, `GET /vault/items?vault=nonexistent expected 404, got ${unknownVaultItems.status}: ${unknownVaultItems.body.toString()}`);
 
-  // Unimplemented / unported partial ops return honest 501 (ZERO fake 200 stubs!)
+  // 1b. Routes implemented in W17C-3A (#9161) & W17C-3B (#9162) return 200
   for (const [m, p, body] of [
     ["GET", "/vault/uses", undefined],
     ["GET", "/vault/plain", undefined],
@@ -3000,6 +3007,13 @@ test("W17C2.14: --smoke-vault-sqlite + live Admin/1 Vault HTTP routes, unified C
     ["GET", "/memory", undefined],
     ["GET", "/mcp-servers", undefined],
     ["PUT", "/mcp-servers", JSON.stringify({ servers: {} })],
+  ] as const) {
+    const resp = await adminCall(conn, m, p, { "content-type": "application/json" }, body !== undefined ? Buffer.from(body) : undefined);
+    assert.equal(resp.status, 200, `${m} ${p} expected 200, got ${resp.status}: ${resp.body.toString()}`);
+  }
+
+  // Unimplemented / unported partial ops return honest 501 (ZERO fake 200 stubs!)
+  for (const [m, p, body] of [
     ["POST", "/updates", "{}"],
     ["POST", "/updates/check", "{}"],
   ] as const) {

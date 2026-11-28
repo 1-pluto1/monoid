@@ -107,8 +107,429 @@ fn run_smoke_sys() -> Int {
       return 1
     }
   }
+  // R10 P0/P1 real OS FS + real SQLite verifier smoke:
+  // (a) `verify_legacy_session_workspace` with real `ELOOP`, `EACCES`, and `ENOENT`
+  // (b) Peer Slack `surface_for_described` (`slack:<team>`) + `query_thread_moved_to` (`handed:<ws>`)
+  if os != "win32" {
+    let vroot = tmp + "/sf-smoke-r10-" + pid.to_string() + "-" + host_shim::wall_ms().to_string()
+    let vsess = vroot + "/sessions"
+    let vws_a = vsess + "/ws_a"
+    let vlocked = vsess + "/locked"
+    let vlocked_child = vlocked + "/ws_b"
+    let vloop_a = vsess + "/loop_a"
+    let vloop_b = vsess + "/loop_b"
+    let vdb = vroot + "/stillfail.db"
+    let mut r10_ok = station_sys::mkdir_p(vws_a)
+    && station_sys::mkdir_p(vlocked_child)
+    && station_sys::symlink(vloop_b, vloop_a, false)
+    && station_sys::symlink(vloop_a, vloop_b, false)
+    if r10_ok {
+      match station_store::Store::open(vdb) {
+        Ok(vst) => {
+          let real_lstat_ops = station_ops::OpsFs::{
+            ..station_ops::MemFs::new().ops(),
+            lstat: fn(p : String) -> Result[station_ops::FileMeta, station_ops::FsErr] {
+              match station_sys::lstat_raw_err(p) {
+                Ok(raw) => {
+                  let is_dir = raw.starts_with("dir|")
+                  let is_link = raw.starts_with("link|")
+                  Ok(station_ops::FileMeta::{ is_file: raw.starts_with("file|"), is_dir: is_dir, is_link: is_link, size: 0L, mtime_ms: 0L, mtime_exact: "", ino: 0L, mode: 493 })
+                }
+                Err(-2) => Err(station_ops::FsErr::NotFound)
+                Err(-3) => Err(station_ops::FsErr::PermissionDenied("EACCES"))
+                Err(_) => Err(station_ops::FsErr::Other("lstat_err"))
+              }
+            },
+          }
+          let mut r10_step = "ok"
+          match vst.db.run(
+            "INSERT INTO sessions(key, connect, scope, runtime, profile, workspace, token, created_at, last_active_at, ws) VALUES('s-other', 'c1', 'sc1', 'claude', 'default', ?1, 'tok-other', 1000, 1000, 'ws-b')",
+            [base_codec::json_str(vloop_a)],
+          ) {
+            Err(e) => { r10_ok = false; r10_step = "insert s-other: " + e.message }
+            Ok(_) => ()
+          }
+          if r10_ok && !(verify_legacy_session_workspace(Some(vst), real_lstat_ops, vws_a, vroot, "ws-a", "ws-a", "/") is None) {
+            r10_ok = false
+            r10_step = "eloop not rejected"
+          }
+          if r10_ok && station_sys::geteuid() > 0 {
+            let _ = station_sys::chmod(vlocked, 0)
+            let _ = vst.db.run("UPDATE sessions SET workspace = ?1 WHERE key = 's-other'", [base_codec::json_str(vlocked_child)])
+            if !(verify_legacy_session_workspace(Some(vst), real_lstat_ops, vws_a, vroot, "ws-a", "ws-a", "/") is None) {
+              r10_ok = false
+              r10_step = "eacces not rejected"
+            }
+            let _ = station_sys::chmod(vlocked, 448)
+          }
+          if r10_ok {
+            let _ = vst.db.run("UPDATE sessions SET workspace = ?1 WHERE key = 's-other'", [base_codec::json_str(vsess + "/missing-ws-b/workspace")])
+            if !(verify_legacy_session_workspace(Some(vst), real_lstat_ops, vws_a, vroot, "ws-a", "ws-a", "/") is Some(_)) {
+              r10_ok = false
+              r10_step = "enoent sibling rejected"
+            }
+          }
+          if r10_ok {
+            let desc = base_codec::json_obj([
+              ("kind", base_codec::json_str("slack")),
+              ("team", base_codec::json_str("T_TEAM_R10")),
+            ])
+            let surf = surface_for_described("slack", desc, "c-slack-r10")
+            let _ = vst.db.run("INSERT INTO threads(id, surface, channel, thread_ts, title, created_at) VALUES(101, 'slack:T_TEAM_R10', 'C_R10', '1700.001', '', 1000)", [])
+            let _ = vst.db.run("INSERT INTO sessions(key, connect, scope, runtime, profile, workspace, token, created_at, last_active_at, ws) VALUES('s-moved', 'c-slack-r10', 'sc2', 'claude', 'default', '/tmp/m', 'tok-moved', 1000, 1000, 'handed:ws-target')", [])
+            let _ = vst.db.run("INSERT INTO thread_sessions(thread, session, connect, joined_at) VALUES(101, 's-moved', 'c-slack-r10', 1000)", [])
+            let _ = vst.db.run("INSERT INTO handed_over(session, station, ws, at) VALUES('s-moved', 'st-dest-r10', 'ws-target', 1000)", [])
+            match query_thread_moved_to(vst, surf, "c-slack-r10", "C_R10", "1700.001", "ws-target", "ws-home") {
+              Some(dest) => if dest != "st-dest-r10" { r10_ok = false; r10_step = "moved_to wrong dest: " + dest }
+              None => { r10_ok = false; r10_step = "moved_to returned None" }
+            }
+          }
+          if r10_ok && station_sys::geteuid() > 0 {
+            // R19/R20 real OS FS check:
+            // (1) `r-locked.json` (`chmod 0000`) + `r-smoke-19.json` (valid) through a `shell_ops_fs`-like
+            //     `OpsFs` collapsing read errors to `NotFound`:
+            //     - `discover_live_runners_scan` -> `complete == false`, retains `r-smoke-19`;
+            //     - `probe_runner_file(..., "r-absent")` -> `ConfirmedAbsent` (not blocked by `r-locked.json`);
+            //     - `probe_runner_file(..., "r-locked")` -> `Uncertain(_, None)`.
+            // (2) `runners` directory itself `chmod 0000`:
+            //     - `probe_runner_file(..., "r-absent")` -> `Uncertain(_, None)`.
+            let r19_rdir = vroot + "/run/runners"
+            let r19_good = r19_rdir + "/r-smoke-19.json"
+            let r19_locked = r19_rdir + "/r-locked.json"
+            let my_start = match station_sys::proc_start_time_ms(pid) {
+              Some(ms) => ms
+              None => host_shim::wall_ms()
+            }
+            let good_body = "{\"id\":\"r-smoke-19\",\"runner\":" + pid.to_string() + ",\"pid\":" + pid.to_string() + ",\"pgid\":" + pid.to_string() + ",\"startedAt\":" + my_start.to_string() + ",\"socket\":\"/tmp/r-smoke-19.sock\"}"
+            let r19_setup = station_sys::mkdir_p(r19_rdir)
+            && station_sys::write_file_atomic(r19_good, good_body.to_bytes(), 384)
+            && station_sys::write_file_atomic(r19_locked, good_body.to_bytes(), 384)
+            if !r19_setup {
+              r10_ok = false
+              r10_step = "r20 setup failed"
+            } else {
+              let _ = station_sys::chmod(r19_locked, 0)
+              let shell_like_ops = station_ops::OpsFs::{
+                ..station_ops::MemFs::new().ops(),
+                readdir: fn(p : String) -> Result[Array[String], station_ops::FsErr] {
+                  if p == r19_rdir {
+                    Ok(["r-smoke-19.json", "r-locked.json"])
+                  } else {
+                    Err(station_ops::FsErr::NotFound)
+                  }
+                },
+                read_bytes: fn(p : String) -> Result[Bytes, station_ops::FsErr] {
+                  match station_sys::read_file_strict(p) {
+                    Ok(b) => Ok(b)
+                    Err(_) => Err(station_ops::FsErr::NotFound)
+                  }
+                },
+              }
+              let scan = discover_live_runners_scan(shell_like_ops, vroot, "/")
+              if scan.complete {
+                r10_ok = false
+                r10_step = "r20 chmod 0000 file must mark scan.complete == false"
+              } else if scan.runners.length() != 1 || scan.runners[0].id != "r-smoke-19" {
+                r10_ok = false
+                r10_step = "r20 valid runner lost alongside chmod 0000 file: len=" + scan.runners.length().to_string()
+              } else if !(probe_runner_file(shell_like_ops, vroot, "/", "r-absent") is RunnerFileProbe::ConfirmedAbsent) {
+                r10_ok = false
+                r10_step = "r20 r-absent must be ConfirmedAbsent despite unrelated r-locked.json"
+              } else if !(probe_runner_file(shell_like_ops, vroot, "/", "r-locked") is RunnerFileProbe::Uncertain(_, None)) {
+                r10_ok = false
+                r10_step = "r20 r-locked (chmod 0000) must be Uncertain(_, None)"
+              }
+              if r10_ok {
+                let _ = station_sys::chmod(r19_rdir, 0)
+                if !(probe_runner_file(shell_like_ops, vroot, "/", "r-absent") is RunnerFileProbe::Uncertain(_, None)) {
+                  r10_ok = false
+                  r10_step = "r20 chmod 0000 runners dir must make r-absent Uncertain(_, None)"
+                }
+                let _ = station_sys::chmod(r19_rdir, 448)
+              }
+              let _ = station_sys::chmod(r19_locked, 384)
+              let _ = station_sys::unlink(r19_locked)
+              let _ = station_sys::unlink(r19_good)
+              let _ = station_sys::rmdir(r19_rdir)
+              let _ = station_sys::rmdir(vroot + "/run")
+            }
+          }
+          if !r10_ok {
+            let _ = host_shim::write_stderr_line("smoke-sys: R10 detail: " + r10_step)
+          }
+          vst.close()
+        }
+        Err(_) => r10_ok = false
+      }
+    }
+    let _ = station_sys::chmod(vlocked, 448)
+    let _ = station_sys::unlink(vloop_a)
+    let _ = station_sys::unlink(vloop_b)
+    let _ = station_sys::rmdir(vlocked_child)
+    let _ = station_sys::rmdir(vlocked)
+    let _ = station_sys::rmdir(vws_a)
+    let _ = station_sys::rmdir(vsess)
+    let _ = station_sys::unlink(vdb)
+    let _ = station_sys::unlink(vdb + "-wal")
+    let _ = station_sys::unlink(vdb + "-shm")
+    let _ = station_sys::rmdir(vroot)
+    if !r10_ok {
+      let _ = host_shim::write_stderr_line("smoke-sys: R10 real OS FS + SQLite verifier check failed")
+      return 1
+    }
+  }
+  let vs_rc = station_sys::selftest_verified_send_cancel()
+  if vs_rc != 0 {
+    let _ = host_shim::write_stderr_line("smoke-sys: selftest_verified_send_cancel failed rc=" + vs_rc.to_string())
+    return 1
+  }
   let _ = host_shim::write_stdout_line(
     "{\"ok\":true,\"os\":\"" + os + "\",\"arch\":\"" + arch + "\",\"pid\":" + pid.to_string() + "}",
+  )
+  0
+}
+
+fn run_smoke_runner(runner_bin : String) -> Int {
+  let os = station_sys::os_name()
+  let tmp = station_sys::tmpdir()
+  let self_pid = host_shim::pid()
+  let root = tmp + "/sf-smoke-runner-" + self_pid.to_string() + "-" + host_shim::wall_ms().to_string()
+  let rdir = root + "/run/runners"
+  let shell_dir = root + "/shell"
+  let rid = "r-smoke-posix"
+  if !station_sys::mkdir_p(rdir) || !station_sys::mkdir_p(shell_dir) {
+    let _ = host_shim::write_stderr_line("smoke-runner: mkdir_p failed")
+    return 1
+  }
+  if !host_shim::start(shell_dir, false) {
+    let _ = host_shim::write_stderr_line("smoke-runner: host_shim::start failed")
+    return 1
+  }
+  let mux = builders_core::ShellMux::host(start_stdin=false)
+  let spawn_opts = station_sys::SpawnOptions::{
+    program: runner_bin,
+    args: ["--dir", rdir, "--id", rid, "--", "/bin/sleep", "30"],
+    env: None,
+    cwd: root,
+    new_pgid: os == "win32",
+    strip_malloc_space_efficient: true,
+    pipe_stdin: false,
+    pipe_stdout: true,
+    pipe_stderr: true,
+  }
+  let ev_id : Int64 = 990001L
+  let child = match station_sys::proc_spawn(ev_id, spawn_opts) {
+    Ok(c) => c
+    Err(e) => {
+      let _ = host_shim::write_stderr_line("smoke-runner: proc_spawn failed: " + e)
+      return 1
+    }
+  }
+  let spawn_pid = child.pid
+  let spawn_os_start_ms = match station_sys::proc_start_time_ms(spawn_pid) {
+    Some(t) => if t > 0L { t } else { 0L }
+    None => 0L
+  }
+  let spawn_boot_id = station_sys::boot_id()
+  let spawn_start_ticks = station_sys::proc_start_ticks(spawn_pid)
+  let real_ops = station_ops::OpsFs::{
+    ..station_ops::MemFs::new().ops(),
+    read_bytes: fn(p : String) -> Result[Bytes, station_ops::FsErr] {
+      match station_sys::read_file_strict(p) {
+        Ok(b) => Ok(b)
+        Err(_) => Err(station_ops::FsErr::NotFound)
+      }
+    },
+  }
+  let stop_via_sock = fn(sock_path : String, sig : String) -> Bool {
+    if sock_path.length() == 0 {
+      return false
+    }
+    let mut sid : Int64 = -1L
+    let mut opened = false
+    let _ = mux.call_async_raw(
+      builders_core::MuxToken::Tagged(1, 10, 0L),
+      "unix.open",
+      base_codec::json_stringify(base_codec::json_obj([("path", base_codec::json_str(sock_path))])),
+      None,
+    )
+    let d1 = host_shim::now_ms() + 3000L
+    while host_shim::now_ms() < d1 && !opened {
+      match host_shim::wait(50L) {
+        Some(host_shim::HostEvent::ShellDone(d)) => {
+          match builders_core::decode_shell_done(d) {
+            Ok((Some(v), _)) => match base_codec::json_get(v, "id") {
+              Some(base_codec::Json::Num(n, _)) => sid = n.to_int64()
+              _ => ()
+            }
+            _ => ()
+          }
+          opened = true
+        }
+        _ => ()
+      }
+    }
+    if sid < 0L {
+      return false
+    }
+    let payload = station_drivers::encode_runner_attach()
+    + station_drivers::encode_runner_signal(sig, true)
+    + station_drivers::encode_runner_done()
+    let _ = mux.call_async_raw(
+      builders_core::MuxToken::Tagged(1, 11, sid),
+      "tcp.write",
+      base_codec::json_stringify(base_codec::json_obj([("id", base_codec::json_int64(sid))])),
+      Some(payload.to_bytes()),
+    )
+    let d2 = host_shim::now_ms() + 4000L
+    let mut gone = false
+    while host_shim::now_ms() < d2 && !gone {
+      let _ = host_shim::wait(50L)
+      if station_sys::proc_kill_is_esrch(station_sys::proc_kill(spawn_pid, station_sys::SIG_PROBE, false)) {
+        gone = true
+      }
+    }
+    let _ = mux.call_async_raw(
+      builders_core::MuxToken::Tagged(1, 12, sid),
+      "tcp.close",
+      base_codec::json_stringify(base_codec::json_obj([("id", base_codec::json_int64(sid))])),
+      None,
+    )
+    gone
+  }
+  let mut out_buf = Bytes::new(0)
+  let mut ready_opt : Option[station_drivers::RunnerInfo] = None
+  let ready_deadline = host_shim::now_ms() + 10000L
+  while host_shim::now_ms() < ready_deadline && ready_opt is None {
+    match host_shim::wait(50L) {
+      Some(host_shim::HostEvent::Sys(eid, sev)) => {
+        if eid == ev_id {
+          match station_sys::decode_sys_event(sev) {
+            Some(station_sys::SysEvent::ProcStdout(data)) => {
+              let merged = Bytes::new(out_buf.length() + data.length())
+              for i in 0..<out_buf.length() { merged[i] = out_buf[i] }
+              for i in 0..<data.length() { merged[out_buf.length() + i] = data[i] }
+              out_buf = merged
+              ready_opt = parse_runner_ready_line(out_buf.to_string())
+            }
+            _ => ()
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  let mut fail_msg = ""
+  let mut rinfo_opt : Option[station_drivers::RunnerInfo] = None
+  match ready_opt {
+    Some(ri) => {
+      if ri.runner_pid != spawn_pid {
+        fail_msg = "child.pid (" + spawn_pid.to_string() + ") != ready.runner_pid (" + ri.runner_pid.to_string() + ") — POSIX fork occurred!"
+        let _ = stop_via_sock(ri.socket, "TERM")
+      } else {
+        rinfo_opt = Some(ri)
+      }
+    }
+    None => {
+      fail_msg = "timed out waiting for stillfail-runner ready line"
+      // R23 P2: Before `child.close()`, prefer verified `<rid>.sock` stop, else handle-bound `child.kill(TERM, false)`.
+      let stopped = match probe_runner_file(real_ops, root, "/", rid) {
+        RunnerFileProbe::Live(pinfo) | RunnerFileProbe::Uncertain(_, Some(pinfo)) =>
+        if pinfo.runner_pid == spawn_pid { stop_via_sock(pinfo.socket, "TERM") } else { false }
+        _ => false
+      }
+      if !stopped {
+        let _ = child.kill(station_sys::SIG_TERM, false)
+      }
+    }
+  }
+  // Close bootstrap handle (handover detach) and verify runner stays alive at the EXACT same PID!
+  let _ = child.close()
+  if fail_msg.length() == 0 {
+    if station_sys::proc_kill(spawn_pid, station_sys::SIG_PROBE, false) != 0 {
+      fail_msg = "runner died after child.close()"
+    }
+  }
+  if fail_msg.length() == 0 {
+    match probe_runner_file(real_ops, root, "/", rid) {
+      RunnerFileProbe::Live(pinfo) => {
+        if pinfo.runner_pid != spawn_pid {
+          fail_msg = "probed metadata runner_pid mismatch"
+        } else {
+          let mgr = LiveRunnerManager::new()
+          let spawn_key = match encode_spawn_stop_key_pure(rid, spawn_pid, spawn_os_start_ms, spawn_boot_id, spawn_start_ticks) {
+            Some(sk) => sk
+            None => ""
+          }
+          mgr.record_draining_stop_marker(spawn_key, "s-smoke-runner")
+          let iid = station_whole::WholeAgents::runner_instance_id(pinfo.id, pinfo.runner_pid, pinfo.started_at)
+          if !mgr.is_draining_stop_target(iid, pinfo.id, pinfo.runner_pid, pinfo.started_at) {
+            fail_msg = "is_draining_stop_target did not match spawn: marker"
+          } else {
+            // R28: Verify kernel peer PID enforcement (`SO_PEERCRED`):
+            // 1. Wrong expected_pid (`runner_pid + 1`) MUST return -2 (0 bytes written, runner stays alive!).
+            let stop_bytes = (
+              station_drivers::encode_runner_attach()
+              + station_drivers::encode_runner_signal("TERM", true)
+              + station_drivers::encode_runner_done()
+            ).to_bytes()
+            let wrong_rc = station_sys::runner_sock_send_verified(pinfo.socket, pinfo.runner_pid + 1, stop_bytes, 1000)
+            if wrong_rc != -2 {
+              fail_msg = "runner_sock_send_verified(wrong_pid) expected -2, got " + wrong_rc.to_string()
+            } else if station_sys::proc_kill(spawn_pid, station_sys::SIG_PROBE, false) != 0 {
+              fail_msg = "runner died after rejected wrong-PID send!"
+            } else {
+              // 2. Exact expected_pid (`runner_pid`) MUST return 0 and cleanly terminate runner + child group!
+              let ok_rc = station_sys::runner_sock_send_verified(pinfo.socket, pinfo.runner_pid, stop_bytes, 1000)
+              if ok_rc != 0 {
+                fail_msg = "runner_sock_send_verified(exact_pid) expected 0, got " + ok_rc.to_string()
+              } else {
+                let exit_deadline = host_shim::now_ms() + 4000L
+                let mut esrch_seen = false
+                while host_shim::now_ms() < exit_deadline && !esrch_seen {
+                  let _ = host_shim::wait(50L)
+                  if station_sys::proc_kill_is_esrch(station_sys::proc_kill(spawn_pid, station_sys::SIG_PROBE, false)) {
+                    esrch_seen = true
+                  }
+                }
+                if !esrch_seen {
+                  let _ = stop_via_sock(pinfo.socket, "KILL")
+                  fail_msg = "runner did not exit after verified attach+TERM+done"
+                } else if !mgr.sweep_draining_stop_markers(host_shim::wall_ms())
+                || mgr.has_pending_draining_stop_for_session("s-smoke-runner") {
+                  fail_msg = "sweep_draining_stop_markers did not clear marker after real OS ESRCH"
+                }
+              }
+            }
+          }
+        }
+      }
+      _ => fail_msg = "probe_runner_file did not return Live(rinfo)"
+    }
+  }
+  if fail_msg.length() > 0 {
+    match rinfo_opt {
+      Some(ri) => { let _ = stop_via_sock(ri.socket, "KILL") }
+      None => ()
+    }
+  }
+  match rinfo_opt {
+    Some(ri) => { let _ = station_sys::unlink(ri.socket) }
+    None => ()
+  }
+  let _ = station_sys::unlink(rdir + "/" + rid + ".json")
+  let _ = station_sys::unlink(rdir + "/" + rid + ".out")
+  let _ = station_sys::unlink(rdir + "/" + rid + ".err")
+  let _ = station_sys::rmdir(rdir)
+  let _ = station_sys::rmdir(root + "/run")
+  let _ = station_sys::rmdir(shell_dir)
+  let _ = station_sys::rmdir(root)
+  if fail_msg.length() > 0 {
+    let _ = host_shim::write_stderr_line("smoke-runner: " + fail_msg)
+    return 1
+  }
+  let _ = host_shim::write_stdout_line(
+    "{\"ok\":true,\"spawn_pid\":" + spawn_pid.to_string() + ",\"runner_pid\":" + spawn_pid.to_string() + ",\"zero_fork\":true,\"esrch_swept\":true}",
   )
   0
 }
@@ -803,221 +1224,6 @@ fn run_internal_replica_restore(argv : Array[String]) -> Int {
   }
 }
 
-/// Strict 3-state read-only SQLite check for active cross-station `@` sessions.
-/// Uses `OPEN_READONLY` + `busy_timeout=2000` and always closes its handle immediately so
-/// zero FDs leak into `exec_replace`. Any open/prepare/step error returns `Unknown(...)`
-/// (fail-safe) rather than silently returning `NoneFound`.
-pub fn db_has_remote_connect_session(db_path : String) -> DbDepCheck {
-  let wal_nonempty = file_is_nonempty(db_path + "-wal")
-  match station_sys::lstat_raw(db_path) {
-    None =>
-    if wal_nonempty {
-      return DbDepCheck::Unknown("db:orphan_wal_without_db")
-    } else {
-      return DbDepCheck::NoneFound
-    }
-    Some(raw) =>
-    match parse_stat_file_size(raw) {
-      Some(sz) =>
-      if sz == 0L {
-        if wal_nonempty {
-          return DbDepCheck::Unknown("db:zero_byte_db_with_nonempty_wal")
-        } else {
-          return DbDepCheck::NoneFound
-        }
-      }
-      None => ()
-    }
-  }
-  let db = match sqlite_ffi::Db::open(db_path, sqlite_ffi::OPEN_READONLY, 2000) {
-    Ok(d) => d
-    Err(e) => return DbDepCheck::Unknown("db:unreadable:" + e.code.to_string())
-  }
-  match db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions' LIMIT 1") {
-    Ok(mstmt) => {
-      let mrc = mstmt.step()
-      let _ = mstmt.finalize()
-      if mrc == 101 {
-        let _ = db.close()
-        return DbDepCheck::NoneFound
-      }
-      if mrc != 100 {
-        let _ = db.close()
-        return DbDepCheck::Unknown("sqlite_master_err:" + mrc.to_string())
-      }
-    }
-    Err(e) => {
-      let _ = db.close()
-      return DbDepCheck::Unknown("sqlite_master_err:" + e.code.to_string())
-    }
-  }
-  let res = match db.prepare("SELECT 1 FROM sessions WHERE connect LIKE '%@%' AND archived_at IS NULL LIMIT 1") {
-    Ok(stmt) => {
-      let rc = stmt.step()
-      let _ = stmt.finalize()
-      if rc == 100 {
-        DbDepCheck::Found
-      } else if rc == 101 {
-        DbDepCheck::NoneFound
-      } else {
-        DbDepCheck::Unknown("db:unreadable:" + rc.to_string())
-      }
-    }
-    Err(e) => DbDepCheck::Unknown("db:unreadable:" + e.code.to_string())
-  }
-  let _ = db.close()
-  res
-}
-
-pub fn check_external_connects_need_node(data : String, sep : String) -> Array[String] {
-  let reasons : Array[String] = []
-
-  // 1. Local `config.json` enabled connects (1:1 with `station/src/sessions/config.ts:174`).
-  let cfg_path = nodepath::join(sep, [data, "config.json"])
-  match station_sys::read_file_strict(cfg_path) {
-    Ok(raw) => match base_codec::json_parse(raw.to_string()) {
-      base_codec::JsonParseResult::Ok(j) => {
-        let local_ext = enabled_external_connects_in_config(j)
-        for i in 0..<local_ext.length() {
-          reasons.push(local_ext[i])
-        }
-      }
-      _ => ()
-    }
-    Err(_) => ()
-  }
-
-  // 2. Cross-station receiver state `<data>/remote-connects.json`.
-  let remote_path = nodepath::join(sep, [data, "remote-connects.json"])
-  let remote_reason = match station_sys::read_file_strict(remote_path) {
-    Ok(raw) => remote_connects_file_needs_node(Some(raw.to_string()), false)
-    Err(station_sys::StrictReadErr::NotFound) => None
-    Err(_) => remote_connects_file_needs_node(None, true)
-  }
-  match remote_reason {
-    Some(r) => reasons.push(r)
-    None => ()
-  }
-
-  // 3. Strict 3-state read-only SQLite fallback check for active cross-station `@` sessions.
-  let db_path = nodepath::join(sep, [data, "stillfail.db"])
-  match classify_db_dep_check(db_has_remote_connect_session(db_path)) {
-    Some(r) => reasons.push(r)
-    None => ()
-  }
-
-  // 4. Pending replica restore `<data>/restore/ready.json`: decide BEFORE `ready` and BEFORE
-  // predecessor exit so a staged snapshot containing external connects never causes post-`ready`
-  // exit / `/healthz` blips or `STRICT=1` 5-failure give-up.
-  let ready_path = nodepath::join(sep, [data, "restore", "ready.json"])
-  match pending_restore_reason(station_sys::lstat_raw(ready_path) is Some(_)) {
-    Some(r) => reasons.push(r)
-    None => ()
-  }
-
-  reasons
-}
-
-fn find_node_in_path(sep : String, os_name : String) -> Option[String] {
-  let path_env = station_sys::env_get("PATH")
-  let path_delim = if os_name == "win32" { ";" } else { ":" }
-  let bin_name = if os_name == "win32" { "node.exe" } else { "node" }
-  match path_env {
-    Some(p) => {
-      let dirs = p.split(path_delim)
-      for i in 0..<dirs.length() {
-        let d = dirs[i]
-        if d.length() == 0 {
-          continue
-        }
-        let cand = nodepath::join(sep, [d, bin_name])
-        if station_sys::is_executable(cand) {
-          return Some(cand)
-        }
-      }
-      None
-    }
-    None => None
-  }
-}
-
-fn resolve_app_dir_for_fallback(argv : Array[String], sep : String, os_name : String) -> Option[String] {
-  match extract_app_dir_from_argv(argv) {
-    Some(d) => Some(d)
-    None => {
-      let argv0 = if argv.length() > 0 { argv[0] } else { "" }
-      let cwd = match station_sys::getcwd() {
-        Some(c) => c
-        None => "."
-      }
-      match resolve_self_executable_with(
-        argv0,
-        cwd,
-        station_sys::env_get("PATH"),
-        sep,
-        os_name,
-        station_sys::realpath,
-        station_sys::is_executable,
-      ) {
-        Some(exe) => {
-          let station_dir = nodepath::dirname(sep, exe)
-          let app_dir = nodepath::dirname(sep, station_dir)
-          if app_dir.length() > 0 { Some(app_dir) } else { None }
-        }
-        None => None
-      }
-    }
-  }
-}
-
-fn resolve_node_and_main_js(argv : Array[String], sep : String, os_name : String) -> Option[(String, String)] {
-  let app_dir_opt = resolve_app_dir_for_fallback(argv, sep, os_name)
-  let main_js = match app_dir_opt {
-    Some(app_dir) => {
-      let cand = nodepath::join(sep, [app_dir, "station", "main.js"])
-      if station_sys::lstat_raw(cand) is Some(_) { Some(cand) } else { None }
-    }
-    None => None
-  }
-  let main_js_path = match main_js {
-    Some(p) => p
-    None => return None
-  }
-  // Node resolution priority aligned with `station/native/launcher/src/main.rs:45-49` & `station_shim.mbt`:
-  // 1. `STILLFAIL_NODE`
-  // 2. `<app>/node/bin/node` (Unix) / `<app>/node/node.exe` (Windows)
-  // 3. `PATH` lookup
-  let node_bin = match station_sys::env_get("STILLFAIL_NODE") {
-    Some(v) => {
-      let t = v.trim()
-      if t.length() > 0 && station_sys::is_executable(t) { Some(t) } else { None }
-    }
-    None => None
-  }
-  let node_bin = match node_bin {
-    Some(p) => Some(p)
-    None => match app_dir_opt {
-      Some(app_dir) => {
-        let cand = if os_name == "win32" {
-          nodepath::join(sep, [app_dir, "node", "node.exe"])
-        } else {
-          nodepath::join(sep, [app_dir, "node", "bin", "node"])
-        }
-        if station_sys::is_executable(cand) { Some(cand) } else { None }
-      }
-      None => None
-    }
-  }
-  let node_bin = match node_bin {
-    Some(p) => Some(p)
-    None => find_node_in_path(sep, os_name)
-  }
-  match node_bin {
-    Some(nb) => Some((nb, main_js_path))
-    None => None
-  }
-}
-
 fn parse_stat_file_size(raw : String) -> Option[Int64] {
   let parts = raw.split("|")
   if parts.length() < 2 || parts[0] != "file" {
@@ -1044,134 +1250,6 @@ fn file_is_nonempty(path : String) -> Bool {
     Some(raw) => match parse_stat_file_size(raw) {
       Some(sz) => sz > 0L
       None => true
-    }
-  }
-}
-
-/// Entry gate executed BEFORE `host_shim::start`, BEFORE `ready`, BEFORE touching inherited launcher
-/// FDs (3/4/5), and BEFORE opening `stillfail.db` for writes: if this whole station has any enabled
-/// local external connects or cross-station remote-connect dependencies, either fail closed
-/// (`STILLFAIL_STATION_ENGINE_STRICT=1`) or seamlessly `exec_replace` in-place into Node `main.js`.
-/// Kept active until Wave 17C-1 wires live `stillfail-runner` process spawning to consume
-/// `started_prompts` (bypassed only in explicit E2E tests via `STILLFAIL_PION_NATIVE_CONNECTS_TEST=1`).
-fn maybe_handoff_external_connects_to_node(argv : Array[String]) -> Option[Int] {
-  match station_sys::env_get("STILLFAIL_PION_NATIVE_CONNECTS_TEST") {
-    Some("1") => return None
-    _ => ()
-  }
-  let os_name = station_sys::os_name()
-  let sep = if os_name == "win32" { "\\" } else { "/" }
-  let home = station_sys::homedir()
-  let env_data = station_sys::env_get("STILLFAIL_DATA")
-  let data = match parse_daemon_run_args(argv, env_data, home, sep=sep) {
-    Ok(parsed) => parsed.data
-    Err(_) => station_ops::data_dir([], env_data, home, sep=sep)
-  }
-  let reasons = check_external_connects_need_node(data, sep)
-  if reasons.length() == 0 {
-    return None
-  }
-  let sb = StringBuilder::new()
-  for i in 0..<reasons.length() {
-    if i > 0 {
-      sb.write_string(", ")
-    }
-    sb.write_string(reasons[i])
-  }
-  let reason_str = sb.to_string()
-  if is_engine_strict_env(station_sys::env_get("STILLFAIL_STATION_ENGINE_STRICT")) {
-    let _ = host_shim::write_stderr_line(
-      "pion whole station beta does not yet support enabled external connects ("
-      + reason_str
-      + "); keep engine=node until Wave 17B Hub delivery cutover",
-    )
-    return Some(1)
-  }
-  match resolve_node_and_main_js(argv, sep, os_name) {
-    Some((node_bin, main_js)) => {
-      // Cold-start pending replica restore without an existing `stillfail.db`: initialize an empty
-      // schema DB and close it immediately before `exec_replace` so Node's `takeBackSoon`
-      // (`restore.mbt:155`) finds an existing target database with zero leaked FDs.
-      let mut has_pending_restore = false
-      for i in 0..<reasons.length() {
-        if reasons[i] == "restore:pending-ready-json" {
-          has_pending_restore = true
-          break
-        }
-      }
-      if has_pending_restore {
-        let db_path = nodepath::join(sep, [data, "stillfail.db"])
-        let db_stat = station_sys::lstat_raw(db_path)
-        let wal_nonempty = file_is_nonempty(db_path + "-wal")
-        match db_stat {
-          None =>
-          if wal_nonempty {
-            let _ = host_shim::write_stderr_line(
-              "stillfail-station-pion: target db not ready for restore handoff (orphan_wal_without_db), preserving restore/ready.json",
-            )
-            return Some(1)
-          }
-          Some(raw) =>
-          match parse_stat_file_size(raw) {
-            Some(sz) =>
-            if sz == 0L && wal_nonempty {
-              let _ = host_shim::write_stderr_line(
-                "stillfail-station-pion: target db not ready for restore handoff (zero_byte_db_with_nonempty_wal), preserving restore/ready.json",
-              )
-              return Some(1)
-            }
-            None => ()
-          }
-        }
-        let existed_before = db_stat is Some(_)
-        let _ = station_sys::register_sqlite_js_lower()
-        match station_store::ensure_restore_target_schema(db_path, wait_ms=2000, now_ms=host_shim::wall_ms()) {
-          Ok(()) => ()
-          Err(se) => {
-            if !existed_before && se.code != 5 && se.code != 6 {
-              match station_sys::lstat_raw(db_path) {
-                Some(after_raw) =>
-                match parse_stat_file_size(after_raw) {
-                  Some(sz) =>
-                  if sz == 0L && !file_is_nonempty(db_path + "-wal") {
-                    let _ = station_sys::unlink(db_path)
-                    let _ = station_sys::unlink(db_path + "-journal")
-                  }
-                  None => ()
-                }
-                None => ()
-              }
-            }
-            let _ = host_shim::write_stderr_line(
-              "stillfail-station-pion: target db not ready for restore handoff (rc="
-              + se.code.to_string()
-              + ":"
-              + se.message
-              + "), preserving restore/ready.json",
-            )
-            return Some(1)
-          }
-        }
-      }
-      let _ = host_shim::write_stderr_line(
-        "stillfail-station-pion: external connects active ("
-        + reason_str
-        + "); exec-replacing into Node station",
-      )
-      let child_argv : Array[String] = [node_bin, main_js]
-      for i in 1..<argv.length() {
-        child_argv.push(argv[i])
-      }
-      let rc = station_sys::exec_replace(node_bin, child_argv)
-      Some(rc)
-    }
-    None => {
-      let _ = host_shim::write_stderr_line(
-        "stillfail-station-pion: external connects active ("
-        + reason_str
-        + "), but Node station fallback (node / <app>/station/main.js) was not found",
-      )
-      Some(1)
     }
   }
 }
@@ -1211,6 +1289,13 @@ fn main(_world : World) -> Unit {
   }
   if argv.length() == 2 && argv[1] == "--smoke-sys" {
     let rc = run_smoke_sys()
+    if rc != 0 {
+      host_shim::exit_process(rc)
+    }
+    return
+  }
+  if argv.length() == 3 && argv[1] == "--smoke-runner" {
+    let rc = run_smoke_runner(argv[2])
     if rc != 0 {
       host_shim::exit_process(rc)
     }
@@ -1280,14 +1365,10 @@ fn main(_world : World) -> Unit {
     }
     match find_main_subcommand(cli_args) {
       Some("run") => {
-        // Wave 17B-5: external connects protocol & Hub routing are ready in Pion `whole_daemon`,
-        // while the Wave 17A Node `exec_replace` entry gate remains active until Wave 17C-1
-        // wires live `stillfail-runner` process spawning to consume `started_prompts`.
+        // Wave 17C-1: live `stillfail-runner` spawning & turn execution are wired in Pion
+        // `whole_daemon`; external connects & cross-station `connect.event` run natively on Pion.
         let rc = if should_run_whole_daemon(argv) {
-          match maybe_handoff_external_connects_to_node(argv) {
-            Some(handoff_rc) => handoff_rc
-            None => run_whole_daemon(argv)
-          }
+          run_whole_daemon(argv)
         } else {
           run_rig_daemon(argv)
         }

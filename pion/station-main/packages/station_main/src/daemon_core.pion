@@ -815,6 +815,7 @@ pub struct DaemonCtx {
   mark_role_ready_fn : () -> Unit
   request_stop_fn : () -> Unit
   fail_and_stop_fn : (String) -> Unit
+  carry_fn : (base_codec::Json) -> Unit
   loopback_port_fn : () -> Int
   shown_loopback_port_fn : () -> Int
   announce_mcp_port_fn : (Int) -> Unit
@@ -905,6 +906,10 @@ pub fn DaemonCtx::request_stop(self : DaemonCtx) -> Unit {
 
 pub fn DaemonCtx::fail_and_stop(self : DaemonCtx, msg : String) -> Unit {
   (self.fail_and_stop_fn)(msg)
+}
+
+pub fn DaemonCtx::carry(self : DaemonCtx, v : base_codec::Json) -> Unit {
+  (self.carry_fn)(v)
 }
 
 /// Write `mcp.json` and report `control.serving("mcp", port)` to the launcher.
@@ -1975,6 +1980,9 @@ pub fn run_daemon(argv : Array[String], hooks : DaemonRoleHooks) -> Int {
       let _ = control.failed(msg)
       handover_failed = true
       stopping = true
+    },
+    carry_fn: fn(v : base_codec::Json) -> Unit {
+      let _ = control.carry(v)
     },
     loopback_port_fn: fn() -> Int { loopback_bound_port },
     shown_loopback_port_fn: fn() -> Int { loopback_shown_port },

@@ -859,9 +859,10 @@ test "decide_connect_inbound covers full multi/single-session, requireMention, e
   // OwnNotice: aligned with Node `acceptOwnNotice` (no spurious notice rows).
   assert_true(decide_connect_inbound(false, true, false, true, own_notice) is ConnectInboundDecision::IgnoreAndAck, "ownNotice ignored & ACKed")
 
-  // Unimplemented Stop / LoginCode fail closed.
-  assert_true(decide_connect_inbound(false, true, false, true, stop) is ConnectInboundDecision::RefuseNoAck, "Stop fails closed")
-  assert_true(decide_connect_inbound(false, true, false, true, login) is ConnectInboundDecision::RefuseNoAck, "LoginCode fails closed")
+  // W17C-1 R2 (P0-5): Stop routes to StopTurn on existing threads (IgnoreAndAck otherwise); LoginCode routes to HandleLoginCode.
+  assert_true(decide_connect_inbound(false, true, false, true, stop) is ConnectInboundDecision::StopTurn, "Stop triggers StopTurn on existing thread")
+  assert_true(decide_connect_inbound(false, true, false, false, stop) is ConnectInboundDecision::IgnoreAndAck, "Stop on unknown thread ignored & ACKed")
+  assert_true(decide_connect_inbound(false, true, false, true, login) is ConnectInboundDecision::HandleLoginCode, "LoginCode routes to HandleLoginCode")
 }
 
 test "enabled_external_connects_in_config aligns 1:1 with Node config.ts:174 and remote_connects/strict helpers" {
@@ -1166,18 +1167,18 @@ test "W17B-5 Opus R2 regressions: P0-A runtime connect.event gate, P0-B connect.
   let has_local = fn(id : String) -> Bool { id == "slack-local" }
   let local_ws = fn(id : String) -> Option[String] { if id == "slack-local" { Some("ws-1") } else { None } }
 
-  // P0-A: With native gate disabled (default), BOTH `LearnAndDeliver` and `kept: true` MUST be rejected.
+  // Wave 17C-1: temporary native connects gate removed; valid remote/kept events validate directly.
   let valid_remote = parse(
     "{\"connect\":{\"id\":\"slack-remote\",\"origin\":\"st-peer\"},\"described\":{\"kind\":\"slack\",\"workspace\":\"ws-1\",\"bind\":{\"runtime\":\"claude\"}}}",
   )
-  match validate_connect_event_with_gate(false, valid_remote, "ws-1", "st-here", has_local, local_ws) {
-    ConnectEventValidation::Reject(msg) => assert_str_eq(msg, "native connects disabled until runner cutover")
-    _ => panic("P0-A: expected Reject when native gate is disabled")
+  match validate_connect_event(valid_remote, "ws-1", "st-here", has_local, local_ws) {
+    ConnectEventValidation::LearnAndDeliver(lid, _) => assert_str_eq(lid, "slack-remote@st-peer")
+    _ => panic("W17C-1: expected LearnAndDeliver for valid remote connect.event")
   }
   let valid_kept = parse("{\"kept\":true,\"connect\":{\"id\":\"slack-local\",\"origin\":\"st-here\"}}")
-  match validate_connect_event_with_gate(false, valid_kept, "ws-1", "st-here", has_local, local_ws) {
-    ConnectEventValidation::Reject(msg) => assert_str_eq(msg, "native connects disabled until runner cutover")
-    _ => panic("P0-A: expected Reject for kept when native gate is disabled")
+  match validate_connect_event(valid_kept, "ws-1", "st-here", has_local, local_ws) {
+    ConnectEventValidation::DeliverKept(lid) => assert_str_eq(lid, "slack-local")
+    _ => panic("W17C-1: expected DeliverKept for valid kept connect.event")
   }
 
   // P0-B: `build_connect_call_post_request` MUST match TS `remote.ts` `answerCall` 1:1:
@@ -1234,4 +1235,2140 @@ test "W17B-5 Opus R2 regressions: P0-A runtime connect.event gate, P0-B connect.
   assert_true(fstate.seen_of("feishu-1", "oc_chat1") == msg_create_ms - 1L, "P1-D: taking holds create_time - 1")
   fstate.commit_taking(hold)
   assert_true(fstate.seen_of("feishu-1", "oc_chat1") == msg_create_ms, "P1-D: commit advances to create_time, not local now")
+}
+
+test "W17C-1 live runner protocol: ready parse, runtime prompt/steer/cancel framing, skill-invocation, stdout event parsing" {
+  // 1. Ready line parsing
+  let ready_out = "debug line\n{\"ready\":true,\"id\":\"claude-chat_c-1\",\"runner\":4321,\"pid\":4322,\"pgid\":4322,\"startedAt\":1700000000000,\"program\":\"claude\",\"args\":[\"-p\"],\"socket\":\"/tmp/r.sock\",\"keeps\":true}\n"
+  match parse_runner_ready_line(ready_out) {
+    Some(info) => {
+      assert_str_eq(info.id, "claude-chat_c-1")
+      assert_true(info.runner_pid == 4321 && info.pid == 4322 && info.pgid == 4322, "runner pids parsed")
+      assert_str_eq(info.socket, "/tmp/r.sock")
+      assert_true(info.keeps, "keeps flag parsed")
+    }
+    None => panic("expected valid RunnerInfo from ready line")
+  }
+  assert_true(parse_runner_ready_line("not json") is None, "invalid ready line returns None")
+
+  // 2. Runner argv builder & skill-invocation framing
+  let rargs = build_live_runner_args("/data/run/runners", "claude-c1", "/ws/c1", "claude", ["-p", "--verbose"])
+  assert_true(rargs.length() == 10 && rargs[0] == "--dir" && rargs[6] == "--" && rargs[7] == "claude" && rargs[9] == "--verbose", "runner argv layout")
+  let with_skill = format_prompt_with_skill("do it", Some("pion"), Some("use pionc"))
+  assert_true(with_skill.starts_with("<skill-invocation name=\"pion\">\nuse pionc\n</skill-invocation>\n\ndo it"), "skill-invocation wrapper")
+  assert_str_eq(format_prompt_with_skill("plain", None, None), "plain")
+
+  // 3. Claude stream-json prompt/cancel framing & stdout event parsing
+  let cp = encode_runtime_prompt(station_drivers::RuntimeKind::Claude, "hello", "", 1)
+  assert_true(cp.contains("\"type\":\"user\"") && cp.contains("\"text\":\"hello\""), "claude userMessage frame")
+  let cc = encode_runtime_cancel(station_drivers::RuntimeKind::Claude, "", 2)
+  assert_true(cc.contains("\"type\":\"control_request\"") && cc.contains("\"subtype\":\"interrupt\""), "claude interrupt frame")
+  match parse_agent_stdout_line(station_drivers::RuntimeKind::Claude, "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sid-123\"}") {
+    ParsedAgentEvent::SessionId(sid) => assert_str_eq(sid, "sid-123")
+    _ => panic("expected SessionId from claude init")
+  }
+  match parse_agent_stdout_line(station_drivers::RuntimeKind::Claude, "{\"type\":\"result\",\"is_error\":false,\"session_id\":\"sid-123\",\"usage\":{\"input_tokens\":10,\"output_tokens\":20}}") {
+    ParsedAgentEvent::TurnCompleted(Some(sid), Some(u)) => {
+      assert_str_eq(sid, "sid-123")
+      assert_true(u.input == 10L && u.output == 20L, "claude usage parsed")
+    }
+    _ => panic("expected TurnCompleted with usage")
+  }
+
+  // 4. ACP JSON-RPC framing & stdout event parsing
+  assert_true(is_acp_runtime(station_drivers::RuntimeKind::Agy), "agy is ACP")
+  assert_true(!is_acp_runtime(station_drivers::RuntimeKind::Claude), "claude is not ACP")
+  let ap = encode_runtime_prompt(station_drivers::RuntimeKind::Agy, "go", "acp-s1", 3)
+  assert_true(ap.contains("\"method\":\"session/prompt\"") && ap.contains("\"id\":\"prompt:3\""), "acp session/prompt frame")
+  let ac = encode_runtime_cancel(station_drivers::RuntimeKind::Agy, "acp-s1", 4)
+  assert_true(ac.contains("\"method\":\"session/cancel\""), "acp session/cancel frame")
+  match parse_agent_stdout_line(station_drivers::RuntimeKind::Agy, "{\"jsonrpc\":\"2.0\",\"id\":\"open\",\"result\":{\"sessionId\":\"acp-s9\"}}") {
+    ParsedAgentEvent::AcpSessionOpened(sid) => assert_str_eq(sid, "acp-s9")
+    _ => panic("expected AcpSessionOpened")
+  }
+  match parse_agent_stdout_line(station_drivers::RuntimeKind::Agy, "{\"jsonrpc\":\"2.0\",\"id\":\"prompt:3\",\"result\":{\"stopReason\":\"end_turn\"}}") {
+    ParsedAgentEvent::TurnCompleted(_, _) => ()
+    _ => panic("expected ACP TurnCompleted")
+  }
+  match parse_agent_stdout_line(station_drivers::RuntimeKind::Agy, "{\"jsonrpc\":\"2.0\",\"id\":\"prompt:3\",\"result\":{\"stopReason\":\"cancelled\"}}") {
+    ParsedAgentEvent::TurnAborted => ()
+    _ => panic("expected ACP TurnAborted")
+  }
+}
+
+test "W17C-1 R2: workspace profile/CWD isolation, message envelope, Codex/ACP wire, Stop/LoginCode & stop key" {
+  let parse = fn(s : String) -> base_codec::Json {
+    match base_codec::json_parse(s) {
+      base_codec::JsonParseResult::Ok(j) => j
+      base_codec::JsonParseResult::Err(e) => panic(e)
+    }
+  }
+
+  // P0-1 & P0-2: Profile authorization (`share.borrowed` / `share.workspaces` / `withheld` / `enabled` / `machine` / `access` / `disabledRuntimes`)
+  let cfg = parse(
+    "{\"disabledRuntimes\":[\"grok\"],\"profiles\":[{\"id\":\"p-home\",\"runtime\":\"claude\",\"withheld\":[\"ws-other\"]},{\"id\":\"p-borrowed\",\"runtime\":\"claude\",\"share\":{\"borrowed\":true,\"workspaces\":[\"ws-shared\"]}},{\"id\":\"p-off\",\"runtime\":\"claude\",\"enabled\":false},{\"id\":\"p-machine\",\"runtime\":\"claude\",\"machine\":true},{\"id\":\"p-api\",\"runtime\":\"claude\",\"access\":{\"kind\":\"api-provider\",\"key\":\"sk-test\",\"provider\":\"openrouter\",\"endpoint\":\"https://api.example/v1\",\"protocol\":\"anthropic\"},\"models\":[\"claude-sonnet-4\"],\"maxConcurrentSessions\":4},{\"id\":\"p-grok\",\"runtime\":\"grok\"}]}",
+  )
+  assert_true(
+    resolve_authorized_profile(cfg, "p-home", station_drivers::RuntimeKind::Claude, "ws-home", "ws-home", "/data", "/").is_ok(),
+    "home ws allowed",
+  )
+  assert_true(
+    resolve_authorized_profile(cfg, "p-home", station_drivers::RuntimeKind::Claude, "ws-other", "ws-home", "/data", "/").is_err(),
+    "withheld ws refused",
+  )
+  assert_true(
+    resolve_authorized_profile(cfg, "p-borrowed", station_drivers::RuntimeKind::Claude, "ws-shared", "ws-home", "/data", "/").is_ok(),
+    "share.borrowed profile allowed in share.workspaces",
+  )
+  assert_true(
+    resolve_authorized_profile(cfg, "p-borrowed", station_drivers::RuntimeKind::Claude, "ws-other", "ws-home", "/data", "/").is_err(),
+    "share.borrowed profile refused outside share.workspaces",
+  )
+  assert_true(
+    resolve_authorized_profile(cfg, "p-off", station_drivers::RuntimeKind::Claude, "ws-home", "ws-home", "/data", "/").is_err(),
+    "disabled profile refused",
+  )
+  assert_true(
+    resolve_authorized_profile(cfg, "p-home", station_drivers::RuntimeKind::Codex, "ws-home", "ws-home", "/data", "/").is_err(),
+    "runtime mismatch refused",
+  )
+  assert_true(
+    resolve_authorized_profile(cfg, "p-grok", station_drivers::RuntimeKind::Grok, "ws-home", "ws-home", "/data", "/").is_err(),
+    "disabledRuntimes blocks grok",
+  )
+  match resolve_authorized_profile(cfg, "p-machine", station_drivers::RuntimeKind::Claude, "ws-home", "ws-home", "/data", "/") {
+    Ok(pm) => {
+      assert_true(pm.machine, "machine flag parsed")
+      assert_str_eq(pm.home, "")
+    }
+    Err(e) => panic("expected machine profile ok: " + e)
+  }
+  match resolve_authorized_profile(cfg, "p-api", station_drivers::RuntimeKind::Claude, "ws-home", "ws-home", "/data", "/") {
+    Ok(pa) => {
+      assert_true(station_drivers::access_kind_eq(pa.access_kind, station_drivers::AccessKind::ApiProvider), "api-provider access_kind parsed")
+      assert_str_eq(pa.access_key, "sk-test")
+      assert_true(pa.models.length() == 1 && pa.models[0] == "claude-sonnet-4", "models parsed")
+      assert_true(pa.max_concurrent_sessions == Some(4), "maxConcurrentSessions parsed")
+    }
+    Err(e) => panic("expected api-provider profile ok: " + e)
+  }
+  // R4: Codex steer uses `turn/steer` + `expectedTurnId`, cancel uses `turn/interrupt` + `turnId`.
+  let cs = encode_runtime_steer(station_drivers::RuntimeKind::Codex, "nudge", "th-42", 5, turn_id=Some("trn-9"))
+  assert_true(cs.contains("\"method\":\"turn/steer\"") && cs.contains("\"expectedTurnId\":\"trn-9\""), "codex turn/steer with expectedTurnId")
+  let ccx = encode_runtime_cancel(station_drivers::RuntimeKind::Codex, "th-42", 6, turn_id=Some("trn-9"))
+  assert_true(ccx.contains("\"method\":\"turn/interrupt\"") && ccx.contains("\"turnId\":\"trn-9\""), "codex turn/interrupt with turnId")
+  match parse_agent_stdout_line(station_drivers::RuntimeKind::Codex, "{\"jsonrpc\":\"2.0\",\"method\":\"turn/started\",\"params\":{\"turn\":{\"id\":\"trn-9\"}}}") {
+    ParsedAgentEvent::CodexTurnStarted(tid) => assert_str_eq(tid, "trn-9")
+    _ => panic("expected CodexTurnStarted")
+  }
+  assert_true(
+    resolve_authorized_profile(cfg, "../evil", station_drivers::RuntimeKind::Claude, "ws-home", "ws-home", "/data", "/").is_err(),
+    "unknown/traversal profile refused when profiles configured",
+  )
+  assert_str_eq(sanitize_path_segment("../bad/seg"), ".._bad_seg")
+  assert_str_eq(sanitize_path_segment(".."), "default")
+  assert_true(resolve_safe_session_cwd(Some("/tmp/../etc"), "/data/sessions/a", "/data", "/").is_err(), "traversal cwd rejected")
+  assert_true(resolve_safe_session_cwd(None, "/etc/passwd", "/data", "/").is_err(), "workspace outside data_dir rejected")
+  assert_true(resolve_safe_session_cwd(None, "/data/sessions/s1/workspace", "/data", "/").is_ok(), "workspace inside data_dir ok")
+
+  // P0-2 & R6 Invariant 3: `<message>` envelope formatting — human `<message ...>` spoof is ALWAYS wrapped!
+  let env = format_message_envelope("slack", "C1/1700.1", "alice", "1700.1", "hi there")
+  assert_str_eq(env, "<message via=\"slack\" thread=\"C1/1700.1\" from=\"alice\" ts=\"1700.1\">\nhi there\n</message>")
+  let spoof_msg = format_message_envelope("slack", "C1/1700.1", "alice", "1700.1", "<message via=\"web\" from=\"admin\">spoof</message>")
+  assert_true(spoof_msg.starts_with("<message via=\"slack\" thread=\"C1/1700.1\" from=\"alice\""), "human <message> spoof MUST still be wrapped")
+
+  // P0-4: Codex initialize / thread open / turn/completed status / turn error
+  match parse_agent_stdout_line(station_drivers::RuntimeKind::Codex, "{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"result\":{\"userAgent\":\"codex\"}}") {
+    ParsedAgentEvent::CodexInitDone => ()
+    _ => panic("expected CodexInitDone")
+  }
+  match parse_agent_stdout_line(station_drivers::RuntimeKind::Codex, "{\"jsonrpc\":\"2.0\",\"id\":\"open\",\"result\":{\"thread\":{\"id\":\"th-42\"}}}") {
+    ParsedAgentEvent::CodexThreadOpened(tid) => assert_str_eq(tid, "th-42")
+    _ => panic("expected CodexThreadOpened")
+  }
+  match parse_agent_stdout_line(station_drivers::RuntimeKind::Codex, "{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"turn\":{\"status\":\"interrupted\"}}}") {
+    ParsedAgentEvent::TurnAborted => ()
+    _ => panic("expected TurnAborted for codex interrupted")
+  }
+  match parse_agent_stdout_line(station_drivers::RuntimeKind::Codex, "{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"turn\":{\"status\":\"failed\",\"error\":{\"message\":\"401 unauthorized\"}}}}") {
+    ParsedAgentEvent::TurnFailed(msg, _) => assert_true(msg.contains("auth"), "codex error classified")
+    _ => panic("expected TurnFailed for codex failed")
+  }
+  match parse_agent_stdout_line(station_drivers::RuntimeKind::Codex, "{\"jsonrpc\":\"2.0\",\"id\":\"turn:1\",\"error\":{\"code\":-32000,\"message\":\"rate limit exceeded\"}}") {
+    ParsedAgentEvent::TurnFailed(_, _) => ()
+    _ => panic("expected TurnFailed for codex turn/start error")
+  }
+
+  // P0-4: ACP permission request preserves integer id + picks `allow_once` or `cancelled`
+  match parse_agent_stdout_line(
+    station_drivers::RuntimeKind::Agy,
+    "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"session/request_permission\",\"params\":{\"options\":[{\"optionId\":\"deny-1\",\"kind\":\"reject_once\"},{\"optionId\":\"ok-once\",\"kind\":\"allow_once\"}]}}",
+  ) {
+    ParsedAgentEvent::AcpPermissionRequest(raw_id, Some(oid)) => {
+      assert_str_eq(oid, "ok-once")
+      let reply = build_acp_permission_reply(raw_id, Some(oid))
+      assert_true(reply.contains("\"id\":7") && reply.contains("\"optionId\":\"ok-once\""), "integer id and allow_once preserved")
+    }
+    _ => panic("expected AcpPermissionRequest with allow_once")
+  }
+  match parse_agent_stdout_line(
+    station_drivers::RuntimeKind::Agy,
+    "{\"jsonrpc\":\"2.0\",\"id\":\"req-9\",\"method\":\"session/request_permission\",\"params\":{\"options\":[{\"optionId\":\"deny-1\",\"kind\":\"reject_once\"}]}}",
+  ) {
+    ParsedAgentEvent::AcpPermissionRequest(raw_id, None) => {
+      let reply = build_acp_permission_reply(raw_id, None)
+      assert_true(reply.contains("\"id\":\"req-9\"") && reply.contains("\"outcome\":\"cancelled\""), "cancelled when no allow_once")
+    }
+    _ => panic("expected AcpPermissionRequest with None option")
+  }
+
+  // P0-5: Connects Stop/LoginCode decisions + `/sessions/<key>/stop` extractor
+  match decide_connect_inbound(false, true, false, true, station_connects::ChatEvent::Stop("C1", "1.1", "1.2", None)) {
+    ConnectInboundDecision::StopTurn => ()
+    _ => panic("expected StopTurn for Stop on existing thread")
+  }
+  match decide_connect_inbound(false, true, false, false, station_connects::ChatEvent::LoginCode("C1", "1.1", "login-1", "123456", "u1")) {
+    ConnectInboundDecision::HandleLoginCode => ()
+    _ => panic("expected HandleLoginCode")
+  }
+  match extract_session_stop_key("POST", "/sessions/chat%3Ac-abc/stop?x=1") {
+    Some(k) => assert_str_eq(k, "chat:c-abc")
+    None => panic("expected decoded session key from /sessions/<key>/stop")
+  }
+  assert_true(extract_session_stop_key("GET", "/sessions/s1/stop") is None, "GET is not stop")
+}
+
+test "W17C-1 R4: unified live policy (relative home, runtimes[], ws agent_home, canonical CWD), newline ACK, [station] passthrough" {
+  let parse = fn(s : String) -> base_codec::Json {
+    match base_codec::json_parse(s) {
+      base_codec::JsonParseResult::Ok(j) => j
+      base_codec::JsonParseResult::Err(e) => panic(e)
+    }
+  }
+
+  // 1. Relative `home: "homes/p1"` resolves under `data_dir` & `runtimes: ["codex"]` is honored.
+  let cfg = parse(
+    "{\"profiles\":[{\"id\":\"p-rel\",\"runtimes\":[\"codex\",\"claude\"],\"home\":\"homes/p1\"},{\"id\":\"p-trav\",\"runtime\":\"claude\",\"home\":\"../escape\"}]}",
+  )
+  match resolve_authorized_profile(cfg, "p-rel", station_drivers::RuntimeKind::Codex, "ws-home", "ws-home", "/data", "/") {
+    Ok(pr) => assert_str_eq(pr.home, "/data/homes/p1")
+    Err(e) => panic("expected relative home + runtimes[] ok: " + e)
+  }
+  assert_true(
+    resolve_authorized_profile(cfg, "p-rel", station_drivers::RuntimeKind::Agy, "ws-home", "ws-home", "/data", "/").is_err(),
+    "runtime outside runtimes[] refused",
+  )
+  assert_true(
+    resolve_authorized_profile(cfg, "p-trav", station_drivers::RuntimeKind::Claude, "ws-home", "ws-home", "/data", "/").is_err(),
+    "relative home traversal refused",
+  )
+
+  // 2. Workspace-isolated agent home (`<data>/agent` vs `<data>/agent/workspaces/<ws>`).
+  match workspace_agent_home_path("/data", "ws-home", "ws-home", "/") {
+    Ok(p) => assert_str_eq(p, "/data/agent")
+    Err(e) => panic("home agent_home err: " + e)
+  }
+  match workspace_agent_home_path("/data", "ws-joined", "ws-home", "/") {
+    Ok(p) => assert_str_eq(p, "/data/agent/workspaces/ws-joined")
+    Err(e) => panic("joined agent_home err: " + e)
+  }
+  assert_true(workspace_agent_home_path("/data", "../bad", "ws-home", "/").is_err(), "ws traversal refused")
+
+  // 3. Canonical CWD via nearest existing ancestor `realpath` (blocks symlink escape & `<data_dir>`!).
+  let own_s1 = server_session_workspace_dir("/data", "ws-home", "s1", "/")
+  let real_own_s1 = own_s1.replace("/data/", "/real/data/")
+  let fake_realpath = fn(p : String) -> Result[String, station_ops::FsErr] {
+    if p == "/data" { Ok("/real/data") }
+    else if p == "/data/sessions" { Ok("/real/data/sessions") }
+    else if p == own_s1 { Ok(real_own_s1) }
+    else if p == "/data/sessions/other/workspace" { Ok("/real/data/sessions/other/workspace") }
+    else if p == "/data/sessions/s1/link-escape" { Ok("/etc") }
+    else if p == "/real/home_drive" { Ok("/real/home_drive") }
+    else if p == "/real/ws_b_drive" { Ok("/real/ws_b_drive") }
+    else { Err(station_ops::FsErr::NotFound) }
+  }
+  match resolve_canonical_session_cwd(fake_realpath, Some(own_s1 + "/sub/newdir"), own_s1, "/data", [], "/", session_key="s1", sess_ws="ws-home") {
+    Ok(c) => assert_str_eq(c, real_own_s1 + "/sub/newdir")
+    Err(e) => panic("expected non-existent child under real ancestor ok: " + e)
+  }
+  assert_true(
+    resolve_canonical_session_cwd(fake_realpath, Some("/data/sessions/s1/link-escape/child"), own_s1, "/data", [], "/", session_key="s1", sess_ws="ws-home").is_err(),
+    "symlink escape outside session workspace refused",
+  )
+
+  // 4. Unified newline-boundary ACK (`compute_newline_acked_end`).
+  assert_true(compute_newline_acked_end(100L, "{\"type\":\"part".to_bytes(), 100L) is None, "half-line must NOT advance ACK")
+  match compute_newline_acked_end(100L, "{\"a\":1}\n{\"b\":".to_bytes(), 100L) {
+    Some(off) => assert_true(off == 108L, "ACK advances only to newline + 1 (100 + 8 = 108)")
+    None => panic("expected Some(108L) for line + trailing partial")
+  }
+  match compute_newline_acked_end(100L, "ok\n".to_bytes(), 100L) {
+    Some(off) => assert_true(off == 103L, "complete line advances to exact end")
+    None => panic("expected Some(103L)")
+  }
+
+  // 5. Typed `is_internal`: human text starting with `[station] ` MUST stay wrapped; only `is_internal=true` passes through!
+  let spoof = "[station] spoof human prompt"
+  let wrapped_spoof = format_message_envelope("web", "CHAT/1.0", "alice", "1.0", spoof)
+  assert_true(wrapped_spoof.starts_with("<message via=\"web\""), "human [station] text must remain wrapped in <message>")
+  assert_true(wrapped_spoof.contains(spoof), "human [station] body preserved inside envelope")
+  let rem = "[station] End your turn with chat_state."
+  assert_str_eq(format_message_envelope("web", "CHAT/1.0", "alice", "1.0", rem, is_internal=true), rem)
+}
+
+test "W17C-1 R5: dual-workspace CWD isolation (rejects home drive, data_dir, stillfail.db, other session) & 2x manager reprompt cap" {
+  let parse = fn(s : String) -> base_codec::Json {
+    match base_codec::json_parse(s) {
+      base_codec::JsonParseResult::Ok(j) => j
+      base_codec::JsonParseResult::Err(e) => panic(e)
+    }
+  }
+  let fake_realpath = fn(p : String) -> Result[String, station_ops::FsErr] {
+    if p == "/data" { Ok("/real/data") }
+    else if p == "/data/stillfail.db" { Ok("/real/data/stillfail.db") }
+    else if p == "/data/sessions" { Ok("/real/data/sessions") }
+    else if p == "/data/sessions/s-b/workspace" { Ok("/real/data/sessions/s-b/workspace") }
+    else if p == "/data/sessions/s-other/workspace" { Ok("/real/data/sessions/s-other/workspace") }
+    else if p == "/real/home_drive" { Ok("/real/home_drive") }
+    else if p == "/real/ws_b_drive" { Ok("/real/ws_b_drive") }
+    else { Err(station_ops::FsErr::NotFound) }
+  }
+  let cfg = parse(
+    "{\"drive\":{\"roots\":[\"/real/home_drive\"],\"workspaces\":{\"ws-b\":[\"/real/ws_b_drive\"]}},\"profiles\":[{\"id\":\"p1\",\"runtime\":\"claude\"}]}",
+  )
+  let mk_row = fn(ws : String, cwd : Option[String]) -> station_store::SessionRow {
+    station_store::SessionRow::{
+      key: "chat:s-b",
+      connect: "web",
+      sess_scope: "",
+      title: None,
+      created_by: None,
+      runtime: "claude",
+      profile: "p1",
+      model: None,
+      effort: None,
+      workspace: "/data/sessions/s-b/workspace",
+      cwd: cwd,
+      token: "tok",
+      running: false,
+      created_at: 0L,
+      last_active_at: 0L,
+      archived_at: None,
+      archived_by: None,
+      shown_at: None,
+      ws: Some(ws),
+      conv: None,
+    }
+  }
+  // Joined ws-b MUST reject: home Drive root, <data_dir>, <data_dir>/stillfail.db, <data_dir>/sessions, and other session dir!
+  assert_true(
+    resolve_session_launch_policy(cfg, fake_realpath, mk_row("ws-b", Some("/real/home_drive")), station_drivers::RuntimeKind::Claude, "ws-home", "/data", "/").is_err(),
+    "joined ws-b must reject home workspace drive root",
+  )
+  assert_true(
+    resolve_session_launch_policy(cfg, fake_realpath, mk_row("ws-b", Some("/data")), station_drivers::RuntimeKind::Claude, "ws-home", "/data", "/").is_err(),
+    "joined ws-b must reject station data_dir",
+  )
+  assert_true(
+    resolve_session_launch_policy(cfg, fake_realpath, mk_row("ws-b", Some("/data/stillfail.db")), station_drivers::RuntimeKind::Claude, "ws-home", "/data", "/").is_err(),
+    "joined ws-b must reject stillfail.db",
+  )
+  assert_true(
+    resolve_session_launch_policy(cfg, fake_realpath, mk_row("ws-b", Some("/data/sessions/s-other/workspace")), station_drivers::RuntimeKind::Claude, "ws-home", "/data", "/").is_err(),
+    "joined ws-b must reject another session's workspace",
+  )
+  // Joined ws-b MUST allow: its own server-owned session workspace AND its own workspace Drive root!
+  assert_true(
+    resolve_session_launch_policy(cfg, fake_realpath, mk_row("ws-b", None), station_drivers::RuntimeKind::Claude, "ws-home", "/data", "/").is_ok(),
+    "joined ws-b allows default server-owned session workspace",
+  )
+  assert_true(
+    resolve_session_launch_policy(cfg, fake_realpath, mk_row("ws-b", Some("/real/ws_b_drive")), station_drivers::RuntimeKind::Claude, "ws-home", "/data", "/").is_ok(),
+    "joined ws-b allows own workspace drive root",
+  )
+  // Even if `row.workspace` in DB were tampered to point at another session's dir, server NEVER trusts `row.workspace`!
+  let tampered = station_store::SessionRow::{ ..mk_row("ws-b", Some("/data/sessions/s-other/workspace")), workspace: "/data/sessions/s-other/workspace" }
+  assert_true(
+    resolve_session_launch_policy(cfg, fake_realpath, tampered, station_drivers::RuntimeKind::Claude, "ws-home", "/data", "/").is_err(),
+    "tampered row.workspace pointing at another session MUST be rejected",
+  )
+  // Home workspace allows home Drive root!
+  assert_true(
+    resolve_session_launch_policy(cfg, fake_realpath, mk_row("ws-home", Some("/real/home_drive")), station_drivers::RuntimeKind::Claude, "ws-home", "/data", "/").is_ok(),
+    "home ws allows home drive root",
+  )
+
+  // Manager-level reprompt restart budget survives runner respawns and caps at 2 attempts.
+  let mgr = LiveRunnerManager::new()
+  assert_true(mgr.consume_reprompt_restart_budget("chat:c-1"), "1st undeclared exit restarts")
+  assert_true(mgr.consume_reprompt_restart_budget("chat:c-1"), "2nd undeclared exit restarts")
+  assert_true(!mgr.consume_reprompt_restart_budget("chat:c-1"), "3rd undeclared exit stops restarting")
+  mgr.reset_reprompt_restart_budget("chat:c-1")
+  assert_true(mgr.consume_reprompt_restart_budget("chat:c-1"), "real human prompt resets budget")
+}
+
+test "W17C-1 R7 collision-free session workspace encoding, no blind legacy exemption & wire event roundtrip" {
+  // 1. Distinct `(ws, skey)` pairs whose sanitized forms would collide MUST map to distinct directories!
+  let d1 = server_session_workspace_dir("/data", "ws_a", "k:1", "/")
+  let d2 = server_session_workspace_dir("/data", "ws:a", "k:1", "/")
+  let d3 = server_session_workspace_dir("/data", "ws_a", "k_1", "/")
+  let d4 = server_session_workspace_dir("/data", "ws_a", "k:1", "/")
+  assert_true(d1 != d2, "ws_a vs ws:a must not collide")
+  assert_true(d1 != d3, "k:1 vs k_1 must not collide")
+  assert_true(d2 != d3, "ws:a/k:1 vs ws_a/k_1 must not collide")
+  assert_str_eq(d1, d4)
+  assert_str_eq(d1, station_whole::server_session_workspace_dir("/data", "ws_a", "k:1", "/"))
+
+  // 2. Blind legacy `<data>/sessions/<sanitize(key)>/workspace` MUST be rejected without `verified_legacy_ws`!
+  let fake_realpath = fn(p : String) -> Result[String, station_ops::FsErr] { Ok(p) }
+  let blind_legacy = "/data/sessions/chat_c-1/workspace"
+  assert_true(
+    resolve_canonical_session_cwd(
+      fake_realpath,
+      Some(blind_legacy),
+      blind_legacy,
+      "/data",
+      [],
+      "/",
+      session_key="chat:c-1",
+      sess_ws="ws-b",
+    ).is_err(),
+    "blind legacy dir without verified_legacy_ws must be rejected",
+  )
+  assert_true(
+    resolve_canonical_session_cwd(
+      fake_realpath,
+      Some(blind_legacy),
+      blind_legacy,
+      "/data",
+      [],
+      "/",
+      session_key="chat:c-1",
+      sess_ws="ws-b",
+      verified_legacy_ws=Some(blind_legacy),
+    ).is_ok(),
+    "explicitly verified legacy dir under <data>/sessions/ is allowed",
+  )
+
+  // 3. `encode_wire_chat_event` round-trips cleanly through `parse_wire_chat_event` for local movedTo forwarding!
+  let msg_ev = station_connects::ChatEvent::Message(
+    station_connects::InboundMessage::{
+      channel: "C100",
+      thread_ts: "1700.1",
+      ts: "1700.2",
+      user: "U1",
+      text: "hello moved",
+      addressed: true,
+      files: [],
+      quoted: Some("1700.0"),
+    },
+  )
+  match parse_wire_chat_event(encode_wire_chat_event(msg_ev)) {
+    Some(station_connects::ChatEvent::Message(m)) => {
+      assert_str_eq(m.channel, "C100")
+      assert_str_eq(m.thread_ts, "1700.1")
+      assert_str_eq(m.text, "hello moved")
+      assert_true(m.addressed, "addressed preserved")
+    }
+    _ => panic("expected Message roundtrip")
+  }
+  let stop_ev = station_connects::ChatEvent::Stop("C100", "1700.1", "1700.3", None)
+  match parse_wire_chat_event(encode_wire_chat_event(stop_ev)) {
+    Some(station_connects::ChatEvent::Stop(ch, tts, ts, _)) => {
+      assert_str_eq(ch, "C100")
+      assert_str_eq(tts, "1700.1")
+      assert_str_eq(ts, "1700.3")
+    }
+    _ => panic("expected Stop roundtrip")
+  }
+}
+
+test "W17C-1 R8 P0 modern root symlink anchor, legacy Node Connects cwd=NULL, encode_connect_event_rpc roundtrip" {
+  // 1. Modern hashed root symlink escape MUST be rejected even when `row_cwd` is None!
+  let own_s1 = server_session_workspace_dir("/data", "ws-a", "s1", "/")
+  let escaped_realpath = fn(p : String) -> Result[String, station_ops::FsErr] {
+    if p == "/data" { Ok("/real/data") }
+    else if p == "/data/sessions" { Ok("/real/data/sessions") }
+    else if p == own_s1 { Ok("/real/data/sessions/s-victim/workspace") }
+    else { Err(station_ops::FsErr::NotFound) }
+  }
+  match resolve_canonical_session_cwd(escaped_realpath, None, own_s1, "/data", [], "/", session_key="s1", sess_ws="ws-a") {
+    Err(msg) => assert_str_eq(msg, "server session workspace symlink escape")
+    Ok(c) => panic("expected symlink escape error, got: " + c)
+  }
+
+  // 2. Legacy Node Connects row (`cwd = None`, verified `row.workspace` on disk) resolves to legacy dir, NOT empty hash dir!
+  let leg_dir = "/data/sessions/slack-1/C1-1700/workspace"
+  let ok_realpath = fn(p : String) -> Result[String, station_ops::FsErr] {
+    if p == "/data" { Ok("/real/data") }
+    else if p == "/data/sessions" { Ok("/real/data/sessions") }
+    else if p == leg_dir { Ok("/real/data/sessions/slack-1/C1-1700/workspace") }
+    else { Err(station_ops::FsErr::NotFound) }
+  }
+  match resolve_canonical_session_cwd(
+    ok_realpath,
+    None,
+    leg_dir,
+    "/data",
+    [],
+    "/",
+    session_key="slack-1:C1/1700",
+    sess_ws="ws-a",
+    verified_legacy_ws=Some(leg_dir),
+  ) {
+    Ok(c) => assert_str_eq(c, "/real/data/sessions/slack-1/C1-1700/workspace")
+    Err(e) => panic("expected verified legacy dir for cwd=None, got: " + e)
+  }
+
+  // 3. `encode_connect_event_rpc` round-trips directly into `validate_connect_event` with `connect: {id, origin}`!
+  let desc = describe_connect_meta(
+    "sl-1",
+    ConnectMeta::{
+      ws: "ws-1",
+      config_surface: "slack:T1",
+      single: false,
+      require_mention: true,
+      runtime: "claude",
+      profile: "default",
+      cwd: None,
+    },
+  )
+  let ev_j = encode_wire_chat_event(
+    station_connects::ChatEvent::Message(
+      station_connects::InboundMessage::{
+        channel: "C1",
+        thread_ts: "100.1",
+        ts: "100.2",
+        user: "U1",
+        text: "moved msg",
+        addressed: true,
+        files: [],
+        quoted: None,
+      },
+    ),
+  )
+  let rpc = encode_connect_event_rpc("sl-1", "st-origin", "ws-1", desc, ev_j)
+  let has_local = fn(_id : String) -> Bool { false }
+  let local_ws = fn(_id : String) -> Option[String] { None }
+  match validate_connect_event(rpc, "ws-1", "st-dest", has_local, local_ws) {
+    ConnectEventValidation::LearnAndDeliver(cid, _) => assert_str_eq(cid, "sl-1@st-origin")
+    ConnectEventValidation::Reject(e) => panic("expected LearnAndDeliver, got Reject: " + e)
+    _ => panic("expected LearnAndDeliver")
+  }
+}
+
+test "W17C-1 R8 canonical legacy cross-ws symlink & parent/child collision checks" {
+  let base_ops = station_ops::MemFs::new().ops()
+  let custom_ops = station_ops::OpsFs::{
+    ..base_ops,
+    lstat: fn(p : String) -> Result[station_ops::FileMeta, station_ops::FsErr] {
+      if p == "/data/sessions/real-dir/workspace"
+      || p == "/data/sessions/parent-dir/workspace"
+      || p == "/data/sessions/parent-dir/workspace/sub"
+      || p == "/data/sessions/unique-a/workspace" {
+        Ok(station_ops::FileMeta::{ is_file: false, is_dir: true, is_link: false, size: 0L, mtime_ms: 0L, mtime_exact: "", ino: 0L, mode: 493 })
+      } else {
+        Err(station_ops::FsErr::NotFound)
+      }
+    },
+    realpath: fn(p : String) -> Result[String, station_ops::FsErr] {
+      if p == "/data" { Ok("/real/data") }
+      else if p == "/data/sessions" { Ok("/real/data/sessions") }
+      else if p == "/data/sessions/real-dir/workspace" { Ok("/real/data/sessions/real-dir/workspace") }
+      else if p == "/data/sessions/alias-link/workspace" { Ok("/real/data/sessions/real-dir/workspace") }
+      else if p == "/data/sessions/parent-dir/workspace" { Ok("/real/data/sessions/parent-dir/workspace") }
+      else if p == "/data/sessions/parent-dir/workspace/sub" { Ok("/real/data/sessions/parent-dir/workspace/sub") }
+      else if p == "/data/sessions/unique-a/workspace" { Ok("/real/data/sessions/unique-a/workspace") }
+      else { Err(station_ops::FsErr::NotFound) }
+    },
+  }
+  let other_ws_dirs = ["/data/sessions/alias-link/workspace", "/data/sessions/parent-dir/workspace/sub"]
+  // (1) Same physical dir referenced by ws-b via ancestor symlink alias -> MUST reject!
+  assert_true(
+    verify_legacy_session_workspace_against(custom_ops, "/data/sessions/real-dir/workspace", "/data", other_ws_dirs, "/") is None,
+    "symlink alias collision with ws-b must be rejected",
+  )
+  // (2) Parent contains ws-b child dir -> MUST reject!
+  assert_true(
+    verify_legacy_session_workspace_against(custom_ops, "/data/sessions/parent-dir/workspace", "/data", other_ws_dirs, "/") is None,
+    "parent containing ws-b child must be rejected",
+  )
+  // (3) Child inside ws-b parent dir -> MUST reject!
+  assert_true(
+    verify_legacy_session_workspace_against(custom_ops, "/data/sessions/parent-dir/workspace/sub", "/data", ["/data/sessions/parent-dir/workspace"], "/") is None,
+    "child inside ws-b parent must be rejected",
+  )
+  // (4) Uncanonicalizable other workspace path -> fail-closed None!
+  assert_true(
+    verify_legacy_session_workspace_against(custom_ops, "/data/sessions/unique-a/workspace", "/data", ["/unresolvable/path"], "/") is None,
+    "uncanonicalizable other workspace path must fail closed",
+  )
+  // (5) Unshared existing dir under <data>/sessions/ -> allowed!
+  match verify_legacy_session_workspace_against(custom_ops, "/data/sessions/unique-a/workspace", "/data", other_ws_dirs, "/") {
+    Some(c) => assert_str_eq(c, "/real/data/sessions/unique-a/workspace")
+    None => panic("expected unshared existing legacy dir to be allowed")
+  }
+  // (6) R9 P0: Non-NotFound FsErr (PermissionDenied / ELOOP) MUST fail closed immediately (NO parent fallback)!
+  let eacces_ops = station_ops::OpsFs::{
+    ..custom_ops,
+    realpath: fn(p : String) -> Result[String, station_ops::FsErr] {
+      if p == "/data" { Ok("/real/data") }
+      else if p == "/data/sessions" { Ok("/real/data/sessions") }
+      else if p == "/data/sessions/unique-a/workspace" { Ok("/real/data/sessions/unique-a/workspace") }
+      else if p == "/data/sessions/perm-denied/workspace" { Err(station_ops::FsErr::PermissionDenied("EACCES")) }
+      else if p == "/data/sessions/loop-link/workspace" { Err(station_ops::FsErr::Other("ELOOP")) }
+      else { Err(station_ops::FsErr::NotFound) }
+    },
+  }
+  assert_true(
+    canonicalize_with_existing_ancestor(eacces_ops.realpath, "/data/sessions/perm-denied/workspace", "/").is_err(),
+    "PermissionDenied must fail closed without parent fallback",
+  )
+  assert_true(
+    canonicalize_with_existing_ancestor(eacces_ops.realpath, "/data/sessions/loop-link/workspace", "/").is_err(),
+    "ELOOP must fail closed without parent fallback",
+  )
+  assert_true(
+    verify_legacy_session_workspace_against(eacces_ops, "/data/sessions/unique-a/workspace", "/data", ["/data/sessions/perm-denied/workspace"], "/") is None,
+    "PermissionDenied on other workspace path must fail closed",
+  )
+  assert_true(
+    verify_legacy_session_workspace_against(eacces_ops, "/data/sessions/unique-a/workspace", "/data", ["/data/sessions/loop-link/workspace"], "/") is None,
+    "ELOOP on other workspace path must fail closed",
+  )
+}
+
+test "W17C-1 R10 surface_for_described slack:<team> & symmetric is_runner_live_strict" {
+  // 1. Peer Slack `surface_for_described` (`slack:<team>` vs fallback `slack:<cid>` vs other kinds)
+  let desc_with_team = base_codec::json_obj([
+    ("kind", base_codec::json_str("slack")),
+    ("team", base_codec::json_str("T_TEAM_R10")),
+  ])
+  assert_str_eq(surface_for_described("slack", desc_with_team, "c-slack-r10"), "slack:T_TEAM_R10")
+  let desc_no_team = base_codec::json_obj([("kind", base_codec::json_str("slack"))])
+  assert_str_eq(surface_for_described("slack", desc_no_team, "c-slack-r10"), "slack:c-slack-r10")
+  let desc_feishu = base_codec::json_obj([("kind", base_codec::json_str("feishu"))])
+  assert_str_eq(surface_for_described("feishu", desc_feishu, "c-fs-1"), "feishu:c-fs-1")
+
+  // 2. Symmetric `is_runner_live_strict` rejects both +6s and -6s skew
+  let rinfo = station_drivers::RunnerInfo::{
+    id: "r1",
+    pid: 100,
+    pgid: 100,
+    runner_pid: 99,
+    program: "",
+    args: [],
+    socket: "/tmp/s",
+    started_at: 100000L,
+    keeps: false,
+    pty: false,
+    cwd: None,
+  }
+  assert_true(station_drivers::is_runner_live_strict(rinfo, true, Some(104000L)), "+4s allowed")
+  assert_true(station_drivers::is_runner_live_strict(rinfo, true, Some(96000L)), "-4s allowed")
+  assert_true(!station_drivers::is_runner_live_strict(rinfo, true, Some(106000L)), "+6s rejected")
+  assert_true(!station_drivers::is_runner_live_strict(rinfo, true, Some(94000L)), "-6s rejected")
+  assert_true(!station_drivers::is_runner_live_strict(rinfo, true, None), "None rejected")
+}
+
+test "W17C-1 R11 LiveRunnerManager handover carry state round-trip (pending_end_turns + draining_stopping_ids)" {
+  let mgr1 = LiveRunnerManager::new()
+  let drain_iid = station_whole::WholeAgents::runner_instance_id("r-drain", 4242, 1700000001000L)
+  mgr1.draining_stopping_ids.set(drain_iid, true)
+  mgr1.pending_end_turns.set(
+    "s-r11",
+    ManagerPendingEndTurn::{
+      session_key: "s-r11",
+      ws: "ws-a",
+      runtime_str: "claude",
+      profile_id: "default",
+      person_opt: Some("u@example.com"),
+      thread_id_opt: Some(77L),
+      launch_instance_id: Some("r-pre:1001:1700000000000"),
+      pend: PendingEndTurn::{
+        turn_id: Some("turn-r11"),
+        outcome: "failed",
+        detail: Some("handover before prompt delivery"),
+        declared_str: None,
+        need_opt: None,
+        wait_secs_opt: None,
+        wait_for_opt: None,
+        wait_watch_opt: None,
+        wall_ms: 1700000005000L,
+        was_completed: false,
+        reprompt_reminder: None,
+      },
+    },
+  )
+  assert_true(mgr1.has_handover_carry_state(), "mgr1 has handover carry state")
+  let carried_json = mgr1.export_handover_state_json()
+  let mgr2 = LiveRunnerManager::new()
+  assert_true(!mgr2.has_handover_carry_state(), "fresh mgr2 starts empty")
+  mgr2.import_handover_state_json(carried_json)
+  assert_true(mgr2.has_handover_carry_state(), "mgr2 imported handover carry state")
+  assert_true(mgr2.draining_stopping_ids.contains(drain_iid), "draining_stopping_ids preserved")
+  match mgr2.pending_end_turns.get("s-r11") {
+    Some(mp) => {
+      assert_str_eq(mp.ws, "ws-a")
+      assert_str_eq(mp.pend.outcome, "failed")
+      match mp.pend.turn_id {
+        Some(tid) => assert_str_eq(tid, "turn-r11")
+        None => panic("expected turn_id")
+      }
+      match mp.pend.detail {
+        Some(det) => assert_str_eq(det, "handover before prompt delivery")
+        None => panic("expected detail")
+      }
+    }
+    None => panic("expected imported ManagerPendingEndTurn for s-r11")
+  }
+}
+
+test "W17C-1 R12..R21 whole-live-runners.json persists across crash/restart & exact spawn:<rid>:<pid>:<start> OS-verified stop markers" {
+  let mem = station_ops::MemFs::new()
+  let ops = mem.ops()
+  let ho_file = "/run/whole-live-runners.json"
+  let t0 : Int64 = 1700000010000L
+
+  // 1. Predecessor writes `whole-live-runners.json` with uncommitted endTurn + exact `spawn:<rid>:<pid>:<start>`
+  let mgr1 = LiveRunnerManager::new()
+  mgr1.set_handover_state_path(ho_file)
+  let spawn_key = "spawn:r-spawn-r21:4321:" + t0.to_string()
+  mgr1.record_draining_stop_marker(spawn_key, "s-r12")
+  mgr1.pending_end_turns.set(
+    "s-r12",
+    ManagerPendingEndTurn::{
+      session_key: "s-r12",
+      ws: "ws-a",
+      runtime_str: "claude",
+      profile_id: "default",
+      person_opt: None,
+      thread_id_opt: None,
+      launch_instance_id: None,
+      pend: PendingEndTurn::{
+        turn_id: Some("turn-r12"),
+        outcome: "failed",
+        detail: Some("handover before prompt delivery"),
+        declared_str: None,
+        need_opt: None,
+        wait_secs_opt: None,
+        wait_for_opt: None,
+        wait_watch_opt: None,
+        wall_ms: t0,
+        was_completed: false,
+        reprompt_reminder: None,
+      },
+    },
+  )
+  assert_true(mgr1.sync_handover_state_file(ops, 1001, "/").is_ok(), "handover state file must be written")
+  assert_true(ops.read_text(ho_file).is_ok(), "handover state file exists on disk")
+
+  // 2. Successor loads file: even at +45s (past 30s!) with metadata still ENOENT, `spawn:` marker is
+  // NEVER cleared while PID 4321 is alive, and matches when metadata finally publishes at +45s!
+  let mgr2 = LiveRunnerManager::new()
+  mgr2.set_handover_state_path(ho_file)
+  match ops.read_text(ho_file) {
+    Ok(raw) => match base_codec::json_parse(raw) {
+      base_codec::JsonParseResult::Ok(j) => mgr2.import_handover_state_json(j)
+      _ => panic("invalid json")
+    }
+    Err(_) => panic("missing handover state file for successor 1")
+  }
+  assert_true(mgr2.has_pending_draining_stop_for_session("s-r12"), "spawn: marker gates pump for s-r12")
+  let verify_same_t0 = fn(p : Int, os_ms : Int64, b : Option[String], tk : Option[Int64]) -> SpawnIdentityVerdict {
+    verify_spawn_os_identity_with(p, os_ms, b, tk, 0, Some("boot-a"), Some(12345L), Some(t0))
+  }
+  assert_true(
+    !mgr2.sweep_draining_stop_markers(
+      t0 + 45000L,
+      check_pid_dead=fn(p, s) { live_runner_pid_confirmed_dead_with(p, s, 0, Some(t0)) },
+      verify_spawn_id=verify_same_t0,
+    ),
+    "R21/R23 Test 1: ENOENT at +45s must NEVER clear spawn: marker while PID 4321 is ConfirmedSame",
+  )
+  assert_true(mgr2.has_pending_draining_stop_for_session("s-r12"), "s-r12 still gated at +45s")
+  // Metadata publishes late at +45s with exact PID 4321 -> matches ONLY when OS identity is ConfirmedSame!
+  let late_iid = "r-spawn-r21:4321:" + (t0 + 45000L).to_string()
+  assert_true(
+    mgr2.is_draining_stop_target(late_iid, "r-spawn-r21", 4321, t0 + 45000L, verify_spawn_id=verify_same_t0),
+    "matches exact (rid, pid=4321) when OS identity is ConfirmedSame even at +45s",
+  )
+  assert_true(
+    !mgr2.is_draining_stop_target("r-spawn-r21:9999:" + (t0 + 45000L).to_string(), "r-spawn-r21", 9999, t0 + 45000L, verify_spawn_id=verify_same_t0),
+    "different PID 9999 must NOT match",
+  )
+  // R23: PID reuse (even 1s later!) MUST return false on is_draining_stop_target AND be cleared by sweep!
+  let verify_reused_1s = fn(p : Int, os_ms : Int64, b : Option[String], tk : Option[Int64]) -> SpawnIdentityVerdict {
+    verify_spawn_os_identity_with(p, os_ms, b, tk, 0, Some("boot-a"), Some(12346L), Some(t0 + 1000L))
+  }
+  let verify_unknown = fn(p : Int, os_ms : Int64, b : Option[String], tk : Option[Int64]) -> SpawnIdentityVerdict {
+    verify_spawn_os_identity_with(p, os_ms, b, tk, 0, None, None, None)
+  }
+  assert_true(
+    !mgr2.is_draining_stop_target(late_iid, "r-spawn-r21", 4321, t0 + 1000L, verify_spawn_id=verify_reused_1s),
+    "R23: reused PID (+1s later!) must NEVER match is_draining_stop_target",
+  )
+  assert_true(
+    !mgr2.is_draining_stop_target(late_iid, "r-spawn-r21", 4321, t0 + 1000L, verify_spawn_id=verify_unknown),
+    "R23: Unknown OS identity must NEVER match is_draining_stop_target",
+  )
+  match mgr2.find_draining_stop_session(late_iid, "r-spawn-r21", 4321, t0 + 45000L, verify_spawn_id=verify_same_t0) {
+    Some(sk) => assert_str_eq(sk, "s-r12")
+    None => panic("expected s-r12 from find_draining_stop_session")
+  }
+  // R23: Linux boot_id + start_ticks encode/parse/verify & PID reuse (ticks off by 1)
+  let linux_key = match encode_spawn_stop_key_pure("r-lx", 4399, t0, Some("boot-xyz"), Some(98765L)) {
+    Some(k) => k
+    None => panic("expected linux spawn key")
+  }
+  assert_str_eq(linux_key, "spawn:r-lx:4399:" + t0.to_string() + ":98765@boot-xyz")
+  assert_true(
+    verify_spawn_os_identity_with(4399, t0, Some("boot-xyz"), Some(98765L), 0, Some("boot-xyz"), Some(98765L), None)
+    is SpawnIdentityVerdict::ConfirmedSame,
+    "R23: Linux exact (boot_id, start_ticks) -> ConfirmedSame",
+  )
+  assert_true(
+    verify_spawn_os_identity_with(4399, t0, Some("boot-xyz"), Some(98765L), 0, Some("boot-xyz"), Some(98766L), None)
+    is SpawnIdentityVerdict::ConfirmedDeadOrReused,
+    "R23: Linux start_ticks off by 1 -> ConfirmedDeadOrReused",
+  )
+  assert_true(
+    verify_spawn_os_identity_with(4399, t0, Some("boot-xyz"), Some(98765L), 0, Some("boot-other"), Some(98765L), None)
+    is SpawnIdentityVerdict::ConfirmedDeadOrReused,
+    "R23: Linux boot_id changed -> ConfirmedDeadOrReused",
+  )
+  assert_true(
+    verify_spawn_os_identity_with(4399, t0, Some("boot-xyz"), Some(98765L), 0, Some("boot-xyz"), None, None)
+    is SpawnIdentityVerdict::Unknown,
+    "R23: Linux unreadable start_ticks -> Unknown",
+  )
+  assert_true(
+    verify_spawn_os_identity_with(4399, t0, None, None, 0, None, None, Some(t0 + 100L))
+    is SpawnIdentityVerdict::ConfirmedSame,
+    "R23: macOS/Win |actual - expected| == 100ms -> ConfirmedSame",
+  )
+  assert_true(
+    verify_spawn_os_identity_with(4399, t0, None, None, 0, None, None, Some(t0 + 101L))
+    is SpawnIdentityVerdict::ConfirmedDeadOrReused,
+    "R23: macOS/Win |actual - expected| == 101ms -> ConfirmedDeadOrReused",
+  )
+  assert_true(
+    verify_spawn_os_identity_with(4399, 0L, None, None, 0, None, None, Some(t0))
+    is SpawnIdentityVerdict::Unknown,
+    "R23: no kernel baseline (0L) while alive -> Unknown",
+  )
+  let mgr_reuse = LiveRunnerManager::new()
+  mgr_reuse.record_draining_stop_marker(linux_key, "s-reuse")
+  assert_true(
+    !mgr_reuse.sweep_draining_stop_markers(
+      t0 + 1000L,
+      check_pid_dead=fn(p, s) { live_runner_pid_confirmed_dead_with(p, s, 0, None) },
+      verify_spawn_id=verify_unknown,
+    ),
+    "R23: Unknown verdict must NEVER clear spawn: marker in sweep",
+  )
+  assert_true(
+    mgr_reuse.sweep_draining_stop_markers(
+      t0 + 1000L,
+      check_pid_dead=fn(p, s) { live_runner_pid_confirmed_dead_with(p, s, 0, Some(t0 + 1000L)) },
+      verify_spawn_id=verify_reused_1s,
+    ),
+    "R23: PID reuse (1s later / ticks mismatch) triggers sweep_draining_stop_markers cleanup",
+  )
+  assert_true(!mgr_reuse.has_pending_draining_stop_for_session("s-reuse"), "R23: PID reuse unblocks session")
+  // Because `is_draining_stop_target` is read-only, file stays on disk until confirmed exit!
+  assert_true(mgr2.sync_handover_state_file(ops, 1002, "/").is_ok(), "sync keeps file on disk")
+  assert_true(ops.read_text(ho_file).is_ok(), "file must remain on disk before runner Exit")
+
+  // 3. Confirmed exit clears stop marker; file unlinked once pending_end_turns also committed!
+  assert_true(mgr2.clear_draining_stop_target(Some(late_iid), "r-spawn-r21", 4321), "confirmed exit clears spawn: marker")
+  assert_true(!mgr2.has_pending_draining_stop_for_session("s-r12"), "s-r12 unblocked after confirmed exit")
+  assert_true(mgr2.sync_handover_state_file(ops, 1003, "/").is_ok(), "sync after exit")
+  assert_true(ops.read_text(ho_file).is_ok(), "file remains while pending_end_turns still uncommitted")
+  mgr2.pending_end_turns.remove("s-r12")
+  assert_true(mgr2.sync_handover_state_file(ops, 1003, "/").is_ok(), "sync after drain")
+  assert_true(ops.read_text(ho_file) is Err(station_ops::FsErr::NotFound), "file unlinked once truly drained")
+
+  // 4. R21/R23 Test 2: Process crashes before publishing metadata -> ESRCH (-3) clears immediately (no 30s wait!)
+  // while EPERM (-1) and unknown start_time (None) NEVER clear!
+  let mgr4 = LiveRunnerManager::new()
+  mgr4.set_handover_state_path(ho_file)
+  let crash_key = "spawn:r-crash:4322:" + t0.to_string()
+  mgr4.record_draining_stop_marker(crash_key, "s-crash")
+  assert_true(
+    !mgr4.sweep_draining_stop_markers(
+      t0 + 1000L,
+      check_pid_dead=fn(p, s) { live_runner_pid_confirmed_dead_with(p, s, -1, None) },
+      verify_spawn_id=fn(p, os_ms, b, tk) { verify_spawn_os_identity_with(p, os_ms, b, tk, -1, None, None, None) },
+    ),
+    "EPERM (-1) must NEVER clear spawn: marker",
+  )
+  assert_true(
+    !mgr4.sweep_draining_stop_markers(
+      t0 + 1000L,
+      check_pid_dead=fn(p, s) { live_runner_pid_confirmed_dead_with(p, s, 0, None) },
+      verify_spawn_id=verify_unknown,
+    ),
+    "alive + None start_time must NEVER clear spawn: marker",
+  )
+  assert_true(
+    mgr4.sweep_draining_stop_markers(
+      t0 + 1000L,
+      check_pid_dead=fn(p, s) { live_runner_pid_confirmed_dead_with(p, s, -3, None) },
+      verify_spawn_id=fn(p, os_ms, b, tk) { verify_spawn_os_identity_with(p, os_ms, b, tk, -3, None, None, None) },
+    ),
+    "R21/R23 Test 2: ESRCH (-3) clears crashed spawn: marker immediately without waiting 30s",
+  )
+  assert_true(!mgr4.has_pending_draining_stop_for_session("s-crash"), "s-crash unblocked immediately on ESRCH")
+
+  // 5. R15/R16/R21 guards: `should_delete_runner_launch_on_pending_replay` & tri-state PID death semantics
+  assert_true(!should_delete_runner_launch_on_pending_replay(true, false, false, true), "already_ended replay must NOT delete runner_launches")
+  assert_true(!should_delete_runner_launch_on_pending_replay(false, true, false, true), "active turn in mem must NOT delete runner_launches")
+  assert_true(!should_delete_runner_launch_on_pending_replay(false, false, true, true), "live/draining instance must NOT delete runner_launches")
+  assert_true(!should_delete_runner_launch_on_pending_replay(false, false, false, false), "unconfirmed-dead PID must NOT delete runner_launches")
+  assert_true(should_delete_runner_launch_on_pending_replay(false, false, false, true), "only newly-committed confirmed-dead untracked instance deletes runner_launches")
+  assert_true(!live_runner_pid_confirmed_dead_with(5000, 100000L, 0, None), "alive + None start_time != dead")
+  assert_true(!live_runner_pid_confirmed_dead_with(5000, 100000L, -1, None), "EPERM (-1) != dead")
+  assert_true(!live_runner_pid_confirmed_dead_with(5000, 0L, 0, Some(1700000000000L)), "started_at == 0L != dead")
+  assert_true(!live_runner_pid_confirmed_dead_with(5000, 100000L, 0, Some(90000L)), "actual < started_at (slow start) != dead")
+  assert_true(live_runner_pid_confirmed_dead_with(5000, 100000L, 0, Some(100000L + station_drivers::STARTED_SLACK_MS + 1L)), "actual > started_at + STARTED_SLACK_MS => PID reused => confirmed dead")
+  assert_true(live_runner_pid_confirmed_dead_with(5000, 100000L, -3, None), "ESRCH (-3) => confirmed dead")
+
+  // 6. R20/R21 Test 3 & 4: Missing/0/string `startedAt` -> Uncertain (NEVER ConfirmedDead!),
+  // tri-state Win32/POSIX `-1` vs `-3`, and per-runner isolation + directory PermissionDenied!
+  assert_true(
+    probe_runner_pid_status(4321, 0L, 0, Some(1700000000000L)) is RunnerPidStatus::Unknown,
+    "R21 Test 3: started_at == 0L MUST return Unknown, NEVER ConfirmedDead",
+  )
+  let no_rl = fn(_p : String) -> Option[String] { None }
+  let kill_ok = fn(_pid : Int) -> Int { 0 }
+  let kill_unknown = fn(_pid : Int) -> Int { -1 }
+  let kill_esrch = fn(_pid : Int) -> Int { -3 }
+  let no_start = fn(_pid : Int) -> Option[Int64] { None }
+  let mem_realpath = fn(p : String) -> Result[String, station_ops::FsErr] {
+    match (ops.stat)(p) {
+      Ok(_) => Ok(p)
+      Err(e) => Err(e)
+    }
+  }
+  let r21_dir = "/r21-iso/run/runners"
+  assert_true((ops.mkdir_p)(r21_dir).is_ok(), "mkdir r21 runners dir")
+  assert_true((ops.write_bytes)(r21_dir + "/r-missing-ts.json", "{\"id\":\"r-missing-ts\",\"runner\":4321,\"socket\":\"/tmp/s\"}".to_bytes(), 384).is_ok(), "write missing startedAt")
+  assert_true((ops.write_bytes)(r21_dir + "/r-zero-ts.json", "{\"id\":\"r-zero-ts\",\"runner\":4321,\"startedAt\":0,\"socket\":\"/tmp/s\"}".to_bytes(), 384).is_ok(), "write zero startedAt")
+  assert_true((ops.write_bytes)(r21_dir + "/r-str-ts.json", "{\"id\":\"r-str-ts\",\"runner\":4321,\"startedAt\":\"bad\",\"socket\":\"/tmp/s\"}".to_bytes(), 384).is_ok(), "write string startedAt")
+  let r21_good_json = "{\"id\":\"r-good-21\",\"runner\":4321,\"pid\":4322,\"pgid\":4322,\"startedAt\":" + (t0 + 5000L).to_string() + ",\"socket\":\"/tmp/r-good-21.sock\"}"
+  assert_true((ops.write_bytes)(r21_dir + "/r-good-21.json", r21_good_json.to_bytes(), 384).is_ok(), "write r-good-21.json")
+  assert_true(
+    probe_runner_file_with(ops, "/r21-iso", "/", "r-missing-ts", mem_realpath, no_rl, kill_ok, no_start) is RunnerFileProbe::Uncertain(_, None),
+    "R21 Test 3: missing startedAt MUST return Uncertain(_, None)",
+  )
+  assert_true(
+    probe_runner_file_with(ops, "/r21-iso", "/", "r-zero-ts", mem_realpath, no_rl, kill_ok, no_start) is RunnerFileProbe::Uncertain(_, None),
+    "R21 Test 3: startedAt == 0 MUST return Uncertain(_, None)",
+  )
+  assert_true(
+    probe_runner_file_with(ops, "/r21-iso", "/", "r-str-ts", mem_realpath, no_rl, kill_ok, no_start) is RunnerFileProbe::Uncertain(_, None),
+    "R21 Test 3: string startedAt MUST return Uncertain(_, None)",
+  )
+  let probe_unk = probe_runner_file_with(ops, "/r21-iso", "/", "r-good-21", mem_realpath, no_rl, kill_unknown, no_start)
+  match probe_unk {
+    RunnerFileProbe::Uncertain(_, Some(info)) => assert_str_eq(info.id, "r-good-21")
+    _ => panic("kill_rc == -1 MUST return Uncertain(_, Some(info)), never ConfirmedDead")
+  }
+  let probe_dead = probe_runner_file_with(ops, "/r21-iso", "/", "r-good-21", mem_realpath, no_rl, kill_esrch, no_start)
+  assert_true(probe_dead is RunnerFileProbe::ConfirmedDead, "kill_rc == -3 MUST return ConfirmedDead")
+  let scan_unk = discover_live_runners_scan_with(ops, "/r21-iso", "/", mem_realpath, no_rl, kill_unknown, no_start)
+  assert_true(!scan_unk.complete, "scan with invalid startedAt + kill_rc -1 must be incomplete")
+  assert_true(scan_unk.runners.length() == 1 && scan_unk.runners[0].id == "r-good-21", "scan must retain valid runner alongside invalid startedAt files")
+  let eacces_realpath = fn(_p : String) -> Result[String, station_ops::FsErr] {
+    Err(station_ops::FsErr::PermissionDenied("EACCES"))
+  }
+  assert_true(
+    probe_runner_file_with(ops, "/r21-iso", "/", "r-absent", eacces_realpath, no_rl, kill_ok, no_start) is RunnerFileProbe::Uncertain(_, None),
+    "dir PermissionDenied MUST return Uncertain(_, None)",
+  )
+  let missing_scan = discover_live_runners_scan_with(ops, "/no-such-data", "/", mem_realpath, no_rl, kill_ok, no_start)
+  assert_true(missing_scan.complete && missing_scan.runners.length() == 0, "missing runners dir is complete & empty")
+}
+
+test "W17C-1 R14 handover_state_dirty retries on OpsFs unlink failure & finish_draining preserves stop marker on socket error" {
+  let mem = station_ops::MemFs::new()
+  let base_ops = mem.ops()
+  let ho_file = "/run/whole-live-runners.json"
+  let mut fail_remove = true
+  let flaky_ops = station_ops::OpsFs::{
+    read_bytes: base_ops.read_bytes,
+    write_bytes: base_ops.write_bytes,
+    remove: fn(p : String) -> Result[Unit, station_ops::FsErr] {
+      if fail_remove { Err(station_ops::FsErr::PermissionDenied("injected unlink failure")) } else { (base_ops.remove)(p) }
+    },
+    rename: base_ops.rename,
+    mkdir_p: base_ops.mkdir_p,
+    readdir: base_ops.readdir,
+    stat: base_ops.stat,
+    lstat: base_ops.lstat,
+    readlink: base_ops.readlink,
+    realpath: base_ops.realpath,
+    truncate: base_ops.truncate,
+    rotate_in_place_native: base_ops.rotate_in_place_native,
+  }
+
+  // 1. `handover_state_dirty` stays true when unlink fails even though maps are empty, then clears on retry!
+  let mgr = LiveRunnerManager::new()
+  mgr.set_handover_state_path(ho_file)
+  mgr.draining_stopping_ids.set("r-dirty:777:1700000001000", true)
+  assert_true(mgr.sync_handover_state_file(flaky_ops, 2001, "/").is_ok(), "initial write succeeds")
+  assert_true(!mgr.handover_state_dirty, "clean after write")
+  mgr.draining_stopping_ids.remove("r-dirty:777:1700000001000")
+  assert_true(!mgr.has_handover_carry_state(), "maps now empty")
+  assert_true(mgr.sync_handover_state_file(flaky_ops, 2001, "/").is_err(), "unlink fails with PermissionDenied")
+  assert_true(mgr.handover_state_dirty, "dirty flag set on unlink failure")
+  assert_true(base_ops.read_text(ho_file).is_ok(), "stale file still on disk")
+  // Retry once FS recovers -> unlinks file and clears dirty flag!
+  fail_remove = false
+  assert_true(mgr.sync_handover_state_file(flaky_ops, 2001, "/").is_ok(), "retry unlink succeeds")
+  assert_true(!mgr.handover_state_dirty, "dirty flag cleared after retry")
+  assert_true(base_ops.read_text(ho_file) is Err(station_ops::FsErr::NotFound), "file unlinked on retry")
+
+  // 2. `finish_draining(confirmed_exited=false)` preserves stop marker, `confirmed_exited=true` clears it!
+  let mgr2 = LiveRunnerManager::new()
+  mgr2.set_handover_state_path(ho_file)
+  let inst = "r-eof:888:1700000002000"
+  mgr2.draining_stopping_ids.set(inst, true)
+  let dummy_sess = LiveRunnerSession::{
+    conn_id: 99,
+    session_key: "s-eof",
+    ws: "ws-a",
+    profile_id: "default",
+    model_opt: None,
+    person_opt: None,
+    thread_id_opt: None,
+    runtime_kind: station_drivers::RuntimeKind::Claude,
+    runtime_str: "claude",
+    runner_id: "r-eof",
+    spawn_pid: 888,
+    spawn_os_start_ms: 1700000002000L,
+    spawn_boot_id: None,
+    spawn_start_ticks: None,
+    is_acp: false,
+    is_codex: false,
+    is_adopted: true,
+    adopted_instance_id: Some(inst),
+    adopted_db_initialized: false,
+    phase: LiveRunnerPhase::Exited,
+    pending_prompt: None,
+    pending_steers: [],
+    runtime_session_id: None,
+    current_turn_id: None,
+    turn_started_at: 0L,
+    turn_start_out_offset: 0L,
+    pending_ack_out: 0L,
+    last_turn_ended_at: 0L,
+    stop_guard: station_drivers::OwnProcessStopGuard::new(station_drivers::RuntimeKind::Claude),
+    acp_guard: station_drivers::AcpTurnGuard::new(station_drivers::RuntimeKind::Claude),
+    agy_tracker: station_drivers::AgyStateTracker::new("", None),
+    claude_turn: parse_claude::Turn::new(),
+    codex_live: parse_codex::Live::new(),
+    mcp_config_json: None,
+    codex_thread_params_json: None,
+    cwd: "/tmp",
+    rx_chunks: [],
+    rx_total_bytes: 0,
+    out_line_buf: Bytes::new(0),
+    err_line_buf: Bytes::new(0),
+    acked_out: 0L,
+    acked_err: 0L,
+    out_at: 0L,
+    err_at: 0L,
+    prompt_seq: 0,
+    kill_escalate_at: None,
+    detached_for_handover: false,
+    close_after_write: false,
+    attached: false,
+    write_inflight: false,
+    write_inflight_bytes: 0,
+    write_queue: [],
+    write_queue_bytes: 0,
+    codex_active_turn_id: None,
+    dropping_oversized_out_line: false,
+    stopping: true,
+    spawn_proc_exited: false,
+    runner_exited: false,
+    identity_verified: false,
+    adopted_passive_only: false,
+    prompt_write_pending: false,
+    pending_end_turn: None,
+    adopted_db_out: 0L,
+  }
+  mgr2.draining.set(99, dummy_sess)
+  // R16 P1-2: While `inst` is in `draining`, `has_live_session_instance` MUST return true so
+  // `pending_end_turns` commit does NOT prematurely delete `runner_launches`!
+  assert_true(mgr2.has_live_session_instance(inst), "draining instance counts as live for runner_launches protection")
+  assert_true(
+    !should_delete_runner_launch_on_pending_replay(false, false, mgr2.has_live_session_instance(inst), true),
+    "draining instance must NOT delete runner_launches on pending_end_turns commit",
+  )
+  mgr2.finish_draining(99, confirmed_exited=false)
+  assert_true(mgr2.draining_stopping_ids.contains(inst), "socket error/EOF must NOT clear stop marker")
+  // Now on confirmed exit, marker IS cleared!
+  mgr2.draining.set(100, dummy_sess)
+  mgr2.finish_draining(100, confirmed_exited=true)
+  assert_true(!mgr2.draining_stopping_ids.contains(inst), "confirmed exit MUST clear stop marker")
+  assert_true(!mgr2.has_live_session_instance(inst), "after finish_draining instance is no longer live")
+}
+
+test "W17C-1 R24: ProcStdoutEof without OS exit preserves spawn marker, timeout preserves pending_end_turn, and shutdown status fails closed" {
+  // 1. P1-1: `ProcStdoutEof` without `ProcExit` or `ConfirmedDeadOrReused` MUST NOT clear `spawn:` marker!
+  assert_true(
+    !spawn_stdout_eof_confirmed_dead(false, SpawnIdentityVerdict::ConfirmedSame),
+    "stdout EOF while OS ConfirmedSame != confirmed dead",
+  )
+  assert_true(
+    !spawn_stdout_eof_confirmed_dead(false, SpawnIdentityVerdict::Unknown),
+    "stdout EOF while OS Unknown != confirmed dead",
+  )
+  assert_true(
+    spawn_stdout_eof_confirmed_dead(true, SpawnIdentityVerdict::Unknown),
+    "ProcExit arrived => confirmed dead",
+  )
+  assert_true(
+    spawn_stdout_eof_confirmed_dead(false, SpawnIdentityVerdict::ConfirmedDeadOrReused),
+    "OS ConfirmedDeadOrReused => confirmed dead",
+  )
+  let mgr_eof = LiveRunnerManager::new()
+  let spawn_k = match encode_spawn_stop_key_pure("r-eof-r24", 4401, 1700000003000L, Some("boot-r24"), Some(555L)) {
+    Some(k) => k
+    None => panic("expected spawn key")
+  }
+  mgr_eof.record_draining_stop_marker(spawn_k, "s-eof-r24")
+  let eof_sess = LiveRunnerSession::{
+    conn_id: 201,
+    session_key: "s-eof-r24",
+    ws: "ws-a",
+    profile_id: "default",
+    model_opt: None,
+    person_opt: None,
+    thread_id_opt: None,
+    runtime_kind: station_drivers::RuntimeKind::Claude,
+    runtime_str: "claude",
+    runner_id: "r-eof-r24",
+    spawn_pid: 4401,
+    spawn_os_start_ms: 1700000003000L,
+    spawn_boot_id: Some("boot-r24"),
+    spawn_start_ticks: Some(555L),
+    is_acp: false,
+    is_codex: false,
+    is_adopted: false,
+    adopted_instance_id: None,
+    adopted_db_initialized: false,
+    phase: LiveRunnerPhase::Exited,
+    pending_prompt: None,
+    pending_steers: [],
+    runtime_session_id: None,
+    current_turn_id: None,
+    turn_started_at: 0L,
+    turn_start_out_offset: 0L,
+    pending_ack_out: 0L,
+    last_turn_ended_at: 0L,
+    stop_guard: station_drivers::OwnProcessStopGuard::new(station_drivers::RuntimeKind::Claude),
+    acp_guard: station_drivers::AcpTurnGuard::new(station_drivers::RuntimeKind::Claude),
+    agy_tracker: station_drivers::AgyStateTracker::new("", None),
+    claude_turn: parse_claude::Turn::new(),
+    codex_live: parse_codex::Live::new(),
+    mcp_config_json: None,
+    codex_thread_params_json: None,
+    cwd: "/tmp",
+    rx_chunks: [],
+    rx_total_bytes: 0,
+    out_line_buf: Bytes::new(0),
+    err_line_buf: Bytes::new(0),
+    acked_out: 0L,
+    acked_err: 0L,
+    out_at: 0L,
+    err_at: 0L,
+    prompt_seq: 0,
+    kill_escalate_at: None,
+    detached_for_handover: false,
+    close_after_write: false,
+    attached: false,
+    write_inflight: false,
+    write_inflight_bytes: 0,
+    write_queue: [],
+    write_queue_bytes: 0,
+    codex_active_turn_id: None,
+    dropping_oversized_out_line: false,
+    stopping: true,
+    spawn_proc_exited: false,
+    runner_exited: false,
+    identity_verified: false,
+    adopted_passive_only: false,
+    prompt_write_pending: false,
+    pending_end_turn: Some(PendingEndTurn::{
+      turn_id: Some("t-r24-timeout"),
+      outcome: "failed",
+      detail: Some("runner did not start within 30s"),
+      declared_str: None,
+      need_opt: None,
+      wait_secs_opt: None,
+      wait_for_opt: None,
+      wait_watch_opt: None,
+      wall_ms: 1700000033000L,
+      was_completed: false,
+      reprompt_reminder: None,
+    }),
+    adopted_db_out: 0L,
+  }
+  mgr_eof.draining.set(201, eof_sess)
+  // Simulate stdout EOF without OS exit: `confirmed_exited = false`, `runner_exited` stays `false`,
+  // `pending_end_turn` is preserved in manager, and `spawn:` marker stays in `draining_stopping_ids`!
+  mgr_eof.preserve_pending_end_turn(eof_sess)
+  mgr_eof.finish_draining(201, confirmed_exited=false)
+  assert_true(!eof_sess.runner_exited, "stdout EOF without OS exit must NOT set runner_exited")
+  assert_true(mgr_eof.draining_stopping_ids.contains(spawn_k), "stdout EOF without OS exit must keep spawn: marker")
+  assert_true(mgr_eof.pending_end_turns.contains("s-eof-r24"), "R24 P1-2: timeout/EOF preserves uncommitted pending_end_turn")
+  // Simulate failed adopt_live_runner leaving draining session intact for retry:
+  mgr_eof.draining.set(202, eof_sess)
+  let adopted_ok = false
+  if adopted_ok {
+    mgr_eof.finish_draining(202, confirmed_exited=false)
+  }
+  assert_true(mgr_eof.draining.contains(202), "R24 P1-2: adopt_live_runner=false retains draining ownership for retry")
+  // Only once ProcExit / ConfirmedDeadOrReused arrives does finish_draining(confirmed_exited=true) clear spawn: marker:
+  mgr_eof.finish_draining(202, confirmed_exited=true)
+  assert_true(!mgr_eof.draining_stopping_ids.contains(spawn_k), "confirmed OS exit clears spawn: marker")
+
+  // 2. P1-3: `evaluate_shutdown_spawning_ok` fail-closed matrix
+  assert_true(evaluate_shutdown_spawning_ok(0, false, true), "no unresolved spawns & no markers => ok")
+  assert_true(evaluate_shutdown_spawning_ok(0, true, true), "all spawns sent TERM & markers durably saved => ok")
+  assert_true(!evaluate_shutdown_spawning_ok(1, true, true), "unresolved Spawning runner => MUST return false")
+  assert_true(!evaluate_shutdown_spawning_ok(0, true, false), "unconfirmed marker failed to persist => MUST return false")
+
+  // 3. R24b: `deadline == 0L` in `draining` retries adopt on subsequent ticks and reclaims on OS death!
+  assert_true(
+    decide_draining_spawning_tick(1000L, 500L, false, SpawnIdentityVerdict::Unknown) is DrainingSpawningTickAction::Wait,
+    "before deadline => Wait",
+  )
+  assert_true(
+    decide_draining_spawning_tick(1000L, 1000L, false, SpawnIdentityVerdict::Unknown) is DrainingSpawningTickAction::FirstTimeout,
+    "at deadline => FirstTimeout",
+  )
+  assert_true(
+    decide_draining_spawning_tick(0L, 2000L, false, SpawnIdentityVerdict::ConfirmedSame) is DrainingSpawningTickAction::RetryAdopt,
+    "deadline == 0L while ConfirmedSame => RetryAdopt on next tick",
+  )
+  assert_true(
+    decide_draining_spawning_tick(0L, 2000L, false, SpawnIdentityVerdict::ConfirmedDeadOrReused) is DrainingSpawningTickAction::ReclaimDead,
+    "deadline == 0L when ConfirmedDeadOrReused => ReclaimDead",
+  )
+  assert_true(
+    decide_draining_spawning_tick(0L, 2000L, true, SpawnIdentityVerdict::Unknown) is DrainingSpawningTickAction::ReclaimDead,
+    "deadline == 0L when spawn_proc_exited => ReclaimDead",
+  )
+}
+
+test "W17C-1 R25/R26: real EdgeMuxHub stop_all_on_shutdown_with (Spawning+Connecting) & real register_adopted_runner_with single stop-owner" {
+  // Helper to build a real `LiveRunnerSession`
+  let make_sess = fn(
+    cid : Int,
+    skey : String,
+    rid : String,
+    pid : Int,
+    phase : LiveRunnerPhase,
+    has_linux_id : Bool,
+  ) -> LiveRunnerSession {
+    LiveRunnerSession::{
+      conn_id: cid,
+      session_key: skey,
+      ws: "ws-a",
+      profile_id: "default",
+      model_opt: None,
+      person_opt: None,
+      thread_id_opt: None,
+      runtime_kind: station_drivers::RuntimeKind::Claude,
+      runtime_str: "claude",
+      runner_id: rid,
+      spawn_pid: pid,
+      spawn_os_start_ms: 1700000010000L,
+      spawn_boot_id: if has_linux_id { Some("boot-r26") } else { None },
+      spawn_start_ticks: if has_linux_id { Some(777L) } else { None },
+      is_acp: false,
+      is_codex: false,
+      is_adopted: false,
+      adopted_instance_id: None,
+      adopted_db_initialized: false,
+      phase: phase,
+      pending_prompt: None,
+      pending_steers: [],
+      runtime_session_id: None,
+      current_turn_id: None,
+      turn_started_at: 0L,
+      turn_start_out_offset: 0L,
+      pending_ack_out: 0L,
+      last_turn_ended_at: 0L,
+      stop_guard: station_drivers::OwnProcessStopGuard::new(station_drivers::RuntimeKind::Claude),
+      acp_guard: station_drivers::AcpTurnGuard::new(station_drivers::RuntimeKind::Claude),
+      agy_tracker: station_drivers::AgyStateTracker::new("", None),
+      claude_turn: parse_claude::Turn::new(),
+      codex_live: parse_codex::Live::new(),
+      mcp_config_json: None,
+      codex_thread_params_json: None,
+      cwd: "/tmp",
+      rx_chunks: [],
+      rx_total_bytes: 0,
+      out_line_buf: Bytes::new(0),
+      err_line_buf: Bytes::new(0),
+      acked_out: 0L,
+      acked_err: 0L,
+      out_at: 0L,
+      err_at: 0L,
+      prompt_seq: 0,
+      kill_escalate_at: None,
+      detached_for_handover: false,
+      close_after_write: false,
+      attached: false,
+      write_inflight: false,
+      write_inflight_bytes: 0,
+      write_queue: [],
+      write_queue_bytes: 0,
+      codex_active_turn_id: None,
+      dropping_oversized_out_line: false,
+      stopping: false,
+      spawn_proc_exited: false,
+      runner_exited: false,
+      identity_verified: false,
+      adopted_passive_only: false,
+      prompt_write_pending: false,
+      pending_end_turn: None,
+      adopted_db_out: 0L,
+    }
+  }
+
+  // ---- Test 1A: Unified `stop_all_on_shutdown_with` for Spawning + Connecting via verified peer-PID send (happy path -> true) ----
+  let mem_a = station_ops::MemFs::new()
+  let ops_a = mem_a.ops()
+  let mut now_a = 1000L
+  let mut verified_sends_a = 0
+  let mut spawn_dead_a = false
+  let mut conn_dead_a = false
+  let tr_a = builders_core::MuxTransport::{
+    wait: fn(_ms : Int64) -> Option[host_shim::HostEvent] {
+      now_a = now_a + 25L
+      None
+    },
+    call_async: fn(_id : Int64, _op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {},
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_a },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_a = station_whole::EdgeMuxHub::from_transport(tr_a)
+  let mgr_a = LiveRunnerManager::new()
+  mgr_a.set_handover_state_path("/data/run/whole-live-runners.json")
+  let sp_rinfo_a = station_drivers::RunnerInfo::{
+    id: "r-sp-a",
+    runner_pid: 4601,
+    pid: 4602,
+    pgid: 4602,
+    started_at: 1700000010100L,
+    program: "/bin/sleep",
+    args: ["30"],
+    socket: "/tmp/r-sp-a.sock",
+    keeps: true,
+    pty: false,
+    cwd: Some("/tmp"),
+  }
+  let cn_rinfo_a = station_drivers::RunnerInfo::{
+    id: "r-cn-a",
+    runner_pid: 4603,
+    pid: 4604,
+    pgid: 4604,
+    started_at: 1700000010200L,
+    program: "/bin/sleep",
+    args: ["30"],
+    socket: "/tmp/r-cn-a.sock",
+    keeps: true,
+    pty: false,
+    cwd: Some("/tmp"),
+  }
+  let child_a = station_sys::ChildProcess::{ handle: 0L, pid: 4601 }
+  let sp_sess_a = make_sess(401, "s-sp-a", "r-sp-a", 4601, LiveRunnerPhase::Spawning(8001L, child_a, Bytes::new(0), Bytes::new(0), 99999L), true)
+  let cn_sess_a = make_sess(402, "s-cn-a", "r-cn-a", 4603, LiveRunnerPhase::Connecting(cn_rinfo_a), true)
+  mgr_a.sessions.set("s-sp-a", sp_sess_a)
+  mgr_a.sessions.set("s-cn-a", cn_sess_a)
+  let mut closed_child_count_a = 0
+  let ok_a = mgr_a.stop_all_on_shutdown_with(
+    hub_a,
+    ops_a,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    now_ms_fn=fn() -> Int64 { now_a },
+    verify_spawn_id=fn(p, _ms, _b, _t) -> SpawnIdentityVerdict {
+      if p == 4601 {
+        if spawn_dead_a { SpawnIdentityVerdict::ConfirmedDeadOrReused } else { SpawnIdentityVerdict::ConfirmedSame }
+      } else {
+        if conn_dead_a { SpawnIdentityVerdict::ConfirmedDeadOrReused } else { SpawnIdentityVerdict::ConfirmedSame }
+      }
+    },
+    runner_sock_send_verified_fn=fn(sock, pid, payload, _to) -> Int {
+      let txt = payload.to_string()
+      assert_true(txt.contains("\"op\":\"attach\""), "shutdown send must include attach")
+      assert_true(txt.contains("\"op\":\"signal\"") && txt.contains("\"TERM\"") && txt.contains("\"group\":true"), "shutdown send must include TERM group:true")
+      assert_true(txt.contains("\"op\":\"done\""), "shutdown send must include done when committed")
+      verified_sends_a = verified_sends_a + 1
+      if sock == "/data/run/runners/r-sp-a.sock" && pid == 4601 { spawn_dead_a = true }
+      if sock == "/tmp/r-cn-a.sock" && pid == 4603 { conn_dead_a = true }
+      0
+    },
+    close_child_fn=fn(_c) { closed_child_count_a = closed_child_count_a + 1 },
+    max_wait_ms=500L,
+  )
+  assert_true(ok_a, "R28 1A: unified shutdown succeeds when Spawning+Connecting pass verified send and exit")
+  assert_true(verified_sends_a == 2, "R28 1A: issued 2 kernel-verified sends (Spawning + Connecting)")
+  assert_true(closed_child_count_a == 1, "R28 1A: closed Spawning child handle")
+  assert_true(mgr_a.draining_stopping_ids.length() == 0, "R28 1A: both stop markers cleared after OS exit")
+
+  // ---- Test 1B: `Connecting` stays alive despite verified send returning 0 -> MUST return false & keep marker ----
+  let mem_b = station_ops::MemFs::new()
+  let ops_b = mem_b.ops()
+  let mut now_b = 1000L
+  let tr_b = builders_core::MuxTransport::{
+    wait: fn(_ms : Int64) -> Option[host_shim::HostEvent] {
+      now_b = now_b + 50L
+      None
+    },
+    call_async: fn(_id : Int64, _op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {},
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_b },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_b = station_whole::EdgeMuxHub::from_transport(tr_b)
+  let mgr_b = LiveRunnerManager::new()
+  mgr_b.set_handover_state_path("/data/run/whole-live-runners.json")
+  let cn_sess_b = make_sess(403, "s-cn-b", "r-cn-a", 4603, LiveRunnerPhase::Connecting(cn_rinfo_a), true)
+  mgr_b.sessions.set("s-cn-b", cn_sess_b)
+  let ok_b = mgr_b.stop_all_on_shutdown_with(
+    hub_b,
+    ops_b,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    now_ms_fn=fn() -> Int64 { now_b },
+    verify_spawn_id=fn(_p, _ms, _b, _t) -> SpawnIdentityVerdict { SpawnIdentityVerdict::ConfirmedSame },
+    runner_sock_send_verified_fn=fn(_s, _p, _b, _t) -> Int { 0 },
+    close_child_fn=fn(_c) {},
+    max_wait_ms=200L,
+  )
+  assert_true(!ok_b, "R28 1B: Connecting runner still alive after verified send MUST return false (exit code 1)")
+  assert_true(mgr_b.draining_stopping_ids.length() == 1, "R28 1B: unconfirmed Connecting stop marker preserved")
+  assert_true(ops_b.read_text("/data/run/whole-live-runners.json").is_ok(), "R28 1B: unconfirmed marker persisted to disk")
+
+  // ---- Test 1C-i (R27/R28 P1-1): Connecting with active turn + SQLite commit SUCCEEDS -> sends `done` & returns true ----
+  let mem_c1 = station_ops::MemFs::new()
+  let ops_c1 = mem_c1.ops()
+  let mut now_c1 = 1000L
+  let mut c1_dead = false
+  let mut c1_saw_done = false
+  let tr_c1 = builders_core::MuxTransport::{
+    wait: fn(_ms : Int64) -> Option[host_shim::HostEvent] {
+      now_c1 = now_c1 + 25L
+      None
+    },
+    call_async: fn(_id : Int64, _op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {},
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_c1 },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_c1 = station_whole::EdgeMuxHub::from_transport(tr_c1)
+  let mgr_c1 = LiveRunnerManager::new()
+  mgr_c1.set_handover_state_path("/data/run/whole-live-runners.json")
+  let cn_sess_c1 = make_sess(411, "s-c1", "r-cn-a", 4603, LiveRunnerPhase::Connecting(cn_rinfo_a), true)
+  cn_sess_c1.current_turn_id = Some("turn-c1")
+  mgr_c1.sessions.set("s-c1", cn_sess_c1)
+  let ok_c1 = mgr_c1.stop_all_on_shutdown_with(
+    hub_c1,
+    ops_c1,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    commit_turn_fn=fn(s) -> Bool {
+      s.current_turn_id = None
+      true
+    },
+    now_ms_fn=fn() -> Int64 { now_c1 },
+    verify_spawn_id=fn(_p, _ms, _b, _t) -> SpawnIdentityVerdict {
+      if c1_dead { SpawnIdentityVerdict::ConfirmedDeadOrReused } else { SpawnIdentityVerdict::ConfirmedSame }
+    },
+    runner_sock_send_verified_fn=fn(_s, _p, b, _t) -> Int {
+      let txt = b.to_string()
+      assert_true(txt.contains("\"op\":\"signal\"") && txt.contains("\"TERM\""), "1C-i must send TERM")
+      if txt.contains("\"op\":\"done\"") { c1_saw_done = true }
+      c1_dead = true
+      0
+    },
+    close_child_fn=fn(_c) {},
+    max_wait_ms=300L,
+  )
+  assert_true(ok_c1 && c1_saw_done, "R28 1C-i: committed active turn sends done, exits, and returns true")
+  assert_true(mgr_c1.draining_stopping_ids.length() == 0, "R28 1C-i: stop marker cleared")
+
+  // ---- Test 1C-ii (R27/R28 P1-1): Connecting with active turn + SQLite commit FAILS -> NO `done`, preserves pending_end_turns, returns false ----
+  let mem_c2 = station_ops::MemFs::new()
+  let ops_c2 = mem_c2.ops()
+  let mut now_c2 = 1000L
+  let mut c2_writes = 0
+  let tr_c2 = builders_core::MuxTransport::{
+    wait: fn(_ms : Int64) -> Option[host_shim::HostEvent] {
+      now_c2 = now_c2 + 50L
+      None
+    },
+    call_async: fn(_id : Int64, _op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {},
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_c2 },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_c2 = station_whole::EdgeMuxHub::from_transport(tr_c2)
+  let mgr_c2 = LiveRunnerManager::new()
+  mgr_c2.set_handover_state_path("/data/run/whole-live-runners.json")
+  let cn_sess_c2 = make_sess(412, "s-c2", "r-cn-a", 4603, LiveRunnerPhase::Connecting(cn_rinfo_a), true)
+  cn_sess_c2.current_turn_id = Some("turn-c2-fail")
+  mgr_c2.sessions.set("s-c2", cn_sess_c2)
+  let ok_c2 = mgr_c2.stop_all_on_shutdown_with(
+    hub_c2,
+    ops_c2,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    commit_turn_fn=fn(s) -> Bool {
+      s.pending_end_turn = Some(PendingEndTurn::{
+        turn_id: s.current_turn_id,
+        outcome: "aborted",
+        detail: Some("station shutdown"),
+        declared_str: None,
+        need_opt: None,
+        wait_secs_opt: None,
+        wait_for_opt: None,
+        wait_watch_opt: None,
+        wall_ms: 1700000010000L,
+        was_completed: false,
+        reprompt_reminder: None,
+      })
+      s.current_turn_id = None
+      mgr_c2.preserve_pending_end_turn(s)
+      false
+    },
+    now_ms_fn=fn() -> Int64 { now_c2 },
+    verify_spawn_id=fn(_p, _ms, _b, _t) -> SpawnIdentityVerdict { SpawnIdentityVerdict::ConfirmedSame },
+    runner_sock_send_verified_fn=fn(_s, _p, b, _t) -> Int {
+      c2_writes = c2_writes + 1
+      let txt = b.to_string()
+      assert_true(txt.contains("\"op\":\"signal\"") && txt.contains("\"TERM\"") && txt.contains("\"group\":true"), "1C-ii must send TERM group:true")
+      assert_true(!txt.contains("\"op\":\"done\""), "R28 1C-ii: uncommitted turn MUST NEVER send done!")
+      0
+    },
+    close_child_fn=fn(_c) {},
+    max_wait_ms=200L,
+  )
+  assert_true(!ok_c2, "R28 1C-ii: failed turn commit MUST return false (exit code 1)")
+  assert_true(c2_writes == 1, "R28 1C-ii: sent 1 TERM-only verified send without done")
+  assert_true(mgr_c2.pending_end_turns.contains("s-c2"), "R28 1C-ii: uncommitted turn preserved in pending_end_turns")
+  assert_true(ops_c2.read_text("/data/run/whole-live-runners.json").is_ok(), "R28 1C-ii: pending_end_turns persisted to disk")
+
+  // ---- Test 1D (R29 P1-1): Unknown OS identity for Spawning + Connecting + Ready -> 0 tcp.write, 0 verified sends, closes old sock, keeps all 3 markers, returns false ----
+  let mem_d = station_ops::MemFs::new()
+  let ops_d = mem_d.ops()
+  let mut now_d = 1000L
+  let mut d_sends = 0
+  let mut d_tcp_writes = 0
+  let mut d_tcp_closes = 0
+  let tr_d = builders_core::MuxTransport::{
+    wait: fn(_ms : Int64) -> Option[host_shim::HostEvent] {
+      now_d = now_d + 50L
+      None
+    },
+    call_async: fn(_id : Int64, op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {
+      if op == "tcp.write" { d_tcp_writes = d_tcp_writes + 1 }
+      if op == "tcp.close" { d_tcp_closes = d_tcp_closes + 1 }
+    },
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_d },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_d = station_whole::EdgeMuxHub::from_transport(tr_d)
+  let mgr_d = LiveRunnerManager::new()
+  mgr_d.set_handover_state_path("/data/run/whole-live-runners.json")
+  let rd_rinfo_d = station_drivers::RunnerInfo::{
+    id: "r-rd-d",
+    runner_pid: 4605,
+    pid: 4606,
+    pgid: 4606,
+    started_at: 1700000010300L,
+    program: "/bin/sleep",
+    args: ["30"],
+    socket: "/tmp/r-rd-d.sock",
+    keeps: true,
+    pty: false,
+    cwd: Some("/tmp"),
+  }
+  let sp_sess_d = make_sess(421, "s-sp-d", "r-sp-a", 4601, LiveRunnerPhase::Spawning(8002L, child_a, Bytes::new(0), Bytes::new(0), 99999L), false)
+  let cn_sess_d = make_sess(422, "s-cn-d", "r-cn-a", 4603, LiveRunnerPhase::Connecting(cn_rinfo_a), false)
+  let rd_sess_d = make_sess(423, "s-rd-d", "r-rd-d", 4605, LiveRunnerPhase::Ready(rd_rinfo_d, 700L), false)
+  mgr_d.sessions.set("s-sp-d", sp_sess_d)
+  mgr_d.sessions.set("s-cn-d", cn_sess_d)
+  mgr_d.sessions.set("s-rd-d", rd_sess_d)
+  let ok_d = mgr_d.stop_all_on_shutdown_with(
+    hub_d,
+    ops_d,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    now_ms_fn=fn() -> Int64 { now_d },
+    verify_spawn_id=fn(_p, _ms, _b, _t) -> SpawnIdentityVerdict { SpawnIdentityVerdict::Unknown },
+    runner_sock_send_verified_fn=fn(_s, _p, _b, _t) -> Int {
+      d_sends = d_sends + 1
+      0
+    },
+    close_child_fn=fn(_c) {},
+    max_wait_ms=150L,
+  )
+  assert_true(!ok_d, "R29 1D: Unknown OS identity across Spawning/Connecting/Ready MUST return false")
+  assert_true(d_tcp_writes == 0 && d_sends == 0, "R29 1D: Unknown OS identity MUST issue 0 tcp.write and 0 verified sends (incl. Ready!)")
+  assert_true(d_tcp_closes == 1, "R29 1D: pre-existing Ready socket closed without writing")
+  assert_true(mgr_d.draining_stopping_ids.length() == 3, "R29 1D: all 3 stop markers preserved")
+  assert_true(ops_d.read_text("/data/run/whole-live-runners.json").is_ok(), "R29 1D: markers persisted to disk")
+
+  // ---- Test 1E (R28 P1-1): Peer PID mismatch (-2) preserves stop marker and returns false ----
+  let mem_e = station_ops::MemFs::new()
+  let ops_e = mem_e.ops()
+  let mut now_e = 1000L
+  let tr_e = builders_core::MuxTransport::{
+    wait: fn(_ms : Int64) -> Option[host_shim::HostEvent] {
+      now_e = now_e + 50L
+      None
+    },
+    call_async: fn(_id : Int64, _op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {},
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_e },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_e = station_whole::EdgeMuxHub::from_transport(tr_e)
+  let mgr_e = LiveRunnerManager::new()
+  mgr_e.set_handover_state_path("/data/run/whole-live-runners.json")
+  let cn_sess_e = make_sess(431, "s-cn-e", "r-cn-a", 4603, LiveRunnerPhase::Connecting(cn_rinfo_a), true)
+  mgr_e.sessions.set("s-cn-e", cn_sess_e)
+  let ok_e = mgr_e.stop_all_on_shutdown_with(
+    hub_e,
+    ops_e,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    now_ms_fn=fn() -> Int64 { now_e },
+    verify_spawn_id=fn(_p, _ms, _b, _t) -> SpawnIdentityVerdict { SpawnIdentityVerdict::ConfirmedSame },
+    runner_sock_send_verified_fn=fn(_s, _p, _b, _t) -> Int { -2 },
+    close_child_fn=fn(_c) {},
+    max_wait_ms=150L,
+  )
+  assert_true(!ok_e, "R28 1E: peer PID mismatch (-2) MUST return false")
+  assert_true(mgr_e.draining_stopping_ids.length() == 1, "R28 1E: stop marker preserved on peer mismatch")
+  assert_true(ops_e.read_text("/data/run/whole-live-runners.json").is_ok(), "R28 1E: stop marker persisted on peer mismatch")
+
+  // ---- Test 1F (R29 P1-1): Connected `Ready` runner closes old sock and routes through verified send ----
+  let mem_f1 = station_ops::MemFs::new()
+  let ops_f1 = mem_f1.ops()
+  let mut now_f1 = 1000L
+  let mut f1_tcp_writes = 0
+  let mut f1_tcp_closes = 0
+  let tr_f1 = builders_core::MuxTransport::{
+    wait: fn(_ms : Int64) -> Option[host_shim::HostEvent] {
+      now_f1 = now_f1 + 50L
+      None
+    },
+    call_async: fn(_id : Int64, op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {
+      if op == "tcp.write" { f1_tcp_writes = f1_tcp_writes + 1 }
+      if op == "tcp.close" { f1_tcp_closes = f1_tcp_closes + 1 }
+    },
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_f1 },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_f1 = station_whole::EdgeMuxHub::from_transport(tr_f1)
+  let mgr_f1 = LiveRunnerManager::new()
+  mgr_f1.set_handover_state_path("/data/run/whole-live-runners.json")
+  let ready_sess_f1 = make_sess(441, "s-rd-f1", "r-cn-a", 4603, LiveRunnerPhase::Ready(cn_rinfo_a, 700L), true)
+  mgr_f1.sessions.set("s-rd-f1", ready_sess_f1)
+  let ok_f1 = mgr_f1.stop_all_on_shutdown_with(
+    hub_f1,
+    ops_f1,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    now_ms_fn=fn() -> Int64 { now_f1 },
+    verify_spawn_id=fn(_p, _ms, _b, _t) -> SpawnIdentityVerdict { SpawnIdentityVerdict::ConfirmedSame },
+    runner_sock_send_verified_fn=fn(_s, _p, _b, _t) -> Int { -1 },
+    close_child_fn=fn(_c) {},
+    max_wait_ms=150L,
+  )
+  assert_true(!ok_f1, "R29 1F-fail: Ready runner with failed verified send & still alive MUST return false")
+  assert_true(f1_tcp_writes == 0 && f1_tcp_closes == 1, "R29 1F-fail: Ready closes old sock without unverified tcp.write")
+  assert_true(mgr_f1.draining_stopping_ids.length() == 1, "R29 1F-fail: Ready runner exact inst_id marker preserved")
+  assert_true(ops_f1.read_text("/data/run/whole-live-runners.json").is_ok(), "R29 1F-fail: Ready marker persisted to disk")
+
+  let mem_f2 = station_ops::MemFs::new()
+  let ops_f2 = mem_f2.ops()
+  let mut now_f2 = 1000L
+  let mut f2_dead = false
+  let mut f2_verified_sends = 0
+  let tr_f2 = builders_core::MuxTransport::{
+    wait: fn(_ms : Int64) -> Option[host_shim::HostEvent] {
+      now_f2 = now_f2 + 25L
+      None
+    },
+    call_async: fn(_id : Int64, _op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {},
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_f2 },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_f2 = station_whole::EdgeMuxHub::from_transport(tr_f2)
+  let mgr_f2 = LiveRunnerManager::new()
+  mgr_f2.set_handover_state_path("/data/run/whole-live-runners.json")
+  let ready_sess_f2 = make_sess(442, "s-rd-f2", "r-cn-a", 4603, LiveRunnerPhase::Ready(cn_rinfo_a, 701L), true)
+  mgr_f2.sessions.set("s-rd-f2", ready_sess_f2)
+  let ok_f2 = mgr_f2.stop_all_on_shutdown_with(
+    hub_f2,
+    ops_f2,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    now_ms_fn=fn() -> Int64 { now_f2 },
+    verify_spawn_id=fn(_p, _ms, _b, _t) -> SpawnIdentityVerdict {
+      if f2_dead { SpawnIdentityVerdict::ConfirmedDeadOrReused } else { SpawnIdentityVerdict::ConfirmedSame }
+    },
+    runner_sock_send_verified_fn=fn(_s, _p, b, _t) -> Int {
+      let txt = b.to_string()
+      assert_true(txt.contains("\"op\":\"attach\"") && txt.contains("\"op\":\"done\""), "R29 1F-ok: Ready sends attach+TERM+done via verified path")
+      f2_verified_sends = f2_verified_sends + 1
+      f2_dead = true
+      0
+    },
+    close_child_fn=fn(_c) {},
+    max_wait_ms=200L,
+  )
+  assert_true(ok_f2 && f2_verified_sends == 1, "R29 1F-ok: Ready runner verified send + OS exit clears marker and returns true")
+  assert_true(mgr_f2.draining_stopping_ids.length() == 0, "R29 1F-ok: Ready stop marker cleared after OS exit")
+
+  // ---- Test 1F-pend (R30 P1-1): Ready with `pending_end_turn` + old `sock_id` closes sock BEFORE commit,
+  //      emits 0 `tcp.write`, keeps phase non-Exited into `records`, sends verified `attach+TERM+done`, and settles on OS exit ----
+  let mem_fp = station_ops::MemFs::new()
+  let ops_fp = mem_fp.ops()
+  let mut now_fp = 1000L
+  let mut fp_dead = false
+  let mut fp_tcp_writes = 0
+  let mut fp_verified_sends = 0
+  let fp_events : Array[String] = []
+  let tr_fp = builders_core::MuxTransport::{
+    wait: fn(_ms : Int64) -> Option[host_shim::HostEvent] {
+      now_fp = now_fp + 25L
+      None
+    },
+    call_async: fn(_id : Int64, op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {
+      if op == "tcp.write" {
+        fp_tcp_writes = fp_tcp_writes + 1
+        fp_events.push("tcp.write")
+      }
+      if op == "tcp.close" {
+        fp_events.push("tcp.close")
+      }
+    },
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_fp },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_fp = station_whole::EdgeMuxHub::from_transport(tr_fp)
+  let mgr_fp = LiveRunnerManager::new()
+  mgr_fp.set_handover_state_path("/data/run/whole-live-runners.json")
+  let ready_sess_fp = make_sess(443, "s-rd-fp", "r-cn-a", 4603, LiveRunnerPhase::Ready(cn_rinfo_a, 702L), true)
+  ready_sess_fp.runner_exited = true
+  ready_sess_fp.current_turn_id = Some("turn-fp-1")
+  ready_sess_fp.pending_end_turn = Some(PendingEndTurn::{
+    turn_id: Some("turn-fp-1"),
+    outcome: "completed",
+    detail: None,
+    declared_str: Some("all_done"),
+    need_opt: None,
+    wait_secs_opt: None,
+    wait_for_opt: None,
+    wait_watch_opt: None,
+    wall_ms: 1700000010000L,
+    was_completed: true,
+    reprompt_reminder: None,
+  })
+  mgr_fp.sessions.set("s-rd-fp", ready_sess_fp)
+  let ok_fp = mgr_fp.stop_all_on_shutdown_with(
+    hub_fp,
+    ops_fp,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    commit_turn_fn=fn(s) -> Bool {
+      fp_events.push("commit")
+      // Mirrors `commit_pending_end_turn_db_only`: pure DB commit, clears turn markers, ZERO socket writes, ZERO phase change!
+      s.current_turn_id = None
+      s.pending_end_turn = None
+      true
+    },
+    now_ms_fn=fn() -> Int64 { now_fp },
+    verify_spawn_id=fn(_p, _ms, _b, _t) -> SpawnIdentityVerdict {
+      if fp_dead { SpawnIdentityVerdict::ConfirmedDeadOrReused } else { SpawnIdentityVerdict::ConfirmedSame }
+    },
+    runner_sock_send_verified_fn=fn(_s, _p, b, _t) -> Int {
+      let txt = b.to_string()
+      assert_true(txt.contains("\"op\":\"attach\"") && txt.contains("\"op\":\"signal\"") && txt.contains("\"op\":\"done\""), "R30 1F-pend: sends attach+TERM+done via verified path")
+      fp_verified_sends = fp_verified_sends + 1
+      fp_events.push("verified_send")
+      fp_dead = true
+      0
+    },
+    close_child_fn=fn(_c) {},
+    max_wait_ms=200L,
+  )
+  assert_true(ok_fp && fp_tcp_writes == 0 && fp_verified_sends == 1, "R30 1F-pend: 0 tcp.write, 1 verified send, settles cleanly on OS exit")
+  assert_true(
+    fp_events.length() == 3 && fp_events[0] == "tcp.close" && fp_events[1] == "commit" && fp_events[2] == "verified_send",
+    "R30 1F-pend: strict order tcp.close -> commit -> verified_send",
+  )
+  assert_true(mgr_fp.draining_stopping_ids.length() == 0, "R30 1F-pend: stop marker cleared after OS exit")
+
+  // ---- Test 1G (R29/R30 P1-2): Global remaining budget clamps every send timeout_ms <= rem_ms and stops at deadline ----
+  let mem_g = station_ops::MemFs::new()
+  let ops_g = mem_g.ops()
+  let mut now_g = 1000L
+  let deadline_g = 1150L
+  let seen_timeouts_g : Array[Int] = []
+  let tr_g = builders_core::MuxTransport::{
+    wait: fn(ms : Int64) -> Option[host_shim::HostEvent] {
+      now_g = now_g + ms
+      None
+    },
+    call_async: fn(_id : Int64, _op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {},
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_g },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_g = station_whole::EdgeMuxHub::from_transport(tr_g)
+  let mgr_g = LiveRunnerManager::new()
+  mgr_g.set_handover_state_path("/data/run/whole-live-runners.json")
+  let r_g1 = station_drivers::RunnerInfo::{ ..cn_rinfo_a, id: "r-g1", runner_pid: 4701, socket: "/tmp/r-g1.sock" }
+  let r_g2 = station_drivers::RunnerInfo::{ ..cn_rinfo_a, id: "r-g2", runner_pid: 4702, socket: "/tmp/r-g2.sock" }
+  let r_g3 = station_drivers::RunnerInfo::{ ..cn_rinfo_a, id: "r-g3", runner_pid: 4703, socket: "/tmp/r-g3.sock" }
+  mgr_g.sessions.set("s-g1", make_sess(451, "s-g1", "r-g1", 4701, LiveRunnerPhase::Connecting(r_g1), true))
+  mgr_g.sessions.set("s-g2", make_sess(452, "s-g2", "r-g2", 4702, LiveRunnerPhase::Connecting(r_g2), true))
+  mgr_g.sessions.set("s-g3", make_sess(453, "s-g3", "r-g3", 4703, LiveRunnerPhase::Connecting(r_g3), true))
+  let ok_g = mgr_g.stop_all_on_shutdown_with(
+    hub_g,
+    ops_g,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    now_ms_fn=fn() -> Int64 { now_g },
+    verify_spawn_id=fn(_p, _ms, _b, _t) -> SpawnIdentityVerdict { SpawnIdentityVerdict::ConfirmedSame },
+    runner_sock_send_verified_fn=fn(_s, _p, _b, to_ms) -> Int {
+      let rem_before = (deadline_g - now_g).to_int()
+      assert_true(to_ms > 0 && to_ms <= rem_before, "R29 1G: send timeout_ms must be <= remaining global budget")
+      seen_timeouts_g.push(to_ms)
+      now_g = now_g + 80L
+      -1
+    },
+    close_child_fn=fn(_c) {},
+    max_wait_ms=150L,
+  )
+  assert_true(!ok_g, "R29 1G: exhausted budget with live runners returns false")
+  assert_true(seen_timeouts_g.length() == 2, "R29 1G: stops immediately once budget hits 0 (3rd runner not called past deadline)")
+  assert_true(seen_timeouts_g[0] == 150 && seen_timeouts_g[1] == 70, "R29 1G: remaining budget clamped from 150ms -> 70ms")
+
+  // ---- Test 1H (R31 P1-2): Deterministic in-memory socket path (POSIX + Windows FNV-1a + unsafe IDs)
+  //      & ZERO disk reads of `<rid>.json` during shutdown ----
+  assert_true(
+    runner_deterministic_socket_path("/data", "/", "r-sp-a", false) == Some("/data/run/runners/r-sp-a.sock"),
+    "R31 1H: POSIX deterministic socket path matches unix.rs:21",
+  )
+  assert_true(
+    runner_deterministic_socket_path("C:\\Users\\Alice\\Data", "\\", "r-win-1", true)
+    == Some("\\\\.\\pipe\\stillfail-runner-49c454acdf177aea-r-win-1"),
+    "R31 1H: Windows deterministic pipe path matches windows.rs:62 FNV-1a vector #1",
+  )
+  assert_true(
+    runner_deterministic_socket_path("C:\\Data", "\\", "r1", true)
+    == Some("\\\\.\\pipe\\stillfail-runner-771d445c4308a80a-r1"),
+    "R31 1H: Windows deterministic pipe path matches windows.rs:62 FNV-1a vector #2",
+  )
+  assert_true(runner_deterministic_socket_path("/data", "/", "../escape", false) is None, "R31 1H: rejects .. traversal")
+  assert_true(runner_deterministic_socket_path("/data", "/", "a/b", false) is None, "R31 1H: rejects slash in runner_id")
+  assert_true(runner_deterministic_socket_path("/data", "/", "", false) is None, "R31 1H: rejects empty runner_id")
+
+  let mem_h = station_ops::MemFs::new()
+  let base_ops_h = mem_h.ops()
+  let mut h_disk_reads = 0
+  let ops_h = station_ops::OpsFs::{
+    ..base_ops_h,
+    read_bytes: fn(_p : String) -> Result[Bytes, station_ops::FsErr] {
+      h_disk_reads = h_disk_reads + 1
+      Err(station_ops::FsErr::NotFound)
+    },
+  }
+  let mut now_h = 1000L
+  let mut h_dead = false
+  let mut h_seen_sock = ""
+  let tr_h = builders_core::MuxTransport::{
+    wait: fn(ms : Int64) -> Option[host_shim::HostEvent] {
+      now_h = now_h + ms
+      None
+    },
+    call_async: fn(_id : Int64, _op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {},
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_h },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_h = station_whole::EdgeMuxHub::from_transport(tr_h)
+  let mgr_h = LiveRunnerManager::new()
+  mgr_h.set_handover_state_path("/data/run/whole-live-runners.json")
+  let sp_sess_h = make_sess(461, "s-sp-h", "r-sp-nodisk", 4801, LiveRunnerPhase::Spawning(8009L, child_a, Bytes::new(0), Bytes::new(0), 99999L), true)
+  mgr_h.sessions.set("s-sp-h", sp_sess_h)
+  let ok_h = mgr_h.stop_all_on_shutdown_with(
+    hub_h,
+    ops_h,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    now_ms_fn=fn() -> Int64 { now_h },
+    verify_spawn_id=fn(_p, _ms, _b, _t) -> SpawnIdentityVerdict {
+      if h_dead { SpawnIdentityVerdict::ConfirmedDeadOrReused } else { SpawnIdentityVerdict::ConfirmedSame }
+    },
+    runner_sock_send_verified_fn=fn(sock, pid, _b, _to_ms) -> Int {
+      h_seen_sock = sock
+      assert_true(pid == 4801, "R31 1H: verified send uses expected_pid")
+      h_dead = true
+      0
+    },
+    close_child_fn=fn(_c) {},
+    max_wait_ms=200L,
+  )
+  assert_true(ok_h, "R31 1H: shutdown succeeds with 0 disk reads even when all read_bytes fail")
+  assert_true(h_disk_reads == 0, "R31 1H: shutdown performs strictly 0 disk reads of <rid>.json")
+  assert_true(h_seen_sock == "/data/run/runners/r-sp-nodisk.sock", "R31 1H: uses deterministic POSIX socket path")
+  assert_true(mgr_h.draining_stopping_ids.length() == 0, "R31 1H: stop marker cleared after OS exit")
+
+  // ---- Test 1I (R33/R34): 4-state verified-send protocol (`0` / `-1` / `-2` / `-3`) shutdown flows ----
+  // Note: the production C lock-free cancel/submit state machine (`sts_vs_*` in `station_sys.c`) is
+  // directly exercised across all 4 deterministic interleavings by `sts_selftest_verified_send_cancel()`
+  // in `--smoke-sys` and `station_sys_test.c` on Linux, macOS, and Windows.
+
+  // 1I-a: `runner_sock_send_verified_fn` returns `-3` (outcome unknown) with ample remaining budget,
+  // runner stays alive -> MUST be called strictly ONCE (never retried in parallel), preserves marker, returns false.
+  let mem_i1 = station_ops::MemFs::new()
+  let ops_i1 = mem_i1.ops()
+  let mut now_i1 = 1000L
+  let mut i1_calls = 0
+  let tr_i1 = builders_core::MuxTransport::{
+    wait: fn(ms : Int64) -> Option[host_shim::HostEvent] {
+      now_i1 = now_i1 + ms
+      None
+    },
+    call_async: fn(_id : Int64, _op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {},
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_i1 },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_i1 = station_whole::EdgeMuxHub::from_transport(tr_i1)
+  let mgr_i1 = LiveRunnerManager::new()
+  mgr_i1.set_handover_state_path("/data/run/whole-live-runners.json")
+  mgr_i1.sessions.set("s-i1", make_sess(471, "s-i1", "r-cn-a", 4603, LiveRunnerPhase::Connecting(cn_rinfo_a), true))
+  let ok_i1 = mgr_i1.stop_all_on_shutdown_with(
+    hub_i1,
+    ops_i1,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    now_ms_fn=fn() -> Int64 { now_i1 },
+    verify_spawn_id=fn(_p, _ms, _b, _t) -> SpawnIdentityVerdict { SpawnIdentityVerdict::ConfirmedSame },
+    runner_sock_send_verified_fn=fn(_s, _p, _b, _t) -> Int {
+      i1_calls = i1_calls + 1
+      station_sys::RUNNER_SEND_OUTCOME_UNKNOWN
+    },
+    close_child_fn=fn(_c) {},
+    max_wait_ms=200L,
+  )
+  assert_true(!ok_i1 && i1_calls == 1, "R33 1I-a: -3 outcome unknown MUST NOT retry (strictly 1 call) and returns false while alive")
+  assert_true(mgr_i1.draining_stopping_ids.length() == 1, "R33 1I-a: stop marker preserved when alive after -3")
+  assert_true(ops_i1.read_text("/data/run/whole-live-runners.json").is_ok(), "R33 1I-a: marker persisted to disk")
+
+  // 1I-b: `runner_sock_send_verified_fn` returns `-3` and next tick OS reports `ConfirmedDeadOrReused`
+  // (in-flight write took effect) -> strictly 1 send call, clears marker, returns true.
+  let mem_i2 = station_ops::MemFs::new()
+  let ops_i2 = mem_i2.ops()
+  let mut now_i2 = 1000L
+  let mut i2_calls = 0
+  let mut i2_polls = 0
+  let tr_i2 = builders_core::MuxTransport::{
+    wait: fn(ms : Int64) -> Option[host_shim::HostEvent] {
+      now_i2 = now_i2 + ms
+      None
+    },
+    call_async: fn(_id : Int64, _op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {},
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_i2 },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_i2 = station_whole::EdgeMuxHub::from_transport(tr_i2)
+  let mgr_i2 = LiveRunnerManager::new()
+  mgr_i2.set_handover_state_path("/data/run/whole-live-runners.json")
+  mgr_i2.sessions.set("s-i2", make_sess(472, "s-i2", "r-cn-a", 4603, LiveRunnerPhase::Connecting(cn_rinfo_a), true))
+  let ok_i2 = mgr_i2.stop_all_on_shutdown_with(
+    hub_i2,
+    ops_i2,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    now_ms_fn=fn() -> Int64 { now_i2 },
+    verify_spawn_id=fn(_p, _ms, _b, _t) -> SpawnIdentityVerdict {
+      i2_polls = i2_polls + 1
+      if i2_polls >= 2 { SpawnIdentityVerdict::ConfirmedDeadOrReused } else { SpawnIdentityVerdict::ConfirmedSame }
+    },
+    runner_sock_send_verified_fn=fn(_s, _p, _b, _t) -> Int {
+      i2_calls = i2_calls + 1
+      station_sys::RUNNER_SEND_OUTCOME_UNKNOWN
+    },
+    close_child_fn=fn(_c) {},
+    max_wait_ms=200L,
+  )
+  assert_true(ok_i2 && i2_calls == 1, "R33 1I-b: -3 with subsequent OS exit clears marker and returns true with strictly 1 send call")
+  assert_true(mgr_i2.draining_stopping_ids.length() == 0, "R33 1I-b: stop marker cleared on OS exit")
+
+  // 1I-c: `-1` (definitely not submitted) retries on next tick -> 2nd call returns `0`, OS exits -> returns true.
+  let mem_i3 = station_ops::MemFs::new()
+  let ops_i3 = mem_i3.ops()
+  let mut now_i3 = 1000L
+  let mut i3_calls = 0
+  let mut i3_dead = false
+  let tr_i3 = builders_core::MuxTransport::{
+    wait: fn(ms : Int64) -> Option[host_shim::HostEvent] {
+      now_i3 = now_i3 + ms
+      None
+    },
+    call_async: fn(_id : Int64, _op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {},
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { now_i3 },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_i3 = station_whole::EdgeMuxHub::from_transport(tr_i3)
+  let mgr_i3 = LiveRunnerManager::new()
+  mgr_i3.set_handover_state_path("/data/run/whole-live-runners.json")
+  mgr_i3.sessions.set("s-i3", make_sess(473, "s-i3", "r-cn-a", 4603, LiveRunnerPhase::Connecting(cn_rinfo_a), true))
+  let ok_i3 = mgr_i3.stop_all_on_shutdown_with(
+    hub_i3,
+    ops_i3,
+    "/data",
+    "/",
+    9999,
+    fn(_m) {},
+    now_ms_fn=fn() -> Int64 { now_i3 },
+    verify_spawn_id=fn(_p, _ms, _b, _t) -> SpawnIdentityVerdict {
+      if i3_dead { SpawnIdentityVerdict::ConfirmedDeadOrReused } else { SpawnIdentityVerdict::ConfirmedSame }
+    },
+    runner_sock_send_verified_fn=fn(_s, _p, _b, _t) -> Int {
+      i3_calls = i3_calls + 1
+      if i3_calls == 1 {
+        station_sys::RUNNER_SEND_NOT_SUBMITTED
+      } else {
+        i3_dead = true
+        station_sys::RUNNER_SEND_OK
+      }
+    },
+    close_child_fn=fn(_c) {},
+    max_wait_ms=200L,
+  )
+  assert_true(ok_i3 && i3_calls == 2, "R33 1I-c: -1 definitely-not-submitted retries, succeeds on 2nd call, and returns true")
+  assert_true(mgr_i3.draining_stopping_ids.length() == 0, "R33 1I-c: stop marker cleared after retry + OS exit")
+
+  // ---- Test 2: REAL `register_adopted_runner_with` + REAL `ShellMux` single stop-owner guard ----
+  let mut adopt_opens = 0
+  let tr_c = builders_core::MuxTransport::{
+    wait: fn(_ms : Int64) -> Option[host_shim::HostEvent] { None },
+    call_async: fn(_id : Int64, op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {
+      if op == "unix.open" {
+        adopt_opens = adopt_opens + 1
+      }
+    },
+    call_sync: fn(_op : String, _json : String) -> String { "{\"ok\":true}" },
+    write_stdout_line: fn(_s : String) -> Bool { true },
+    write_stdout_frame: fn(_h : Array[(String, base_codec::Json)], _b : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { 1000L },
+    wall_ms: fn() -> Int64 { 1700000010000L },
+  }
+  let hub_c = station_whole::EdgeMuxHub::from_transport(tr_c)
+  let mux_c = builders_core::ShellMux::new(hub_c.as_mux_transport(), start_stdin=false)
+  let mgr_c = LiveRunnerManager::new()
+  let spawn_k = match encode_spawn_stop_key_pure("r-sp-a", 4601, 1700000010000L, Some("boot-r26"), Some(777L)) {
+    Some(k) => k
+    None => panic("expected spawn key")
+  }
+  mgr_c.record_draining_stop_marker(spawn_k, "s-r26")
+  let iid_c = station_whole::WholeAgents::runner_instance_id(sp_rinfo_a.id, sp_rinfo_a.runner_pid, sp_rinfo_a.started_at)
+  assert_true(
+    mgr_c.is_draining_stop_target(
+      iid_c,
+      sp_rinfo_a.id,
+      sp_rinfo_a.runner_pid,
+      sp_rinfo_a.started_at,
+      verify_spawn_id=fn(_p, _ms, _b, _t) { SpawnIdentityVerdict::ConfirmedSame },
+    ),
+    "R26 2: spawn: marker matches via ConfirmedSame",
+  )
+  let stop_sess_1 = make_sess(501, "s-r26", "r-sp-a", 4601, LiveRunnerPhase::Connecting(sp_rinfo_a), true)
+  let res1 = mgr_c.register_adopted_runner_with(mux_c, sp_rinfo_a, stop_sess_1, true)
+  assert_true(res1 is AdoptRunnerResult::AdoptedForStop, "R26 2: first adopt returns AdoptedForStop")
+  assert_true(mgr_c.draining.length() == 1 && adopt_opens == 1, "R26 2: exactly 1 draining owner and 1 unix.open")
+  let stop_sess_2 = make_sess(502, "s-r26", "r-sp-a", 4601, LiveRunnerPhase::Connecting(sp_rinfo_a), true)
+  let res2 = mgr_c.register_adopted_runner_with(mux_c, sp_rinfo_a, stop_sess_2, true)
+  assert_true(res2 is AdoptRunnerResult::Rejected, "R26 2: duplicate adopt on same runner_id returns Rejected")
+  assert_true(mgr_c.draining.length() == 1 && adopt_opens == 1, "R26 2: still exactly 1 draining owner and 1 unix.open")
 }

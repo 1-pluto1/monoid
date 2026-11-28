@@ -66,6 +66,7 @@
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
@@ -85,7 +86,6 @@
 #include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
-#include <sys/un.h>
 #include <util.h>
 #else
 #include <pty.h>
@@ -1794,10 +1794,17 @@ int32_t sts_proc_kill(int32_t pid, int32_t sig, int32_t group) {
     }
     if (sig == STS_SIG_PROBE) {
         HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
-        if (h == NULL) return GetLastError() == ERROR_ACCESS_DENIED ? 0 : -1;
-        int alive = (WaitForSingleObject(h, 0) == WAIT_TIMEOUT);
+        if (h == NULL) {
+            DWORD err = GetLastError();
+            if (err == ERROR_ACCESS_DENIED) return 0;
+            if (err == ERROR_INVALID_PARAMETER) return -3;
+            return -1;
+        }
+        DWORD wr = WaitForSingleObject(h, 0);
         CloseHandle(h);
-        return alive ? 0 : -1;
+        if (wr == WAIT_TIMEOUT) return 0;
+        if (wr == WAIT_OBJECT_0) return -3;
+        return -1;
     }
     if (group) {
         wchar_t line[96];
@@ -1852,6 +1859,12 @@ void *sts_proc_cmdline(int32_t pid, int64_t *out_len) {
     return NULL;
 }
 
+int32_t sts_is_child_pgroup_leader(int32_t child_pid, int32_t expected_ppid, int32_t expected_pgid) {
+    (void)child_pid;
+    (void)expected_ppid;
+    (void)expected_pgid;
+    return 0;
+}
 void *sts_boot_id(int64_t *out_len) {
     if (out_len != NULL) *out_len = 0;
     return NULL;
@@ -6318,6 +6331,35 @@ void *sts_proc_cmdline(int32_t pid, int64_t *out_len) {
 #endif
 }
 
+int32_t sts_is_child_pgroup_leader(int32_t child_pid, int32_t expected_ppid, int32_t expected_pgid) {
+    if (child_pid <= 1 || expected_ppid <= 1 || expected_pgid <= 1 || child_pid != expected_pgid) {
+        return 0;
+    }
+#ifdef __APPLE__
+    struct proc_bsdinfo info;
+    memset(&info, 0, sizeof(info));
+    int got = proc_pidinfo((int)child_pid, PROC_PIDTBSDINFO, 0, &info, (int)sizeof(info));
+    if (got <= 0) return 0;
+    return ((int32_t)info.pbi_ppid == expected_ppid && (int32_t)info.pbi_pgid == expected_pgid) ? 1 : 0;
+#else
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)child_pid);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return 0;
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) return 0;
+    buf[n] = '\0';
+    char *rp = strrchr(buf, ')');
+    if (rp == NULL || rp[1] != ' ') return 0;
+    int ppid = 0;
+    int pgrp = 0;
+    if (sscanf(rp + 2, "%*c %d %d", &ppid, &pgrp) != 2) return 0;
+    return (ppid == expected_ppid && pgrp == expected_pgid) ? 1 : 0;
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // 3. POSIX Launcher Control Channel (fd e.g. fd 5; never touches fds 3/4)
 // ---------------------------------------------------------------------------
@@ -6729,7 +6771,8 @@ void *sts_realpath_err(const char *path, int64_t *out_len, int32_t *out_err) {
     if (path == NULL || path[0] == '\0') return NULL;
     char *resolved = realpath(path, NULL);
     if (resolved == NULL) {
-        if (out_err != NULL) *out_err = sts_posix_map_errno(errno);
+        int e = errno;
+        if (out_err != NULL) *out_err = (e == ENOTDIR) ? -1 : sts_posix_map_errno(e);
         return NULL;
     }
     void *res = dup_bytes(resolved, strlen(resolved), out_len);
@@ -10239,6 +10282,427 @@ int32_t sts_exec_replace(
     fprintf(stderr, "stillfail-station-pion: execv(%s) failed: %s\n", program, strerror(err));
     free(argv);
     return 127;
+#endif
+}
+
+#define STS_VS_INIT 0
+#define STS_VS_SUBMITTING 1
+#define STS_VS_CANCELLED 2
+
+typedef struct sts_vs_state {
+    _Atomic int32_t state;
+    _Atomic int32_t any_submitted;
+} sts_vs_state_t;
+
+static inline void sts_vs_init(sts_vs_state_t *s) {
+    atomic_init(&s->state, STS_VS_INIT);
+    atomic_init(&s->any_submitted, 0);
+}
+
+static inline int sts_vs_begin_submit(sts_vs_state_t *s) {
+    int32_t expected = STS_VS_INIT;
+    if (!atomic_compare_exchange_strong_explicit(
+            &s->state, &expected, STS_VS_SUBMITTING, memory_order_acq_rel, memory_order_acquire)) {
+        return 0;
+    }
+    atomic_store_explicit(&s->any_submitted, 1, memory_order_release);
+    return 1;
+}
+
+static inline int sts_vs_is_cancelled(sts_vs_state_t *s) {
+    return atomic_load_explicit(&s->state, memory_order_acquire) == STS_VS_CANCELLED ? 1 : 0;
+}
+
+static inline int32_t sts_vs_cancel_from_caller(sts_vs_state_t *s) {
+    int32_t prev = atomic_exchange_explicit(&s->state, STS_VS_CANCELLED, memory_order_acq_rel);
+    int32_t submitted = atomic_load_explicit(&s->any_submitted, memory_order_acquire);
+    return (prev == STS_VS_SUBMITTING || submitted != 0) ? -3 : -1;
+}
+
+static inline int32_t sts_vs_finish_sync_chunk(sts_vs_state_t *s, int64_t next_off, int64_t total_len) {
+    if (sts_vs_is_cancelled(s)) {
+        return -3;
+    }
+    if (next_off < total_len) {
+        int32_t expected = STS_VS_SUBMITTING;
+        if (!atomic_compare_exchange_strong_explicit(
+                &s->state, &expected, STS_VS_INIT, memory_order_acq_rel, memory_order_acquire)) {
+            return -3;
+        }
+    }
+    return 0;
+}
+
+int32_t sts_selftest_verified_send_cancel(void) {
+    /* 1. Cancel before first CAS (INIT, any_submitted=0) -> -1; worker begin_submit refused. */
+    {
+        sts_vs_state_t vs;
+        sts_vs_init(&vs);
+        if (sts_vs_cancel_from_caller(&vs) != -1) return 1;
+        if (!sts_vs_is_cancelled(&vs)) return 2;
+        if (sts_vs_begin_submit(&vs) != 0) return 3;
+    }
+    /* 2. Cancel after CAS (SUBMITTING), before/during sync WriteFile -> caller -3, sync finish -3 (never 0). */
+    {
+        sts_vs_state_t vs;
+        sts_vs_init(&vs);
+        if (sts_vs_begin_submit(&vs) != 1) return 4;
+        if (sts_vs_cancel_from_caller(&vs) != -3) return 5;
+        if (!sts_vs_is_cancelled(&vs)) return 6;
+        if (sts_vs_finish_sync_chunk(&vs, 64, 64) != -3) return 7;
+        if (sts_vs_finish_sync_chunk(&vs, 64, 128) != -3) return 8;
+    }
+    /* 3. Chunk 1 written & reset SUBMITTING->INIT (any_submitted=1), then cancelled -> -3 (never -1); chunk 2 refused. */
+    {
+        sts_vs_state_t vs;
+        sts_vs_init(&vs);
+        if (sts_vs_begin_submit(&vs) != 1) return 9;
+        if (sts_vs_finish_sync_chunk(&vs, 65536, 131072) != 0) return 10;
+        if (sts_vs_is_cancelled(&vs)) return 11;
+        if (sts_vs_cancel_from_caller(&vs) != -3) return 12;
+        if (sts_vs_begin_submit(&vs) != 0) return 13;
+    }
+    /* 4. Normal 2-chunk completion without cancellation -> 0. */
+    {
+        sts_vs_state_t vs;
+        sts_vs_init(&vs);
+        if (sts_vs_begin_submit(&vs) != 1) return 14;
+        if (sts_vs_finish_sync_chunk(&vs, 65536, 131072) != 0) return 15;
+        if (sts_vs_begin_submit(&vs) != 1) return 16;
+        if (sts_vs_finish_sync_chunk(&vs, 131072, 131072) != 0) return 17;
+        if (sts_vs_is_cancelled(&vs)) return 18;
+    }
+    return 0;
+}
+
+#ifdef _WIN32
+typedef struct win_verified_send_ctx {
+    volatile LONG refs;
+    sts_vs_state_t vs;
+    volatile LONG result;
+    wchar_t *wpath;
+    uint8_t *buf;
+    int64_t len;
+    int32_t expected_pid;
+    ULONGLONG deadline_ms;
+    PVOID volatile h;
+    HANDLE io_ev;
+    HANDLE cancel_ev;
+    HANDLE done_ev;
+    OVERLAPPED ov;
+} win_verified_send_ctx_t;
+
+static void win_verified_send_ctx_release(win_verified_send_ctx_t *ctx) {
+    if (InterlockedDecrement(&ctx->refs) == 0) {
+        HANDLE h = (HANDLE)ctx->h;
+        if (h != NULL && h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+        }
+        if (ctx->io_ev != NULL) {
+            CloseHandle(ctx->io_ev);
+        }
+        if (ctx->cancel_ev != NULL) {
+            CloseHandle(ctx->cancel_ev);
+        }
+        if (ctx->done_ev != NULL) {
+            CloseHandle(ctx->done_ev);
+        }
+        free(ctx->wpath);
+        free(ctx->buf);
+        free(ctx);
+    }
+}
+
+static DWORD WINAPI win_verified_send_worker(LPVOID arg) {
+    win_verified_send_ctx_t *ctx = (win_verified_send_ctx_t *)arg;
+    LONG rc = -1;
+    if (sts_vs_is_cancelled(&ctx->vs) || GetTickCount64() >= ctx->deadline_ms) {
+        goto done;
+    }
+    HANDLE h = CreateFileW(
+        ctx->wpath,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_OVERLAPPED,
+        NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        goto done;
+    }
+    ULONG server_pid = 0;
+    if (!GetNamedPipeServerProcessId(h, &server_pid) || (int32_t)server_pid != ctx->expected_pid) {
+        CloseHandle(h);
+        rc = -2;
+        goto done;
+    }
+    /* Publish handle; owned by refcount and closed only when refs drops to 0. */
+    (void)InterlockedExchangePointer(&ctx->h, (PVOID)h);
+
+    int64_t off = 0;
+    while (off < ctx->len) {
+        if (!sts_vs_begin_submit(&ctx->vs)) {
+            rc = (off > 0) ? -3 : -1;
+            goto done;
+        }
+        ULONGLONG now_ms = GetTickCount64();
+        if (now_ms >= ctx->deadline_ms) {
+            rc = (off > 0) ? -3 : -1;
+            goto done;
+        }
+        ULONGLONG rem64 = ctx->deadline_ms - now_ms;
+        DWORD rem = (rem64 > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (DWORD)rem64;
+        DWORD chunk = (ctx->len - off > 65536) ? 65536U : (DWORD)(ctx->len - off);
+        (void)ResetEvent(ctx->io_ev);
+        ZeroMemory(&ctx->ov, sizeof(ctx->ov));
+        ctx->ov.hEvent = ctx->io_ev;
+        DWORD written = 0;
+        BOOL ok = WriteFile(h, ctx->buf + off, chunk, &written, &ctx->ov);
+        if (!ok) {
+            if (GetLastError() != ERROR_IO_PENDING) {
+                rc = (off > 0) ? -3 : -1;
+                goto done;
+            }
+            HANDLE waits[2] = { ctx->io_ev, ctx->cancel_ev };
+            DWORD wrc = WaitForMultipleObjects(2, waits, FALSE, rem);
+            if (wrc != WAIT_OBJECT_0 || sts_vs_is_cancelled(&ctx->vs)) {
+                (void)CancelIoEx(h, &ctx->ov);
+                DWORD dummy = 0;
+                (void)GetOverlappedResult(h, &ctx->ov, &dummy, TRUE);
+                rc = -3;
+                goto done;
+            }
+            if (!GetOverlappedResult(h, &ctx->ov, &written, FALSE) || written == 0) {
+                rc = -3;
+                goto done;
+            }
+        } else if (written == 0) {
+            rc = (off > 0) ? -3 : -1;
+            goto done;
+        }
+        off += (int64_t)written;
+        if (sts_vs_finish_sync_chunk(&ctx->vs, off, ctx->len) != 0) {
+            rc = -3;
+            goto done;
+        }
+    }
+    rc = sts_vs_is_cancelled(&ctx->vs) ? -3 : 0;
+
+done:
+    (void)InterlockedExchange(&ctx->result, rc);
+    (void)SetEvent(ctx->done_ev);
+    win_verified_send_ctx_release(ctx);
+    return 0;
+}
+#endif
+
+int32_t sts_runner_sock_send_verified(
+    const char *sock_path,
+    int32_t expected_pid,
+    const uint8_t *data,
+    int64_t len,
+    int32_t timeout_ms) {
+    if (sock_path == NULL || sock_path[0] == '\0' || expected_pid <= 1 || data == NULL || len <= 0) {
+        return -1;
+    }
+    if (timeout_ms <= 0) {
+        timeout_ms = 200;
+    }
+#ifdef _WIN32
+    ULONGLONG start_ms = GetTickCount64();
+    ULONGLONG deadline_ms = start_ms + (ULONGLONG)timeout_ms;
+    wchar_t *wpath = utf8_to_wide(sock_path);
+    if (wpath == NULL) {
+        return -1;
+    }
+    uint8_t *buf = (uint8_t *)malloc((size_t)len);
+    if (buf == NULL) {
+        free(wpath);
+        return -1;
+    }
+    memcpy(buf, data, (size_t)len);
+    win_verified_send_ctx_t *ctx = (win_verified_send_ctx_t *)calloc(1, sizeof(*ctx));
+    if (ctx == NULL) {
+        free(buf);
+        free(wpath);
+        return -1;
+    }
+    ctx->refs = 2; /* 1 for caller, 1 for worker */
+    sts_vs_init(&ctx->vs);
+    ctx->result = -1;
+    ctx->wpath = wpath;
+    ctx->buf = buf;
+    ctx->len = len;
+    ctx->expected_pid = expected_pid;
+    ctx->deadline_ms = deadline_ms;
+    ctx->h = NULL;
+    ctx->io_ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+    ctx->cancel_ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+    ctx->done_ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (ctx->io_ev == NULL || ctx->cancel_ev == NULL || ctx->done_ev == NULL) {
+        ctx->refs = 1;
+        win_verified_send_ctx_release(ctx);
+        return -1;
+    }
+    HANDLE th = CreateThread(NULL, 0, win_verified_send_worker, ctx, 0, NULL);
+    if (th == NULL) {
+        ctx->refs = 1;
+        win_verified_send_ctx_release(ctx);
+        return -1;
+    }
+    CloseHandle(th);
+
+    ULONGLONG now_ms = GetTickCount64();
+    DWORD rem = (now_ms >= deadline_ms)
+        ? 0U
+        : (DWORD)((deadline_ms - now_ms > 0xFFFFFFFFULL) ? 0xFFFFFFFFULL : (deadline_ms - now_ms));
+    DWORD wrc = WaitForSingleObject(ctx->done_ev, rem);
+    if (wrc == WAIT_OBJECT_0) {
+        int32_t rc = (int32_t)InterlockedCompareExchange(&ctx->result, 0, 0);
+        win_verified_send_ctx_release(ctx);
+        return rc;
+    }
+    /* Wait-free timeout cancellation: distinguish definite not-submitted (-1) vs in-flight/unknown (-3). */
+    int32_t cancel_rc = sts_vs_cancel_from_caller(&ctx->vs);
+    (void)SetEvent(ctx->cancel_ev);
+    HANDLE ch = (HANDLE)InterlockedCompareExchangePointer(&ctx->h, NULL, NULL);
+    if (ch != NULL && ch != INVALID_HANDLE_VALUE) {
+        (void)CancelIoEx(ch, NULL);
+    }
+    win_verified_send_ctx_release(ctx);
+    return cancel_rc;
+#else
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    size_t plen = strlen(sock_path);
+    if (plen >= sizeof(addr.sun_path)) {
+        return -1;
+    }
+    memcpy(addr.sun_path, sock_path, plen + 1);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        close(fd);
+        return -1;
+    }
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+#ifdef __APPLE__
+    int one = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, (socklen_t)sizeof(one));
+#endif
+
+    struct timespec ts_start;
+    memset(&ts_start, 0, sizeof(ts_start));
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts_start);
+    int64_t start_ms = (int64_t)ts_start.tv_sec * 1000LL + (int64_t)(ts_start.tv_nsec / 1000000L);
+    int64_t deadline_ms = start_ms + (int64_t)timeout_ms;
+
+    if (connect(fd, (struct sockaddr *)&addr, (socklen_t)sizeof(addr)) != 0) {
+        if (errno != EINPROGRESS && errno != EWOULDBLOCK) {
+            close(fd);
+            return -1;
+        }
+        for (;;) {
+            struct timespec ts_now;
+            (void)clock_gettime(CLOCK_MONOTONIC, &ts_now);
+            int64_t now_ms = (int64_t)ts_now.tv_sec * 1000LL + (int64_t)(ts_now.tv_nsec / 1000000L);
+            int64_t rem = deadline_ms - now_ms;
+            if (rem <= 0) {
+                close(fd);
+                return -1;
+            }
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            int prc = poll(&pfd, 1, (int)(rem > 2147483647LL ? 2147483647LL : rem));
+            if (prc < 0) {
+                if (errno == EINTR) continue;
+                close(fd);
+                return -1;
+            }
+            if (prc == 0) {
+                close(fd);
+                return -1;
+            }
+            int so_err = 0;
+            socklen_t slen = (socklen_t)sizeof(so_err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &slen) != 0 || so_err != 0) {
+                close(fd);
+                return -1;
+            }
+            break;
+        }
+    }
+
+#if defined(__linux__)
+    struct ucred cred;
+    socklen_t clen = (socklen_t)sizeof(cred);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) != 0
+        || clen < (socklen_t)sizeof(cred)
+        || (int32_t)cred.pid != expected_pid) {
+        close(fd);
+        return -2;
+    }
+#elif defined(__APPLE__)
+    pid_t peer_pid = 0;
+    socklen_t pidlen = (socklen_t)sizeof(peer_pid);
+    if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &peer_pid, &pidlen) != 0
+        || pidlen < (socklen_t)sizeof(peer_pid)
+        || (int32_t)peer_pid != expected_pid) {
+        close(fd);
+        return -2;
+    }
+#else
+    close(fd);
+    return -2;
+#endif
+
+    int64_t off = 0;
+    while (off < len) {
+#ifdef MSG_NOSIGNAL
+        ssize_t n = send(fd, data + off, (size_t)(len - off), MSG_NOSIGNAL);
+#else
+        ssize_t n = send(fd, data + off, (size_t)(len - off), 0);
+#endif
+        if (n > 0) {
+            off += (int64_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct timespec ts_now;
+            (void)clock_gettime(CLOCK_MONOTONIC, &ts_now);
+            int64_t now_ms = (int64_t)ts_now.tv_sec * 1000LL + (int64_t)(ts_now.tv_nsec / 1000000L);
+            int64_t rem = deadline_ms - now_ms;
+            if (rem <= 0) {
+                close(fd);
+                return (off > 0) ? -3 : -1;
+            }
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            int prc = poll(&pfd, 1, (int)(rem > 2147483647LL ? 2147483647LL : rem));
+            if (prc <= 0) {
+                if (prc < 0 && errno == EINTR) continue;
+                close(fd);
+                return (off > 0) ? -3 : -1;
+            }
+            continue;
+        }
+        close(fd);
+        return (off > 0) ? -3 : -1;
+    }
+    close(fd);
+    return 0;
 #endif
 }
 

@@ -54,6 +54,7 @@ import "station_whole"
 import "websocket"
 
 let WHOLE_HANDOVER_FILE : String = "whole-handover.json"
+let WHOLE_LIVE_RUNNERS_HANDOVER_FILE : String = "whole-live-runners.json"
 let WHOLE_MAX_ADMIN_HEAD : Int = 65536
 let WHOLE_MAX_PROXY_HEAD : Int = 262144
 let WHOLE_MAX_HTTP_BODY : Int64 = 4194304L
@@ -316,6 +317,21 @@ fn save_remote_connects_file(
   let _ = station_ops::write_private(ops_fs, path, body.to_bytes(), pid, 1, sep=sep)
 }
 
+/// Canonical external thread surface key shared by storage and `query_thread_moved_to`:
+/// Slack uses `slack:<team>` when `described.team` is present, otherwise `<kind>:<cid>`.
+pub fn surface_for_described(kind : String, described : base_codec::Json, cid : String) -> String {
+  let eff_kind = if kind.length() > 0 { kind } else { "slack" }
+  if eff_kind == "slack" {
+    let team = match base_codec::json_get(described, "team") {
+      Some(base_codec::Json::Str(s)) => s.trim()
+      _ => ""
+    }
+    if team.length() > 0 { "slack:" + team } else { "slack:" + cid }
+  } else {
+    eff_kind + ":" + cid
+  }
+}
+
 fn connect_meta_from_described(
   remote_id : String,
   described : base_codec::Json,
@@ -335,12 +351,7 @@ fn connect_meta_from_described(
     let w = get_s(described, "workspace")
     if w.length() > 0 { w } else { fallback_ws }
   }
-  let team = get_s(described, "team")
-  let surface = if kind == "slack" {
-    if team.length() > 0 { "slack:" + team } else { "slack:" + remote_id }
-  } else {
-    kind + ":" + remote_id
-  }
+  let surface = surface_for_described(kind, described, remote_id)
   let single = get_s(described, "mode") == "single-session"
   let require_mention = if !single {
     true
@@ -382,33 +393,6 @@ pub enum ConnectEventValidation {
   Reject(String)
   DeliverKept(String)
   LearnAndDeliver(String, base_codec::Json)
-}
-
-/// Returns `true` only when the explicit test-only native connects flag is enabled.
-/// Until Wave 17C-1 wires live `stillfail-runner` spawning to consume `started_prompts`,
-/// runtime `connect.event` ingress MUST fail closed when this returns `false` (P0-A).
-pub fn native_connects_runtime_enabled() -> Bool {
-  match station_sys::env_get("STILLFAIL_PION_NATIVE_CONNECTS_TEST") {
-    Some("1") => true
-    _ => false
-  }
-}
-
-/// Runtime-gated wrapper around `validate_connect_event` (P0-A): when `native_enabled` is
-/// `false`, rejects BOTH `LearnAndDeliver` and `kept: true` BEFORE any DB or `remote-connects`
-/// mutation so cross-station events are never falsely ACKed into a silent black hole.
-pub fn validate_connect_event_with_gate(
-  native_enabled : Bool,
-  req : base_codec::Json,
-  ws : String,
-  here_station : String,
-  has_local_connect : (String) -> Bool,
-  local_connect_ws : (String) -> Option[String],
-) -> ConnectEventValidation {
-  if !native_enabled {
-    return ConnectEventValidation::Reject("native connects disabled until runner cutover")
-  }
-  validate_connect_event(req, ws, here_station, has_local_connect, local_connect_ws)
 }
 
 /// Builds a `connect.call` outbound `post` RPC payload 1:1 with TS `station/src/connects/remote.ts`:
@@ -560,7 +544,9 @@ fn handle_slack_interactive_payload(
   envelope_id : String,
   payload : base_codec::Json,
   now_ms : Int64,
-) -> Bool {
+  on_done : (Bool) -> Unit,
+  on_moved_to : Option[(String, String, base_codec::Json, base_codec::Json, (Bool) -> Unit) -> Unit] = None,
+) -> Unit {
   let get_s = fn(obj : base_codec::Json, k : String) -> String {
     match base_codec::json_get(obj, k) {
       Some(base_codec::Json::Str(s)) => s
@@ -619,7 +605,8 @@ fn handle_slack_interactive_payload(
     _ => ()
   }
   if ch.length() == 0 || tts.length() == 0 || choice.length() == 0 {
-    return false
+    on_done(false)
+    return
   }
   let ts = if action_ts.length() > 0 {
     "card-" + action_ts
@@ -646,7 +633,7 @@ fn handle_slack_interactive_payload(
       },
     },
   )
-  handle_connect_inbound_event(core, connects, connect_meta, connect_id, ev, now_ms)
+  let _ = handle_connect_inbound_event(core, connects, connect_meta, connect_id, ev, now_ms, on_done=Some(on_done), on_moved_to=on_moved_to)
 }
 
 pub fn parse_wire_chat_event(ev : base_codec::Json) -> Option[station_connects::ChatEvent] {
@@ -737,6 +724,114 @@ pub fn parse_wire_chat_event(ev : base_codec::Json) -> Option[station_connects::
   None
 }
 
+/// Encodes a `ChatEvent` into the cross-station `connect.event` wire JSON format (inverse of `parse_wire_chat_event`).
+pub fn encode_wire_chat_event(ev : station_connects::ChatEvent) -> base_codec::Json {
+  let encode_msg = fn(m : station_connects::InboundMessage) -> base_codec::Json {
+    let files_j : Array[base_codec::Json] = []
+    for i in 0..<m.files.length() {
+      let f = m.files[i]
+      let ffields : Array[(String, base_codec::Json)] = [
+        ("id", base_codec::json_str(f.id)),
+        ("name", base_codec::json_str(f.name)),
+        ("size", base_codec::json_int64(f.size)),
+      ]
+      match f.url {
+        Some(u) => if u.length() > 0 { ffields.push(("url", base_codec::json_str(u))) }
+        None => ()
+      }
+      files_j.push(base_codec::json_obj(ffields))
+    }
+    let mfields : Array[(String, base_codec::Json)] = [
+      ("channel", base_codec::json_str(m.channel)),
+      ("threadTs", base_codec::json_str(m.thread_ts)),
+      ("ts", base_codec::json_str(m.ts)),
+      ("user", base_codec::json_str(m.user)),
+      ("text", base_codec::json_str(m.text)),
+      ("addressed", base_codec::json_bool(m.addressed)),
+      ("files", base_codec::json_arr(files_j)),
+    ]
+    match m.quoted {
+      Some(q) => if q.length() > 0 { mfields.push(("quoted", base_codec::json_str(q))) }
+      None => ()
+    }
+    base_codec::json_obj(mfields)
+  }
+  match ev {
+    station_connects::ChatEvent::Message(m) => base_codec::json_obj([
+      ("type", base_codec::json_str("message")),
+      ("message", encode_msg(m)),
+    ])
+    station_connects::ChatEvent::OwnNotice(m) => base_codec::json_obj([
+      ("type", base_codec::json_str("ownNotice")),
+      ("message", encode_msg(m)),
+    ])
+    station_connects::ChatEvent::Changed(ch, tts, ts, text) => base_codec::json_obj([
+      ("type", base_codec::json_str("changed")),
+      ("channel", base_codec::json_str(ch)),
+      ("threadTs", base_codec::json_str(tts)),
+      ("ts", base_codec::json_str(ts)),
+      ("text", base_codec::json_str(text)),
+    ])
+    station_connects::ChatEvent::Stop(ch, tts, ts, _) => base_codec::json_obj([
+      ("type", base_codec::json_str("stop")),
+      ("channel", base_codec::json_str(ch)),
+      ("threadTs", base_codec::json_str(tts)),
+      ("ts", base_codec::json_str(ts)),
+    ])
+    station_connects::ChatEvent::LoginCode(ch, tts, lid, code, _) => base_codec::json_obj([
+      ("type", base_codec::json_str("loginCode")),
+      ("channel", base_codec::json_str(ch)),
+      ("threadTs", base_codec::json_str(tts)),
+      ("loginId", base_codec::json_str(lid)),
+      ("code", base_codec::json_str(code)),
+    ])
+  }
+}
+
+/// R8 P1-5: Shared `connect.event` peer RPC payload builder (1:1 with TS `knownOf(id, here)` and
+/// receiver `validate_connect_event`: `connect` is ALWAYS `{"id": connect_id, "origin": origin_station}`).
+pub fn encode_connect_event_rpc(
+  connect_id : String,
+  origin_station : String,
+  ws : String,
+  described : base_codec::Json,
+  event : base_codec::Json,
+) -> base_codec::Json {
+  base_codec::json_obj([
+    ("method", base_codec::json_str("connect.event")),
+    ("workspace", base_codec::json_str(ws)),
+    (
+      "connect",
+      base_codec::json_obj([
+        ("id", base_codec::json_str(connect_id)),
+        ("origin", base_codec::json_str(origin_station)),
+      ]),
+    ),
+    ("described", described),
+    ("event", event),
+  ])
+}
+
+fn describe_connect_meta(connect_id : String, meta : ConnectMeta) -> base_codec::Json {
+  let parts = meta.config_surface.split(":")
+  let kind = if parts.length() > 0 && parts[0].length() > 0 { parts[0] } else { "slack" }
+  let team = if parts.length() > 1 && parts[1].length() > 0 { parts[1] } else { connect_id }
+  base_codec::json_obj([
+    ("kind", base_codec::json_str(kind)),
+    ("workspace", base_codec::json_str(meta.ws)),
+    ("team", base_codec::json_str(team)),
+    ("mode", base_codec::json_str(if meta.single { "single-session" } else { "threads" })),
+    ("requireMention", base_codec::json_bool(meta.require_mention)),
+    (
+      "bind",
+      base_codec::json_obj([
+        ("runtime", base_codec::json_str(meta.runtime)),
+        ("profile", base_codec::json_str(meta.profile)),
+      ]),
+    ),
+  ])
+}
+
 fn emit_thread_sse_event(
   core : station_whole::WholeCore,
   ws : String,
@@ -786,6 +881,18 @@ fn emit_thread_sse_event(
 /// (local Slack/Feishu/Comma/Group or cross-station `connect.event`) into SQLite
 /// `threads` / `entries` / `deliveries`, respects `left_at` and multi-edit history,
 /// and triggers `SessionHub` actor prompt delivery + live `"thread"` SSE push.
+fn session_belongs_to_ws(
+  sess_ws : Option[String],
+  target_ws : String,
+  home_ws : String,
+) -> Bool {
+  let eff = match sess_ws {
+    Some(w) => if w.length() > 0 { w } else { home_ws }
+    None => home_ws
+  }
+  eff == target_ws
+}
+
 fn handle_connect_inbound_event(
   core : station_whole::WholeCore,
   connects : station_whole::ConnectsOsRuntime,
@@ -793,14 +900,25 @@ fn handle_connect_inbound_event(
   connect_id : String,
   ev : station_connects::ChatEvent,
   now_ms : Int64,
+  on_stop_session : (String) -> Unit = fn(_s : String) -> Unit { () },
+  on_login_code : (String, String) -> Unit = fn(_lid : String, _code : String) -> Unit { () },
+  on_done : Option[(Bool) -> Unit] = None,
+  on_moved_to : Option[(String, String, base_codec::Json, base_codec::Json, (Bool) -> Unit) -> Unit] = None,
 ) -> Bool {
+  let finish = fn(ok : Bool) -> Bool {
+    match on_done {
+      Some(cb) => cb(ok)
+      None => ()
+    }
+    ok
+  }
   let meta = match connect_meta.get(connect_id) {
     Some(m) => m
-    None => return false
+    None => return finish(false)
   }
   let st_db = match core.store.require_open() {
     Ok(s) => s
-    Err(_) => return false
+    Err(_) => return finish(false)
   }
   let (ch, tts) = match ev {
     station_connects::ChatEvent::Message(m) => (m.channel, m.thread_ts)
@@ -809,7 +927,29 @@ fn handle_connect_inbound_event(
     station_connects::ChatEvent::Stop(c, t, _, _) => (c, t)
     station_connects::ChatEvent::LoginCode(c, t, _, _, _) => (c, t)
   }
-  let routed_elsewhere = connects.workspace.thread_station(connect_id, ch, tts) is Some(_)
+  // R9 P1-5: Query `query_thread_moved_to` FIRST (strictly SQL-filtered by `meta.ws`, matching
+  // both in-flight `s.ws = meta.ws` and completed `s.ws = 'handed:' || meta.ws` which
+  // `thread_visible_in_ws` intentionally hides from local lists!).
+  let moved_station_opt = query_thread_moved_to(
+    st_db,
+    meta.config_surface,
+    connect_id,
+    ch,
+    tts,
+    meta.ws,
+    core.config.home_workspace,
+  )
+  match (moved_station_opt, on_moved_to) {
+    (Some(target_station), Some(fwd_fn)) => {
+      let done_cb = match on_done {
+        Some(cb) => cb
+        None => fn(_ok : Bool) -> Unit { () }
+      }
+      fwd_fn(target_station, meta.ws, describe_connect_meta(connect_id, meta), encode_wire_chat_event(ev), done_cb)
+      return true
+    }
+    _ => ()
+  }
   let existing_tid : Option[Int64] = match st_db.db.first(
     "SELECT id FROM threads WHERE surface = ?1 AND channel = ?2 AND thread_ts = ?3 LIMIT 1",
     [
@@ -824,61 +964,112 @@ fn handle_connect_inbound_event(
     }
     _ => None
   }
+  // Security (P0-1 / R9 P1-5): For local delivery, enforce workspace visibility BEFORE attachment
+  // download or message persistence so workspace A NEVER touches a thread owned by workspace B!
+  match existing_tid {
+    Some(id) => {
+      let vis = match station_whole::thread_visible_in_ws(st_db, id, meta.ws, core.config.home_workspace) {
+        Ok(b) => b
+        Err(_) => false
+      }
+      if !vis {
+        return finish(false)
+      }
+    }
+    None => ()
+  }
+  let routed_elsewhere = moved_station_opt is Some(_)
+  let ok = handle_connect_inbound_event_local(
+    core,
+    connects,
+    meta,
+    st_db,
+    connect_id,
+    ev,
+    now_ms,
+    routed_elsewhere,
+    existing_tid,
+    on_stop_session,
+    on_login_code,
+  )
+  finish(ok)
+}
+
+fn handle_connect_inbound_event_local(
+  core : station_whole::WholeCore,
+  connects : station_whole::ConnectsOsRuntime,
+  meta : ConnectMeta,
+  st_db : station_store::Store,
+  connect_id : String,
+  ev : station_connects::ChatEvent,
+  now_ms : Int64,
+  routed_elsewhere : Bool,
+  existing_tid : Option[Int64],
+  on_stop_session : (String) -> Unit,
+  on_login_code : (String, String) -> Unit,
+) -> Bool {
   match decide_connect_inbound(meta.single, meta.require_mention, routed_elsewhere, existing_tid is Some(_), ev) {
     ConnectInboundDecision::IgnoreAndAck => true
     ConnectInboundDecision::RefuseNoAck => false
+    ConnectInboundDecision::StopTurn => {
+      match existing_tid {
+        Some(tid) => {
+          match st_db.db.all(
+            "SELECT session FROM thread_sessions WHERE thread = ?1 AND left_at IS NULL",
+            [sql_db::int64_to_json(tid)],
+          ) {
+            Ok(rows) => {
+              for i in 0..<rows.length() {
+                let skey = match rows[i].get("session") {
+                  Some(base_codec::Json::Str(s)) => s
+                  _ => ""
+                }
+                if skey.length() > 0 {
+                  match st_db.get_session(skey) {
+                    Ok(Some(srow)) => {
+                      if session_belongs_to_ws(srow.ws, meta.ws, core.config.home_workspace) {
+                        on_stop_session(skey)
+                      }
+                    }
+                    _ => ()
+                  }
+                }
+              }
+            }
+            Err(_) => ()
+          }
+          true
+        }
+        None => true
+      }
+    }
+    ConnectInboundDecision::HandleLoginCode => match ev {
+      station_connects::ChatEvent::LoginCode(_, _, login_id, code, _) => {
+        if login_id.length() > 0 && code.length() > 0 {
+          on_login_code(login_id, code)
+        }
+        true
+      }
+      _ => true
+    }
     ConnectInboundDecision::PersistMessage => match ev {
       station_connects::ChatEvent::Message(m) => {
         if !connects.workspace.should_deliver_thread(connect_id, m.channel, m.thread_ts, m.addressed) {
           return true
         }
-        let tid = match existing_tid {
-          Some(id) => id
-          None => match st_db.ensure_thread(
-            meta.config_surface,
-            m.channel,
-            m.thread_ts,
-            None,
-            Some(m.user),
-            now_ms,
-            home=Some(meta.ws),
-          ) {
-            Ok(id) => id
-            Err(_) => return false
-          }
-        }
-        let active_sessions : Array[String] = []
-        let mut had_left_session = false
-        match st_db.db.all(
-          "SELECT session, left_at FROM thread_sessions WHERE thread = ?1",
-          [sql_db::int64_to_json(tid)],
-        ) {
-          Ok(rows) => {
-            for i in 0..<rows.length() {
-              let skey = match rows[i].get("session") {
-                Some(base_codec::Json::Str(s)) => s
-                _ => ""
+        let sess_scope = if meta.single { m.channel } else { m.channel + "/" + m.thread_ts }
+        let default_skey = connect_id + ":" + sess_scope
+        // Security (P0-1): `threads.home` is a SESSION KEY (not a workspace ID!).
+        // Ensure/create the owning session FIRST when creating a new thread so `threads.home = default_skey`
+        // atomically resolves `COALESCE(h.ws, home_ws) == meta.ws` in `thread_visible_in_ws`!
+        let ensure_default_session = fn() -> Bool {
+          let exists_sess = match st_db.get_session(default_skey) {
+            Ok(Some(existing_row)) => {
+              if !session_belongs_to_ws(existing_row.ws, meta.ws, core.config.home_workspace) {
+                return false
               }
-              let is_left = match rows[i].get("left_at") {
-                Some(base_codec::Json::Null) | None => false
-                _ => true
-              }
-              if skey.length() > 0 {
-                if is_left {
-                  had_left_session = true
-                } else {
-                  active_sessions.push(skey)
-                }
-              }
+              true
             }
-          }
-          Err(_) => return false
-        }
-        if active_sessions.length() == 0 && (!had_left_session || m.addressed) {
-          let sess_scope = if meta.single { m.channel } else { m.channel + "/" + m.thread_ts }
-          let skey = connect_id + ":" + sess_scope
-          let exists_sess = match st_db.get_session(skey) {
-            Ok(Some(_)) => true
             Ok(None) => false
             Err(_) => return false
           }
@@ -888,20 +1079,17 @@ fn handle_connect_inbound_event(
               Err(_) => return false
             }
             let sep = if station_sys::os_name() == "win32" { "\\" } else { "/" }
-            // 1:1 with TS `station/src/sessions/hub.ts:2236-2237`:
-            // `<dataDir>/sessions/<connect.id>/<dir>/workspace` (never fall back to `data_dir` root).
-            let dir_name = if !meta.single {
-              m.channel + "-" + m.thread_ts.replace(".", "-")
-            } else {
-              sess_scope
+            match meta.cwd {
+              Some(c) => if path_has_parent_traversal(c) {
+                return false
+              }
+              None => ()
             }
-            let sess_ws_dir = match meta.cwd {
-              Some(c) => c
-              None => nodepath::join(sep, [core.config.data_dir, "sessions", connect_id, dir_name, "workspace"])
-            }
+            // R7 P0-1: Always use shared collision-free `server_session_workspace_dir(data_dir, ws, skey, sep)`.
+            let sess_ws_dir = station_whole::server_session_workspace_dir(core.config.data_dir, meta.ws, default_skey, sep)
             let _ = station_sys::mkdir_p(sess_ws_dir)
             let new_sess = station_store::NewSession::{
-              key: skey,
+              key: default_skey,
               connect: connect_id,
               sess_scope: sess_scope,
               title: None,
@@ -921,14 +1109,83 @@ fn handle_connect_inbound_event(
             }
             match st_db.insert_session(new_sess) {
               Ok(_) => {
-                core.agents.register_adopted_token(skey, tok)
+                core.agents.register_adopted_token(default_skey, tok)
                 let _ = core.agents.adopt_all_active_tokens_from_store(core.store)
               }
               Err(_) => return false
             }
           }
-          match st_db.join_thread(tid, skey, connect_id, now_ms) {
-            Ok(_) => active_sessions.push(skey)
+          true
+        }
+        let tid = match existing_tid {
+          Some(id) => id
+          None => {
+            if !ensure_default_session() {
+              return false
+            }
+            match st_db.ensure_thread(
+              meta.config_surface,
+              m.channel,
+              m.thread_ts,
+              None,
+              Some(m.user),
+              now_ms,
+              home=Some(default_skey),
+            ) {
+              Ok(id) => id
+              Err(_) => return false
+            }
+          }
+        }
+        // Verify returned thread row genuinely belongs to `meta.ws` (protects against concurrent race).
+        let tid_vis = match station_whole::thread_visible_in_ws(st_db, tid, meta.ws, core.config.home_workspace) {
+          Ok(b) => b
+          Err(_) => false
+        }
+        if !tid_vis {
+          return false
+        }
+        let active_sessions : Array[String] = []
+        let mut had_left_session = false
+        match st_db.db.all(
+          "SELECT session, left_at FROM thread_sessions WHERE thread = ?1",
+          [sql_db::int64_to_json(tid)],
+        ) {
+          Ok(rows) => {
+            for i in 0..<rows.length() {
+              let skey = match rows[i].get("session") {
+                Some(base_codec::Json::Str(s)) => s
+                _ => ""
+              }
+              let is_left = match rows[i].get("left_at") {
+                Some(base_codec::Json::Null) | None => false
+                _ => true
+              }
+              if skey.length() > 0 {
+                match st_db.get_session(skey) {
+                  Ok(Some(srow)) => {
+                    if !session_belongs_to_ws(srow.ws, meta.ws, core.config.home_workspace) {
+                      return false
+                    }
+                  }
+                  _ => ()
+                }
+                if is_left {
+                  had_left_session = true
+                } else {
+                  active_sessions.push(skey)
+                }
+              }
+            }
+          }
+          Err(_) => return false
+        }
+        if active_sessions.length() == 0 && (!had_left_session || m.addressed) {
+          if !ensure_default_session() {
+            return false
+          }
+          match st_db.join_thread(tid, default_skey, connect_id, now_ms) {
+            Ok(_) => active_sessions.push(default_skey)
             Err(_) => return false
           }
         }
@@ -1110,7 +1367,9 @@ fn handle_feishu_card_answer(
   connect_id : String,
   ans : station_connects::FeishuCardAnswer,
   now_ms : Int64,
-) -> Bool {
+  on_done : (Bool) -> Unit,
+  on_moved_to : Option[(String, String, base_codec::Json, base_codec::Json, (Bool) -> Unit) -> Unit] = None,
+) -> Unit {
   let tts = if ans.thread_ts.length() > 0 { ans.thread_ts } else { ans.message_id }
   let ts = if ans.event_id.length() > 0 { "card-" + ans.event_id } else { "card-" + now_ms.to_string() }
   let ev = station_connects::ChatEvent::Message(
@@ -1125,7 +1384,7 @@ fn handle_feishu_card_answer(
       quoted: if ans.message_id.length() > 0 { Some(ans.message_id) } else { None },
     },
   )
-  handle_connect_inbound_event(core, connects, connect_meta, connect_id, ev, now_ms)
+  let _ = handle_connect_inbound_event(core, connects, connect_meta, connect_id, ev, now_ms, on_done=Some(on_done), on_moved_to=on_moved_to)
 }
 
 /// Local attachment chunk reader for Comma `task.read_file` & `comma.read_file`
@@ -1414,6 +1673,8 @@ pub enum ConnectInboundDecision {
   RefuseNoAck
   PersistMessage
   PersistEdit
+  StopTurn
+  HandleLoginCode
 }
 
 /// Pure, side-effect-free inbound connect routing decision aligned 1:1 with
@@ -1447,10 +1708,73 @@ pub fn decide_connect_inbound(
     }
     // 1:1 with Node `hub.ts:1179` (`acceptOwnNotice`): never insert spurious `author_kind='notice'` rows.
     station_connects::ChatEvent::OwnNotice(_) => ConnectInboundDecision::IgnoreAndAck
-    // Unimplemented event types fail closed (never ACK without handling).
-    station_connects::ChatEvent::Stop(_, _, _, _)
-    | station_connects::ChatEvent::LoginCode(_, _, _, _, _) => ConnectInboundDecision::RefuseNoAck
+    station_connects::ChatEvent::Stop(_, _, _, _) => {
+      if existing_thread_exists {
+        ConnectInboundDecision::StopTurn
+      } else {
+        ConnectInboundDecision::IgnoreAndAck
+      }
+    }
+    station_connects::ChatEvent::LoginCode(_, _, _, _, _) => ConnectInboundDecision::HandleLoginCode
   }
+}
+
+fn hex_nibble(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 65 && c <= 70 {
+    c - 55
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else {
+    -1
+  }
+}
+
+fn percent_decode_segment(raw : String) -> String {
+  let b = raw.to_bytes()
+  let out : Array[Byte] = []
+  let mut i = 0
+  while i < b.length() {
+    let c = b[i].to_int() & 0xFF
+    if c == 37 && i + 2 < b.length() {
+      let hi = hex_nibble(b[i + 1].to_int() & 0xFF)
+      let lo = hex_nibble(b[i + 2].to_int() & 0xFF)
+      if hi >= 0 && lo >= 0 {
+        out.push(((hi << 4) | lo) as Byte)
+        i = i + 3
+        continue
+      }
+    }
+    out.push(b[i])
+    i = i + 1
+  }
+  let res = Bytes::new(out.length())
+  for j in 0..<out.length() {
+    res[j] = out[j]
+  }
+  res.to_string()
+}
+
+/// Extracts `<key>` from `POST /sessions/<key>/stop` (ignoring query string).
+pub fn extract_session_stop_key(method : String, raw_path : String) -> Option[String] {
+  if method != "POST" {
+    return None
+  }
+  let (path, _, _) = station_http::parse_request_target(raw_path)
+  if !path.starts_with("/sessions/") || !path.ends_with("/stop") {
+    return None
+  }
+  let pb = path.to_bytes()
+  if pb.length() <= 15 {
+    return None
+  }
+  let key_bytes = slice_bytes_local(pb, 10, pb.length() - 5)
+  let raw_key = bytes_to_str_local(key_bytes, key_bytes.length())
+  if raw_key.length() == 0 || raw_key.contains("/") {
+    return None
+  }
+  Some(percent_decode_segment(raw_key))
 }
 
 /// Route `EV_CONFIG_WATCH` `FsChange` events to `core.config_file.on_fs_event(kind, name)`
@@ -1500,6 +1824,7 @@ struct WholeRuntimeState {
   rig_put_streams : Map[Int64, StreamPutCtx]
   adopted_runners : Map[Int, AdoptedRunnerConn]
   adopted_runner_by_sock : Map[Int64, Int]
+  live_runners : LiveRunnerManager
   mut next_runner_conn_id : Int
   mut carried_handover_failed : Option[String]
   mut mcp_announced : Bool
@@ -2088,9 +2413,8 @@ fn is_abs_drive_root(p : String, is_win : Bool) -> Bool {
   false
 }
 
-fn clean_abs_drive_roots(raw : Array[String]) -> Array[String] {
-  let is_win = station_sys::os_name() == "win32"
-  let sep = if is_win { "\\" } else { "/" }
+fn clean_abs_drive_roots_with_sep(raw : Array[String], sep : String) -> Array[String] {
+  let is_win = sep == "\\"
   let out : Array[String] = []
   for i in 0..<raw.length() {
     let t = raw[i].trim()
@@ -2104,27 +2428,36 @@ fn clean_abs_drive_roots(raw : Array[String]) -> Array[String] {
   out
 }
 
+fn clean_abs_drive_roots(raw : Array[String]) -> Array[String] {
+  let sep = if station_sys::os_name() == "win32" { "\\" } else { "/" }
+  clean_abs_drive_roots_with_sep(raw, sep)
+}
+
 /// Strictly resolve Drive roots for a single workspace (1:1 with `station/src/drive/drive.ts:104-107`):
 /// - Home workspace (`is_home == true`): `drive.roots` (or `driveRoots` / `STILLFAIL_DRIVE_ROOTS`).
 /// - Joined workspace (`is_home == false`): `drive.workspaces[ws]` ONLY.
 /// - Rejects relative paths, normalizes absolute paths, NEVER shares home roots with joined workspaces,
 ///   and NEVER falls back to `$HOME`!
-fn parse_drive_roots_for_workspace(
+/// Pure workspace-scoped Drive roots resolver (zero `station_sys` dependency so unit tests can
+/// exercise `resolve_session_launch_policy` directly).
+fn parse_drive_roots_for_workspace_pure(
   cfg_raw : base_codec::Json,
   ws : String,
   is_home : Bool,
+  env_roots_opt : Option[String],
+  sep : String,
 ) -> Array[String] {
   if !is_home {
     match base_codec::json_get(cfg_raw, "drive") {
       Some(drv) => match base_codec::json_get(drv, "workspaces") {
-        Some(wss) => return clean_abs_drive_roots(parse_str_arr_json(base_codec::json_get(wss, ws)))
+        Some(wss) => return clean_abs_drive_roots_with_sep(parse_str_arr_json(base_codec::json_get(wss, ws)), sep)
         None => return []
       }
       None => return []
     }
   }
   let out : Array[String] = []
-  match station_sys::env_get("STILLFAIL_DRIVE_ROOTS") {
+  match env_roots_opt {
     Some(env_roots) => {
       if env_roots.length() > 0 {
         let parts = env_roots.split(",")
@@ -2139,16 +2472,25 @@ fn parse_drive_roots_for_workspace(
     None => ()
   }
   if out.length() > 0 {
-    return clean_abs_drive_roots(out)
+    return clean_abs_drive_roots_with_sep(out, sep)
   }
   let from_drive_roots = match base_codec::json_get(cfg_raw, "drive") {
     Some(drv) => parse_str_arr_json(base_codec::json_get(drv, "roots"))
     None => []
   }
   if from_drive_roots.length() > 0 {
-    return clean_abs_drive_roots(from_drive_roots)
+    return clean_abs_drive_roots_with_sep(from_drive_roots, sep)
   }
-  clean_abs_drive_roots(parse_str_arr_json(base_codec::json_get(cfg_raw, "driveRoots")))
+  clean_abs_drive_roots_with_sep(parse_str_arr_json(base_codec::json_get(cfg_raw, "driveRoots")), sep)
+}
+
+fn parse_drive_roots_for_workspace(
+  cfg_raw : base_codec::Json,
+  ws : String,
+  is_home : Bool,
+) -> Array[String] {
+  let sep = if station_sys::os_name() == "win32" { "\\" } else { "/" }
+  parse_drive_roots_for_workspace_pure(cfg_raw, ws, is_home, station_sys::env_get("STILLFAIL_DRIVE_ROOTS"), sep)
 }
 
 fn build_whole_core_config(ctx : DaemonCtx, now_secs : Double) -> station_whole::WholeCoreConfig {
@@ -2194,9 +2536,17 @@ fn build_whole_core_config(ctx : DaemonCtx, now_secs : Double) -> station_whole:
   }
 
   let home_drive_roots = parse_drive_roots_for_workspace(ctx.cfg_raw, home_ws, true)
-  let runner_bin = match ctx.args.app {
-    Some(a) => nodepath::join(ctx.sep, [a, "station", "stillfail-runner"])
-    None => ""
+  let runner_bin = match station_sys::env_get("STILLFAIL_RUNNER") {
+    Some(p) => if p.trim().length() > 0 { p.trim() } else {
+      match ctx.args.app {
+        Some(a) => nodepath::join(ctx.sep, [a, "station", "stillfail-runner"])
+        None => ""
+      }
+    }
+    None => match ctx.args.app {
+      Some(a) => nodepath::join(ctx.sep, [a, "station", "stillfail-runner"])
+      None => ""
+    }
   }
   station_whole::WholeCoreConfig::{
     station_id: ctx.station_key.id,
@@ -3062,12 +3412,257 @@ fn encode_ws_proxy_frame(kind : Int, payload : Bytes) -> Bytes {
 /// `WholeCore::open_after_predecessor_gone` (`whole_agents.pion:807`).
 /// Prioritizes native `stillfail-runner` field `"runner"` (`station/native/runner/src/main.rs:376`),
 /// falling back to `"runnerPid"` / `"runner_pid"` for compatibility.
-fn discover_live_runners(ops_fs : station_ops::OpsFs, data : String, sep : String) -> Array[station_drivers::RunnerInfo] {
+pub enum RunnerPidStatus {
+  Alive
+  ConfirmedDead
+  Unknown
+}
+
+/// R20/R21: Unified tri-state runner PID liveness probe:
+/// - `rpid <= 1` or `station_sys::proc_kill_is_esrch(kill_rc)` (`-3`) -> `ConfirmedDead`
+/// - `kill_rc != 0` (POSIX `EPERM` `-1`, Win32 `WAIT_FAILED`/unknown `-1`) or `started_at <= 0L` -> `Unknown` (NEVER dead!)
+/// - `kill_rc == 0 && started_at > 0L`: PID reused (`actual > started_at + STARTED_SLACK_MS`) -> `ConfirmedDead`, else `Alive`
+pub fn probe_runner_pid_status(
+  rpid : Int,
+  started_at : Int64,
+  kill_rc : Int,
+  os_start_time_ms : Option[Int64],
+) -> RunnerPidStatus {
+  if rpid <= 1 || station_sys::proc_kill_is_esrch(kill_rc) {
+    return RunnerPidStatus::ConfirmedDead
+  }
+  if kill_rc != 0 || started_at <= 0L {
+    return RunnerPidStatus::Unknown
+  }
+  match os_start_time_ms {
+    Some(actual) => if actual > started_at + station_drivers::STARTED_SLACK_MS {
+      RunnerPidStatus::ConfirmedDead
+    } else {
+      RunnerPidStatus::Alive
+    }
+    None => RunnerPidStatus::Alive
+  }
+}
+
+pub enum RunnerFileProbe {
+  Live(station_drivers::RunnerInfo)
+  ConfirmedAbsent
+  ConfirmedDead
+  Uncertain(String, Option[station_drivers::RunnerInfo])
+}
+
+pub struct RunnerScanResult {
+  pub runners : Array[station_drivers::RunnerInfo]
+  pub complete : Bool
+  pub error : Option[String]
+}
+
+fn is_safe_runner_id(runner_id : String) -> Bool {
+  if runner_id.length() == 0 {
+    return false
+  }
+  if runner_id.contains("/") || runner_id.contains("\\") || runner_id.contains("..") {
+    return false
+  }
+  true
+}
+
+/// R20: Single-file runner metadata + tri-state PID probe:
+/// - `read_text` failure is `ConfirmedAbsent` ONLY when `realpath_fn(fpath)` confirms true `FsErr::NotFound`;
+///   existing unreadable file (`Ok(_)`) or un-traversable parent (`PermissionDenied`/etc.) returns `Uncertain(_, None)`.
+/// - Corrupt JSON, missing `id`, `expected_id` mismatch, or `rpid <= 1` returns `Uncertain(_, None)`.
+/// - Uses tri-state `probe_runner_pid_status` so `Unknown` (`kill_rc == -1`) returns `Uncertain(..., Some(info))`
+///   instead of silently dropping a live runner as dead!
+pub fn probe_runner_metadata_file_with(
+  ops_fs : station_ops::OpsFs,
+  fpath : String,
+  expected_id : Option[String],
+  realpath_fn : (String) -> Result[String, station_ops::FsErr],
+  readlink_fn : (String) -> Option[String],
+  kill_probe_fn : (Int) -> Int,
+  start_time_fn : (Int) -> Option[Int64],
+) -> RunnerFileProbe {
+  let raw = match ops_fs.read_text(fpath) {
+    Ok(s) => s
+    Err(e) => match realpath_fn(fpath) {
+      Err(station_ops::FsErr::NotFound) => return RunnerFileProbe::ConfirmedAbsent
+      Ok(_) => return RunnerFileProbe::Uncertain("read " + fpath + " failed while file exists: " + station_ops::fs_err_msg(e), None)
+      Err(re) => return RunnerFileProbe::Uncertain("read/realpath " + fpath + ": " + station_ops::fs_err_msg(re), None)
+    }
+  }
+  let j = match base_codec::json_parse(raw) {
+    base_codec::JsonParseResult::Ok(v) => v
+    base_codec::JsonParseResult::Err(e) => return RunnerFileProbe::Uncertain("parse " + fpath + ": " + e, None)
+  }
+  let id = match base_codec::json_get(j, "id") {
+    Some(base_codec::Json::Str(s)) => if s.length() > 0 { s } else { return RunnerFileProbe::Uncertain("empty id in " + fpath, None) }
+    _ => return RunnerFileProbe::Uncertain("missing id in " + fpath, None)
+  }
+  match expected_id {
+    Some(eid) => if id != eid {
+      return RunnerFileProbe::Uncertain("id mismatch in " + fpath + ": expected " + eid + ", got " + id, None)
+    }
+    None => ()
+  }
+  let rpid = match base_codec::json_get(j, "runner") {
+    Some(base_codec::Json::Num(n, _)) => n.to_int()
+    _ => match base_codec::json_get(j, "runnerPid") {
+      Some(base_codec::Json::Num(n, _)) => n.to_int()
+      _ => match base_codec::json_get(j, "runner_pid") {
+        Some(base_codec::Json::Num(n, _)) => n.to_int()
+        _ => 0
+      }
+    }
+  }
+  if rpid <= 1 {
+    return RunnerFileProbe::Uncertain("invalid runner pid in " + fpath, None)
+  }
+  let pid = match base_codec::json_get(j, "pid") {
+    Some(base_codec::Json::Num(n, _)) => n.to_int()
+    _ => rpid
+  }
+  let pgid = match base_codec::json_get(j, "pgid") {
+    Some(base_codec::Json::Num(n, _)) => n.to_int()
+    _ => pid
+  }
+  let started_at = match base_codec::json_get(j, "startedAt") {
+    Some(base_codec::Json::Num(n, _)) => {
+      let v = n.to_int64()
+      if n > 0.0 && v > 0L { v } else { return RunnerFileProbe::Uncertain("missing or invalid startedAt in " + fpath, None) }
+    }
+    Some(_) => return RunnerFileProbe::Uncertain("missing or invalid startedAt in " + fpath, None)
+    None => match base_codec::json_get(j, "started_at") {
+      Some(base_codec::Json::Num(n, _)) => {
+        let v = n.to_int64()
+        if n > 0.0 && v > 0L { v } else { return RunnerFileProbe::Uncertain("missing or invalid startedAt in " + fpath, None) }
+      }
+      _ => return RunnerFileProbe::Uncertain("missing or invalid startedAt in " + fpath, None)
+    }
+  }
+  let program = match base_codec::json_get(j, "program") {
+    Some(base_codec::Json::Str(s)) => s
+    _ => ""
+  }
+  let args : Array[String] = []
+  match base_codec::json_get(j, "args") {
+    Some(base_codec::Json::Arr(arr)) => {
+      for ai in 0..<arr.length() {
+        match arr[ai] {
+          base_codec::Json::Str(s) => args.push(s)
+          _ => ()
+        }
+      }
+    }
+    _ => ()
+  }
+  let socket = match base_codec::json_get(j, "socket") {
+    Some(base_codec::Json::Str(s)) => s
+    _ => ""
+  }
+  let keeps = match base_codec::json_get(j, "keeps") {
+    Some(base_codec::Json::Bool(b)) => b
+    _ => false
+  }
+  let pty = match base_codec::json_get(j, "pty") {
+    Some(base_codec::Json::Bool(b)) => b
+    _ => false
+  }
+  let cwd_opt = match base_codec::json_get(j, "cwd") {
+    Some(base_codec::Json::Str(s)) => if s.trim().length() > 0 { Some(s.trim()) } else { None }
+    _ => if pid > 1 && pid != rpid {
+      match readlink_fn("/proc/" + pid.to_string() + "/cwd") {
+        Some(p) => if p.trim().length() > 0 { Some(p.trim()) } else { None }
+        None => None
+      }
+    } else {
+      None
+    }
+  }
+  let info = station_drivers::RunnerInfo::{
+    id: id,
+    runner_pid: rpid,
+    pid: pid,
+    pgid: pgid,
+    started_at: started_at,
+    program: program,
+    args: args,
+    socket: socket,
+    keeps: keeps,
+    pty: pty,
+    cwd: cwd_opt,
+  }
+  let kill_rc = kill_probe_fn(rpid)
+  let os_start = if kill_rc == 0 { start_time_fn(rpid) } else { None }
+  match probe_runner_pid_status(rpid, started_at, kill_rc, os_start) {
+    RunnerPidStatus::ConfirmedDead => RunnerFileProbe::ConfirmedDead
+    RunnerPidStatus::Alive => RunnerFileProbe::Live(info)
+    RunnerPidStatus::Unknown => RunnerFileProbe::Uncertain("pid probe uncertain rc=" + kill_rc.to_string(), Some(info))
+  }
+}
+
+pub fn probe_runner_file_with(
+  ops_fs : station_ops::OpsFs,
+  data : String,
+  sep : String,
+  runner_id : String,
+  realpath_fn : (String) -> Result[String, station_ops::FsErr],
+  readlink_fn : (String) -> Option[String],
+  kill_probe_fn : (Int) -> Int,
+  start_time_fn : (Int) -> Option[Int64],
+) -> RunnerFileProbe {
+  if !is_safe_runner_id(runner_id) {
+    return RunnerFileProbe::Uncertain("invalid runner id", None)
+  }
+  let fpath = nodepath::join(sep, [station_drivers::runners_dir(data, sep), runner_id + ".json"])
+  probe_runner_metadata_file_with(ops_fs, fpath, Some(runner_id), realpath_fn, readlink_fn, kill_probe_fn, start_time_fn)
+}
+
+pub fn probe_runner_file(
+  ops_fs : station_ops::OpsFs,
+  data : String,
+  sep : String,
+  runner_id : String,
+) -> RunnerFileProbe {
+  probe_runner_file_with(
+    ops_fs,
+    data,
+    sep,
+    runner_id,
+    sys_realpath_checked,
+    station_sys::readlink,
+    fn(p : Int) -> Int { station_sys::proc_kill(p, station_sys::SIG_PROBE, false) },
+    station_sys::proc_start_time_ms,
+  )
+}
+
+/// R18/R19/R20: Startup directory scan reusing `probe_runner_metadata_file_with` + tri-state `kill_probe_fn`.
+/// Retains both `Live(info)` and `Uncertain(msg, Some(info))` (never drops a runner on Win32/POSIX `-1`!).
+pub fn discover_live_runners_scan_with(
+  ops_fs : station_ops::OpsFs,
+  data : String,
+  sep : String,
+  realpath_fn : (String) -> Result[String, station_ops::FsErr],
+  readlink_fn : (String) -> Option[String],
+  kill_probe_fn : (Int) -> Int,
+  start_time_fn : (Int) -> Option[Int64],
+) -> RunnerScanResult {
   let out : Array[station_drivers::RunnerInfo] = []
+  let mut complete = true
+  let mut first_err : Option[String] = None
+  let mark_incomplete = fn(msg : String) -> Unit {
+    complete = false
+    if first_err is None {
+      first_err = Some(msg)
+    }
+  }
   let rdir = station_drivers::runners_dir(data, sep)
   let entries = match (ops_fs.readdir)(rdir) {
     Ok(list) => list
-    Err(_) => return out
+    Err(e) => match realpath_fn(rdir) {
+      Err(station_ops::FsErr::NotFound) => return RunnerScanResult::{ runners: out, complete: true, error: None }
+      Ok(_) => return RunnerScanResult::{ runners: out, complete: false, error: Some("readdir " + rdir + " failed while dir exists: " + station_ops::fs_err_msg(e)) }
+      Err(re) => return RunnerScanResult::{ runners: out, complete: false, error: Some("readdir/realpath " + rdir + ": " + station_ops::fs_err_msg(re)) }
+    }
   }
   for i in 0..<entries.length() {
     let name = entries[i]
@@ -3075,90 +3670,37 @@ fn discover_live_runners(ops_fs : station_ops::OpsFs, data : String, sep : Strin
       continue
     }
     let fpath = nodepath::join(sep, [rdir, name])
-    let raw = match ops_fs.read_text(fpath) {
-      Ok(s) => s
-      Err(_) => continue
-    }
-    let j = match base_codec::json_parse(raw) {
-      base_codec::JsonParseResult::Ok(v) => v
-      base_codec::JsonParseResult::Err(_) => continue
-    }
-    let id = match base_codec::json_get(j, "id") {
-      Some(base_codec::Json::Str(s)) => s
-      _ => continue
-    }
-    let rpid = match base_codec::json_get(j, "runner") {
-      Some(base_codec::Json::Num(n, _)) => n.to_int()
-      _ => match base_codec::json_get(j, "runnerPid") {
-        Some(base_codec::Json::Num(n, _)) => n.to_int()
-        _ => match base_codec::json_get(j, "runner_pid") {
-          Some(base_codec::Json::Num(n, _)) => n.to_int()
-          _ => 0
-        }
+    match probe_runner_metadata_file_with(ops_fs, fpath, None, realpath_fn, readlink_fn, kill_probe_fn, start_time_fn) {
+      RunnerFileProbe::Live(info) => out.push(info)
+      RunnerFileProbe::Uncertain(msg, Some(info)) => {
+        out.push(info)
+        mark_incomplete(msg)
       }
-    }
-    let pid = match base_codec::json_get(j, "pid") {
-      Some(base_codec::Json::Num(n, _)) => n.to_int()
-      _ => rpid
-    }
-    let pgid = match base_codec::json_get(j, "pgid") {
-      Some(base_codec::Json::Num(n, _)) => n.to_int()
-      _ => pid
-    }
-    let started_at = match base_codec::json_get(j, "startedAt") {
-      Some(base_codec::Json::Num(n, _)) => n.to_int64()
-      _ => match base_codec::json_get(j, "started_at") {
-        Some(base_codec::Json::Num(n, _)) => n.to_int64()
-        _ => 0L
-      }
-    }
-    let program = match base_codec::json_get(j, "program") {
-      Some(base_codec::Json::Str(s)) => s
-      _ => ""
-    }
-    let args : Array[String] = []
-    match base_codec::json_get(j, "args") {
-      Some(base_codec::Json::Arr(arr)) => {
-        for ai in 0..<arr.length() {
-          match arr[ai] {
-            base_codec::Json::Str(s) => args.push(s)
-            _ => ()
-          }
-        }
-      }
-      _ => ()
-    }
-    let socket = match base_codec::json_get(j, "socket") {
-      Some(base_codec::Json::Str(s)) => s
-      _ => ""
-    }
-    let keeps = match base_codec::json_get(j, "keeps") {
-      Some(base_codec::Json::Bool(b)) => b
-      _ => false
-    }
-    let pty = match base_codec::json_get(j, "pty") {
-      Some(base_codec::Json::Bool(b)) => b
-      _ => false
-    }
-    let info = station_drivers::RunnerInfo::{
-      id: id,
-      runner_pid: rpid,
-      pid: pid,
-      pgid: pgid,
-      started_at: started_at,
-      program: program,
-      args: args,
-      socket: socket,
-      keeps: keeps,
-      pty: pty,
-    }
-    let alive = rpid > 1 && station_ops::is_pid_alive(rpid)
-    let os_start = if alive { station_sys::proc_start_time_ms(rpid) } else { None }
-    if station_drivers::is_runner_live(info, alive, os_start) {
-      out.push(info)
+      RunnerFileProbe::Uncertain(msg, None) => mark_incomplete(msg)
+      RunnerFileProbe::ConfirmedAbsent | RunnerFileProbe::ConfirmedDead => ()
     }
   }
-  out
+  RunnerScanResult::{ runners: out, complete: complete, error: first_err }
+}
+
+pub fn discover_live_runners_scan(
+  ops_fs : station_ops::OpsFs,
+  data : String,
+  sep : String,
+) -> RunnerScanResult {
+  discover_live_runners_scan_with(
+    ops_fs,
+    data,
+    sep,
+    sys_realpath_checked,
+    station_sys::readlink,
+    fn(p : Int) -> Int { station_sys::proc_kill(p, station_sys::SIG_PROBE, false) },
+    station_sys::proc_start_time_ms,
+  )
+}
+
+fn discover_live_runners(ops_fs : station_ops::OpsFs, data : String, sep : String) -> Array[station_drivers::RunnerInfo] {
+  discover_live_runners_scan(ops_fs, data, sep).runners
 }
 
 fn find_crlf_crlf(b : Bytes) -> Int {
@@ -3297,6 +3839,7 @@ fn build_upstream_http_request(
 /// Entrypoint for `stillfail-station-pion run --whole-daemon ...` (or `STILLFAIL_PION_WHOLE_DAEMON=1`).
 pub fn run_whole_daemon(argv : Array[String]) -> Int {
   let mut state_opt : Option[WholeRuntimeState] = None
+  let mut shutdown_exit_code = 0
 
   let pump_admin_body_chunk = fn(
     ctx : DaemonCtx,
@@ -3853,9 +4396,76 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
       }
     }
 
+    // P1-4: Direct authenticated `POST /sessions/<key>/stop` interception (avoids whole_api.pion 501).
+    match extract_session_stop_key(head.method, norm_path) {
+      Some(stop_skey) => {
+        match check_oldest_core_fast(st, head.method, head.path, head.headers) {
+          Some(old_resp) => {
+            send_admin_resp_and_finish(ctx, astream.sid, old_resp)
+            astream.mode = AdminStreamMode::Done
+            return
+          }
+          None => ()
+        }
+        match peer_id {
+          station_whole::PeerIdentity::AuthenticatedMember(v, _) => {
+            let can_write = v.role == "owner" || v.role == "admin" || v.role == "member"
+            if !can_write {
+              send_admin_resp_and_finish(ctx, astream.sid, station_api::json_error(403, "read-only member cannot stop session"))
+              astream.mode = AdminStreamMode::Done
+              return
+            }
+            let st_db = match st.core.store.require_open() {
+              Ok(s) => s
+              Err(_) => {
+                send_admin_resp_and_finish(ctx, astream.sid, station_api::json_error(503, "store not ready"))
+                astream.mode = AdminStreamMode::Done
+                return
+              }
+            }
+            match st_db.get_session(stop_skey) {
+              Ok(Some(srow)) => {
+                if !session_belongs_to_ws(srow.ws, v.workspace, st.core.config.home_workspace) {
+                  send_admin_resp_and_finish(ctx, astream.sid, station_api::json_error(404, "no such session"))
+                  astream.mode = AdminStreamMode::Done
+                  return
+                }
+                let stopped = st.live_runners.stop_session(ctx, stop_skey, host_shim::now_ms())
+                let body_s = base_codec::json_stringify(
+                  base_codec::json_obj([("ok", base_codec::json_bool(true)), ("stopped", base_codec::json_bool(stopped))]),
+                )
+                send_admin_resp_and_finish(ctx, astream.sid, station_http::HttpResponse::json(200, body_s))
+                astream.mode = AdminStreamMode::Done
+                return
+              }
+              _ => {
+                send_admin_resp_and_finish(ctx, astream.sid, station_api::json_error(404, "no such session"))
+                astream.mode = AdminStreamMode::Done
+                return
+              }
+            }
+          }
+          _ => {
+            send_admin_resp_and_finish(ctx, astream.sid, station_api::json_error(403, "unauthenticated peer rejected"))
+            astream.mode = AdminStreamMode::Done
+            return
+          }
+        }
+      }
+      None => ()
+    }
+
     let action = st.core.handle_peer_http(peer_id, head.method, head.path, head.headers, body, now_w)
     match action {
       station_http::HandlerAction::Respond(resp) => {
+        if resp.status >= 200 && resp.status < 300 {
+          match extract_session_stop_key(head.method, head.path) {
+            Some(stop_skey) => {
+              let _ = st.live_runners.stop_session(ctx, stop_skey, host_shim::now_ms())
+            }
+            None => ()
+          }
+        }
         astream.mode = AdminStreamMode::Done
         send_admin_resp_and_finish(ctx, astream.sid, resp)
       }
@@ -4949,6 +5559,9 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
     tok : builders_core::MuxToken,
     d : host_shim::ShellDone,
   ) -> Unit {
+    if st.live_runners.handle_role_done(ctx, st.core, tok, d, host_shim::now_ms(), host_shim::wall_ms()) {
+      return
+    }
     match tok {
       builders_core::MuxToken::Tagged(owner_id, kind, sid) => {
         // Async `tar.file` archived session upload completion (Wave 17C-3A R4 N1).
@@ -5843,27 +6456,88 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
       let remote_connects_path = nodepath::join(ctx.sep, [ctx.data, "remote-connects.json"])
       let connect_bridge = station_whole::ConnectMuxBridge::with_hub(ctx.edge_hub, ctx.ops_fs)
       let connects_cell : Array[Option[station_whole::ConnectsOsRuntime]] = [None]
+      let live_runners_cell : Array[Option[LiveRunnerManager]] = [None]
+      let make_local_moved_fwd = fn(connect_id : String) -> (String, String, base_codec::Json, base_codec::Json, (Bool) -> Unit) -> Unit {
+        fn(target_station : String, ws : String, desc : base_codec::Json, ev_j : base_codec::Json, on_done : (Bool) -> Unit) -> Unit {
+          if target_station.length() == 0 || target_station == ctx.station_key.id {
+            on_done(false)
+            return
+          }
+          let fwd_req = encode_connect_event_rpc(connect_id, ctx.station_key.id, ws, desc, ev_j)
+          ctx.ask_peer_rpc(target_station, ws, fwd_req, fn(res : Result[base_codec::Json, String]) -> Unit {
+            match res {
+              Ok(_) => on_done(true)
+              Err(e) => {
+                ctx.log("[connects] local movedTo forward to " + target_station + " failed: " + e)
+                on_done(false)
+              }
+            }
+          })
+        }
+      }
       let connect_cbs = station_whole::ConnectsCallbacks::{
         on_event: fn(
           connect_id : String,
           _platform : station_connects::ConnectPlatform,
           ev : station_connects::ChatEvent,
-        ) -> Bool {
+          on_done : (Bool) -> Unit,
+        ) -> Unit {
           match connects_cell[0] {
-            Some(crt) => handle_connect_inbound_event(core, crt, connect_meta, connect_id, ev, host_shim::wall_ms())
-            None => false
+            Some(crt) => {
+              let _ = handle_connect_inbound_event(
+                core,
+                crt,
+                connect_meta,
+                connect_id,
+                ev,
+                host_shim::wall_ms(),
+                on_stop_session=fn(skey : String) -> Unit {
+                  match live_runners_cell[0] {
+                    Some(lr) => {
+                      let _ = lr.stop_session(ctx, skey, host_shim::now_ms())
+                    }
+                    None => ()
+                  }
+                },
+                on_login_code=fn(lid : String, code : String) -> Unit {
+                  let _ = logins.send_input(lid, Some(code), None)
+                },
+                on_done=Some(on_done),
+                on_moved_to=Some(make_local_moved_fwd(connect_id)),
+              )
+            }
+            None => on_done(false)
           }
         },
-        on_card_answer: fn(cid : String, ans : station_connects::FeishuCardAnswer) -> Bool {
+        on_card_answer: fn(cid : String, ans : station_connects::FeishuCardAnswer, on_done : (Bool) -> Unit) -> Unit {
           match connects_cell[0] {
-            Some(crt) => handle_feishu_card_answer(core, crt, connect_meta, cid, ans, host_shim::wall_ms())
-            None => false
+            Some(crt) => handle_feishu_card_answer(
+              core,
+              crt,
+              connect_meta,
+              cid,
+              ans,
+              host_shim::wall_ms(),
+              on_done,
+              on_moved_to=Some(make_local_moved_fwd(cid)),
+            )
+            None => on_done(false)
           }
         },
-        on_interactive: fn(cid : String, eid : String, payload : base_codec::Json) -> Bool {
+        on_interactive: fn(cid : String, eid : String, payload : base_codec::Json, on_done : (Bool) -> Unit) -> Unit {
           match connects_cell[0] {
-            Some(crt) => handle_slack_interactive_payload(core, crt, connect_meta, cid, eid, payload, host_shim::wall_ms())
-            None => false
+            Some(crt) => handle_slack_interactive_payload(
+              core,
+              crt,
+              connect_meta,
+              cid,
+              eid,
+              payload,
+              host_shim::wall_ms(),
+              on_done,
+              on_moved_to=Some(make_local_moved_fwd(cid)),
+            )
+            None => on_done(false)
           }
         },
         on_disconnect: fn(_cid : String, _reason : String) -> Unit {},
@@ -6387,6 +7061,8 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
         mcp_srv.listen_loopback(0)
       }
 
+      let live_runners = LiveRunnerManager::new()
+      live_runners_cell[0] = Some(live_runners)
       let now0 = host_shim::now_ms()
       let seen_members : Map[String, Map[String, Map[String, SeenMember]]] = Map::new()
       wire_whole_core_runtime_hooks(ctx, core, logins, browser, seen_members)
@@ -6419,6 +7095,7 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
         rig_put_streams: Map::new(),
         adopted_runners: Map::new(),
         adopted_runner_by_sock: Map::new(),
+        live_runners: live_runners,
         next_runner_conn_id: 1,
         carried_handover_failed: None,
         mcp_announced: false,
@@ -6471,6 +7148,22 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
               ctx.fail_and_stop(msg)
               return false
             }
+          }
+          let lr_ho_path = nodepath::join(ctx.sep, [ctx.run_dir, WHOLE_LIVE_RUNNERS_HANDOVER_FILE])
+          st.live_runners.set_handover_state_path(lr_ho_path)
+          match ctx.ops_fs.read_text(lr_ho_path) {
+            Ok(lr_raw) => {
+              match base_codec::json_parse(lr_raw) {
+                base_codec::JsonParseResult::Ok(lr_j) => {
+                  st.live_runners.import_handover_state_json(lr_j)
+                  // R12 P1-1: Keep `whole-live-runners.json` on disk until ALL pending_end_turns
+                  // and draining_stopping_ids are truly drained (unlink only when empty).
+                  let _ = st.live_runners.sync_handover_state_file(ctx.ops_fs, ctx.self_pid, ctx.sep, log_fn=fn(m) { ctx.log(m) })
+                }
+                base_codec::JsonParseResult::Err(e) => ctx.log("[live-runner] failed to parse " + lr_ho_path + ": " + e)
+              }
+            }
+            Err(_) => ()
           }
           let live_runners = discover_live_runners(ctx.ops_fs, ctx.data, ctx.sep)
           let w_now = host_shim::wall_ms()
@@ -6665,52 +7358,28 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
               if snap_valid_to_remove {
                 let _ = (ctx.ops_fs.remove)(ho_path)
               }
-              // Actively reconnect ONLY to runners genuinely claimed by `WholeAgents::adopt_sessions`
-              // (`adopt_once == Ok`); bystander runners not owned by any session are NEVER attached!
+              // P0-3: Actively reconnect claimed live runners directly into `st.live_runners` so
+              // in-flight turns continue parsing stdout and finish cleanly, and subsequent prompts
+              // reuse the SAME live runner without socket collisions (while still persisting
+              // `adopted-runners.db` chunks with `keep: 0` for `adoptedOutput`).
+              let adopt_wall_ms = host_shim::wall_ms()
+              let adopt_now_ms = host_shim::now_ms()
+              let adopt_cfg = live_config_raw(st.core, ctx.cfg_raw)
               for ri in 0..<live_runners.length() {
                 let rinfo = live_runners[ri]
                 if rinfo.socket.length() > 0 {
                   match st.core.agents.adopted_session_by_runner_id.get(rinfo.id) {
                     Some(skey) => {
-                      let rcid = st.next_runner_conn_id
-                      st.next_runner_conn_id = st.next_runner_conn_id + 1
-                      let inst_id = station_whole::WholeAgents::runner_instance_id(
-                        rinfo.id,
-                        rinfo.runner_pid,
-                        rinfo.started_at,
-                      )
-                      st.adopted_runners.set(
-                        rcid,
-                        AdoptedRunnerConn::{
-                          runner_id: rinfo.id,
-                          instance_id: inst_id,
-                          runner_pid: rinfo.runner_pid,
-                          started_at: rinfo.started_at,
-                          session_key: skey,
-                          socket_path: rinfo.socket,
-                          keep_from: 0L,
-                          sock_id: -1L,
-                          rx_chunks: [],
-                          rx_total_bytes: 0,
-                          attached_seen: false,
-                          db_initialized: false,
-                          acked_out: 0L,
-                          acked_err: 0L,
-                          lines_received: 0,
-                          exited: false,
-                        },
-                      )
-                      let _ = ctx.mux_role.call_async_raw(
-                        builders_core::MuxToken::Tagged(rcid, RUNNER_TOK_UNIX_OPEN, 0L),
-                        "unix.open",
-                        base_codec::json_stringify(base_codec::json_obj([("path", base_codec::json_str(rinfo.socket))])),
-                        None,
-                      )
+                      let _ = st.live_runners.adopt_live_runner(ctx, st.core, adopt_cfg, rinfo, skey, adopt_now_ms, adopt_wall_ms)
                     }
                     None => ()
                   }
                 }
               }
+              // R14 Invariant 2: Do NOT single-scan prune `draining_stopping_ids` at startup;
+              // `LiveRunnerManager::tick()` safely sweeps dead exact `instance_id`s via OS liveness
+              // checks and expires `Spawning` `"rid:<id>@<before_ms>"` markers after 30s while
+              // catching late-ready runners during that window.
               ctx.mark_role_ready()
               true
             }
@@ -6773,6 +7442,14 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
             let station_peer_id = station_whole::PeerIdentity::AuthenticatedStation(auth.remote_id, ws, false)
             match st.core.handle_peer_http(station_peer_id, http_method, path, hdrs, body_bytes, now_w) {
               station_http::HandlerAction::Respond(resp) => {
+                if resp.status >= 200 && resp.status < 300 {
+                  match extract_session_stop_key(http_method, path) {
+                    Some(stop_skey) => {
+                      let _ = st.live_runners.stop_session(ctx, stop_skey, host_shim::now_ms())
+                    }
+                    None => ()
+                  }
+                }
                 let rh_arr : Array[base_codec::Json] = []
                 for hi in 0..<resp.headers.length() {
                   rh_arr.push(
@@ -6850,11 +7527,8 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
           }
 
           // Cross-station external connect event delivery (`connect.event`, 1:1 with TS `workspace.ts:348-375 taken()`).
-          // P0-A: runtime entry gate refuses BOTH `LearnAndDeliver` and `kept: true` unless
-          // `STILLFAIL_PION_NATIVE_CONNECTS_TEST=1`, preventing silent black-hole ACKs before Wave 17C-1.
           if method == "connect.event" {
-            let validation = validate_connect_event_with_gate(
-              native_connects_runtime_enabled(),
+            let validation = validate_connect_event(
               req,
               ws,
               ctx.station_key.id,
@@ -6888,6 +7562,12 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
                       local_cid,
                       chat_ev,
                       now_w,
+                      on_stop_session=fn(skey : String) -> Unit {
+                        let _ = st.live_runners.stop_session(ctx, skey, host_shim::now_ms())
+                      },
+                      on_login_code=fn(lid : String, code : String) -> Unit {
+                        let _ = st.logins.send_input(lid, Some(code), None)
+                      },
                     )
                     if ok {
                       let res_j = base_codec::json_obj([("ok", base_codec::json_bool(true))])
@@ -6903,16 +7583,26 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
                 return
               }
               ConnectEventValidation::LearnAndDeliver(remote_cid, desc) => {
-                let rec = RemoteConnectRecord::{ station: auth.remote_id, described: desc }
-                st.remote_connects.set(remote_cid, rec)
-                st.connect_meta.set(remote_cid, connect_meta_from_described(remote_cid, desc, ws))
-                save_remote_connects_file(
-                  ctx.ops_fs,
-                  st.remote_connects_path,
-                  st.remote_connects,
-                  ctx.self_pid,
-                  ctx.sep,
-                )
+                // Security (P0-1): Validate event payload, workspace ownership, AND prevent another peer
+                // from silently hijacking an existing `RemoteConnectRecord.station` before downstream passes!
+                match st.connect_meta.get(remote_cid) {
+                  Some(existing_meta) => {
+                    if existing_meta.ws != ws {
+                      ctx.reply_peer_rpc(sid, station_mesh::encode_peer_answer_err("connect workspace mismatch", v2_bytes), None, v2_bytes, is_front)
+                      return
+                    }
+                  }
+                  None => ()
+                }
+                match st.remote_connects.get(remote_cid) {
+                  Some(existing_rec) => {
+                    if existing_rec.station != auth.remote_id {
+                      ctx.reply_peer_rpc(sid, station_mesh::encode_peer_answer_err("connect origin station mismatch", v2_bytes), None, v2_bytes, is_front)
+                      return
+                    }
+                  }
+                  None => ()
+                }
                 match parse_wire_chat_event(ev_json) {
                   Some(chat_ev) => {
                     let (ev_ch, ev_tts) = match chat_ev {
@@ -6922,8 +7612,20 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
                       station_connects::ChatEvent::Stop(c, t, _, _) => (c, t)
                       station_connects::ChatEvent::LoginCode(c, t, _, _, _) => (c, t)
                     }
-                    // `movedTo` forwarding (1:1 with TS `workspace.ts:365-370`).
-                    match st.connects.workspace.thread_station(remote_cid, ev_ch, ev_tts) {
+                    // R6 Invariant 4: Query local SQLite `handed_over` directly (1:1 with Node
+                    // `hub.ts:801` `movedTo`, zero stale in-memory cache).
+                    let moved_opt : Option[String] = match st.core.store.require_open() {
+                      Ok(st_db) => {
+                        let desc_kind = match base_codec::json_get(desc, "kind") {
+                          Some(base_codec::Json::Str(s)) => if s.length() > 0 { s } else { "slack" }
+                          _ => "slack"
+                        }
+                        let desc_surf = surface_for_described(desc_kind, desc, remote_cid)
+                        query_thread_moved_to(st_db, desc_surf, remote_cid, ev_ch, ev_tts, ws, st.core.config.home_workspace)
+                      }
+                      Err(_) => None
+                    }
+                    match moved_opt {
                       Some(moved) => {
                         if moved != ctx.station_key.id {
                           let fwd_req = base_codec::json_obj([
@@ -6939,14 +7641,23 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
                             ("described", desc),
                             ("event", ev_json),
                           ])
-                          ctx.enqueue_tell(moved, ws, fwd_req)
-                          let res_j = base_codec::json_obj([("ok", base_codec::json_bool(true))])
-                          ctx.reply_peer_rpc(sid, station_mesh::encode_peer_answer_ok(res_j, false, v2_bytes), None, v2_bytes, is_front)
+                          ctx.ask_peer_rpc(moved, ws, fwd_req, fn(res : Result[base_codec::Json, String]) -> Unit {
+                            match res {
+                              Ok(ans) => {
+                                ctx.reply_peer_rpc(sid, station_mesh::encode_peer_answer_ok(ans, false, v2_bytes), None, v2_bytes, is_front)
+                              }
+                              Err(e) => {
+                                ctx.reply_peer_rpc(sid, station_mesh::encode_peer_answer_err("movedTo forward failed: " + e, v2_bytes), None, v2_bytes, is_front)
+                              }
+                            }
+                          })
                           return
                         }
                       }
                       None => ()
                     }
+                    let prev_meta_opt = st.connect_meta.get(remote_cid)
+                    st.connect_meta.set(remote_cid, connect_meta_from_described(remote_cid, desc, ws))
                     let ok = handle_connect_inbound_event(
                       st.core,
                       st.connects,
@@ -6954,11 +7665,30 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
                       remote_cid,
                       chat_ev,
                       now_w,
+                      on_stop_session=fn(skey : String) -> Unit {
+                        let _ = st.live_runners.stop_session(ctx, skey, host_shim::now_ms())
+                      },
+                      on_login_code=fn(lid : String, code : String) -> Unit {
+                        let _ = st.logins.send_input(lid, Some(code), None)
+                      },
                     )
                     if ok {
+                      let rec = RemoteConnectRecord::{ station: auth.remote_id, described: desc }
+                      st.remote_connects.set(remote_cid, rec)
+                      save_remote_connects_file(
+                        ctx.ops_fs,
+                        st.remote_connects_path,
+                        st.remote_connects,
+                        ctx.self_pid,
+                        ctx.sep,
+                      )
                       let res_j = base_codec::json_obj([("ok", base_codec::json_bool(true))])
                       ctx.reply_peer_rpc(sid, station_mesh::encode_peer_answer_ok(res_j, false, v2_bytes), None, v2_bytes, is_front)
                     } else {
+                      match prev_meta_opt {
+                        Some(pm) => st.connect_meta.set(remote_cid, pm)
+                        None => st.connect_meta.remove(remote_cid)
+                      }
                       ctx.reply_peer_rpc(sid, station_mesh::encode_peer_answer_err("connect.event delivery refused", v2_bytes), None, v2_bytes, is_front)
                     }
                   }
@@ -7630,6 +8360,9 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
           if st.browser.handle_sys_event(ev_id, sev) {
             return
           }
+          if st.live_runners.handle_sys_event(ctx, st.core, ev_id, sev, now_sys, host_shim::wall_ms()) {
+            return
+          }
           let _ = st.core.agents.jobs.handle_sys_event(ev_id, sev, host_shim::wall_ms())
         }
         None => ()
@@ -7663,6 +8396,7 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
             ctx.log("mcp server listening on 127.0.0.1:" + mport.to_string())
           }
           let _ = st.mcp_srv.tick(st.mcp_cb)
+          st.live_runners.pump(ctx, st.core, live_config_raw(st.core, ctx.cfg_raw), _now, _wall)
         }
         None => ()
       }
@@ -7680,6 +8414,8 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
             }
           }
           st.upkeep.tick(now, clones_active)
+          st.live_runners.tick(ctx, st.core, now, wall)
+          st.live_runners.pump(ctx, st.core, live_config_raw(st.core, ctx.cfg_raw), now, wall)
           let _ = st.core.agents.jobs.poll_followed(wall)
           let _ = st.core.remote.drain_queue(wall)
           let _ = st.devices.tick_expiry(now, wall)
@@ -7910,6 +8646,15 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
     on_carried: fn(ctx : DaemonCtx, carried : base_codec::Json) -> Unit {
       match state_opt {
         Some(st) => {
+          match base_codec::json_get(carried, "liveRunnerHandover") {
+            Some(lr_j) => {
+              let lr_ho_path = nodepath::join(ctx.sep, [ctx.run_dir, WHOLE_LIVE_RUNNERS_HANDOVER_FILE])
+              st.live_runners.set_handover_state_path(lr_ho_path)
+              st.live_runners.import_handover_state_json(lr_j)
+              let _ = st.live_runners.sync_handover_state_file(ctx.ops_fs, ctx.self_pid, ctx.sep, log_fn=fn(m) { ctx.log(m) })
+            }
+            None => ()
+          }
           match base_codec::json_get(carried, "handoverFailed") {
             Some(base_codec::Json::Str(msg)) => {
               if msg.length() > 0 {
@@ -7933,16 +8678,31 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
           if st.handover_exported || !st.core.store.is_primary_open() {
             return Ok(())
           }
-          st.connects.stop()
-          if st.replica.kept_log.entries.length() > 0 {
-            let _ = st.replica.persist_kept_log()
-          }
-          match st.core.export_handover(host_shim::wall_ms()) {
+          let ho_wall_ms = host_shim::wall_ms()
+          // R11 P1-1: Freeze `pre_delivery` prompts immediately, best-effort commit all pending
+          // end-turns/draining entries, and hand over any uncommitted entries + in-flight
+          // `draining_stopping_ids` to the successor via `carry` + private handover file.
+          st.live_runners.prepare_handover(ctx, st.core, ho_wall_ms)
+          match st.core.export_handover(ho_wall_ms) {
             Ok(snap) => {
               let ho_path = nodepath::join(ctx.sep, [ctx.run_dir, WHOLE_HANDOVER_FILE])
               let body = base_codec::json_stringify(snap.to_json())
               match station_ops::write_private(ctx.ops_fs, ho_path, body.to_bytes(), ctx.self_pid, 1, sep=ctx.sep) {
                 Ok(_) => {
+                  if st.live_runners.has_handover_carry_state() {
+                    let lr_j = st.live_runners.export_handover_state_json()
+                    ctx.carry(base_codec::json_obj([("liveRunnerHandover", lr_j)]))
+                    let lr_ho_path = nodepath::join(ctx.sep, [ctx.run_dir, WHOLE_LIVE_RUNNERS_HANDOVER_FILE])
+                    st.live_runners.set_handover_state_path(lr_ho_path)
+                    match st.live_runners.sync_handover_state_file(ctx.ops_fs, ctx.self_pid, ctx.sep, log_fn=fn(m) { ctx.log(m) }) {
+                      Ok(_) => ()
+                      Err(e) => return Err(e)
+                    }
+                  }
+                  st.connects.stop()
+                  if st.replica.kept_log.entries.length() > 0 {
+                    let _ = st.replica.persist_kept_log()
+                  }
                   st.handover_exported = true
                   st.core.agents.close_adopted_db()
                   Ok(())
@@ -8041,11 +8801,17 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
             let _ = st.replica.persist_kept_log()
           }
 
-          // On `SIGUSR2` hot handover: detach job handles WITHOUT killing running jobs so the
-          // new daemon adopts them seamlessly. On full shutdown (`SIGTERM`/`SIGINT`): stop managed jobs.
+          // On `SIGUSR2` hot handover: detach job & live runner handles WITHOUT killing running
+          // processes so the new daemon adopts them seamlessly. On full shutdown: stop them cleanly.
           if ctx.is_handover_shutdown() {
+            st.live_runners.detach_all_for_handover(ctx, st.core, host_shim::wall_ms())
             st.core.agents.jobs.detach_all_for_handover()
           } else {
+            let runner_stop_ok = st.live_runners.stop_all_on_shutdown(ctx, st.core, host_shim::wall_ms())
+            if !runner_stop_ok {
+              ctx.log("[whole-daemon] ERROR: full shutdown failed to confirm stop/persistence of all spawning runners")
+              shutdown_exit_code = 1
+            }
             let jobs_list = st.core.agents.jobs.list()
             let w_end = host_shim::wall_ms()
             for ji in 0..<jobs_list.length() {
@@ -8073,7 +8839,8 @@ pub fn run_whole_daemon(argv : Array[String]) -> Int {
     },
   }
 
-  run_daemon(argv, hooks)
+  let rc = run_daemon(argv, hooks)
+  if rc != 0 { rc } else { shutdown_exit_code }
 }
 
 fn test_wd_assert(cond : Bool, msg : String = "assertion failed") -> Unit {
