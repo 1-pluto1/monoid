@@ -111,7 +111,7 @@ test("the Directory rechecks a session revoked after the Worker's earlier check"
   }
 });
 
-test("prune and single-session revoke skip Directory RPCs when no matching active session ends", async () => {
+test("prune skips the Directory when no session ended, and a session removed again is told to it again", async () => {
   const h = await harness();
   try {
     await primary(h);
@@ -133,7 +133,8 @@ test("prune and single-session revoke skip Directory RPCs when no matching activ
     assert.equal(repeated.status, 200);
     assert.deepEqual(await repeated.json(), { revoked: true });
     await h.settled();
-    assert.equal(await meCalls(), base + 1, "removing an already revoked session skips Directory RPC");
+    // A removal whose Directory call failed is retried by asking again: the Directory must hear it again.
+    assert.equal(await meCalls(), base + 2, "removing an already removed session tells the Directory again");
     assert.equal((await asCurrent("GET", "/v1/me")).status, 200, "active session stays valid");
     const beforeExpire = await meCalls();
 

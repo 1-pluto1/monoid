@@ -288,7 +288,6 @@ export class Account extends DurableObject<Env> {
   private async revoke(data: AccountData, id: string | undefined, why: Ended["why"]) {
     const now = nowSeconds();
     const ending = id ? data.sessions.filter((s) => s.id === id) : data.sessions;
-    if (id !== undefined && ending.length === 0) return;
     data.ended = [...(data.ended ?? []), ...ending.map((s) => ({ id: s.id, at: now, why }))].slice(-ENDED_KEPT);
     data.sessions = id ? data.sessions.filter((s) => s.id !== id) : [];
     this.save(data);
