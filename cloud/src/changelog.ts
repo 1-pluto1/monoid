@@ -87,8 +87,6 @@ export async function etagOf(body: string): Promise<string> {
   return `"${hex}"`;
 }
 
-export { etagMatches };
-
 function singleEtagToken(ifNoneMatch: string | null): string | null {
   if (!ifNoneMatch || ifNoneMatch.includes(",")) return null;
   const trimmed = ifNoneMatch.trim();
