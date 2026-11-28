@@ -18,7 +18,8 @@ import { PLAIN, PlainStore } from "../src/vault/plain.ts";
 import { Secrets } from "../src/vault/secrets.ts";
 import { vaultTools } from "../src/vault/tool.ts";
 import { VaultStore } from "../src/vault/store.ts";
-import { STILLFAIL_SURFACE } from "../src/store/store.ts";
+import { MANUAL, STILLFAIL_SURFACE, Store } from "../src/store/store.ts";
+import { INTERNAL_CONNECT, InternalChat, nextTsAt } from "../src/sessions/internal.ts";
 import { isFor } from "../src/api/events.ts";
 import { withoutUseReader } from "./vault-no-reader.ts";
 
@@ -1805,5 +1806,120 @@ test("a request withdrawn by the agent that asked: its card closed, gone from it
     assert.match(h.secrets.savedPlain(WS, null, "bob@x.com", { request: r.id, fields: { username: "u", password: "p" } }) as string, /withdrawn/);
   } finally {
     rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test("FB-83: vault requests from a Feishu session post interactive cards to the session's still.fail home chat", async () => {
+  const store = Store.open(":memory:");
+  const db = store.db;
+  const dir = mkdtempSync(join(tmpdir(), "vault-feishu-home-"));
+  try {
+    let now = 1_800_000_000_000;
+    const session = "shelly-cxo:oc_1:om_1";
+    store.insertSession({
+      key: session,
+      connect: "shelly-cxo",
+      runtime: "claude",
+      profile: "cc",
+      workspace: dir,
+      token: "tok",
+      ws: WS,
+      createdBy: "qiao@hypershell.tech",
+      createdAt: now,
+      lastActiveAt: now,
+    });
+    const feishu = store.openThread("feishu:shelly-cxo", "oc_1", "om_1", null, "ou_1");
+    store.joinThread(feishu.id, session, "shelly-cxo");
+    const [firstN] = store.insertMessage({ thread: feishu.id, ts: "om_1", authorKind: "person", author: "ou_1", text: "帮我存密码", attachments: [] });
+    db.prepare("INSERT INTO deliveries(thread,n,session,delivered_at) VALUES(?,?,?,?)").run(feishu.id, firstN, session, now);
+
+    const feishuPosts: { channel: string; threadTs: string; text: string }[] = [];
+    let feishuSeq = 0;
+    const internal = new InternalChat();
+    const hub = {
+      store,
+      internal,
+      nextTs: () => nextTsAt((now += 10)),
+      chat: (connect: string) =>
+        connect === INTERNAL_CONNECT
+          ? internal
+          : {
+              post: async (where: { channel: string; threadTs: string }, text: string) => {
+                feishuPosts.push({ ...where, text });
+                return `om_bot_${++feishuSeq}`;
+              },
+            },
+      shared: () => {},
+      notify: () => {},
+    };
+    const vaults = new VaultStore(db);
+    const plain = new PlainStore(db);
+    const secrets = new Secrets({ db: withoutUseReader(db), vaults, plain, home: () => WS, hub: hub as never, data: dir, lock: () => null, now: () => now });
+
+    // 1. No homeChat exists yet: secret_save posts plain text to Feishu, creates homeChat, and puts the card there.
+    assert.equal(store.homeChat(session), null);
+    await secrets.save(session, { name: "CXO-Mac 管理员密码", kind: "login", username: "admin", reason: "装依赖", value: "pw-1", cwd: dir });
+    const home = store.homeChat(session);
+    assert.ok(home !== null && home.surface === STILLFAIL_SURFACE && home.home === session, "homeChat created automatically");
+    assert.equal(store.latestThread(session)?.thread.id, feishu.id, "Feishu stays the latest thread for deliveries");
+    assert.equal(feishuPosts.length, 1);
+    assert.match(feishuPosts[0]!.text, /请在 still\.fail 客户端的此对话或「密钥」中批准/);
+    assert.equal(store.pendingCardHeader(feishu.id), null, "Feishu thread carries no interactive card");
+
+    const saveCard = store.pendingCardHeader(home.id);
+    assert.ok(saveCard !== null, "homeChat holds the pending vault save card");
+    const saveReqId = (saveCard[1] as { vault: { request: string }; assignee?: string }).vault.request;
+    assert.equal((saveCard[1] as { assignee?: string }).assignee, "qiao@hypershell.tech");
+    assert.notEqual(typeof secrets.savedPlain(WS, null, "qiao@hypershell.tech", { request: saveReqId }), "string");
+    assert.equal(store.pendingCardHeader(home.id), null, "approving settles the card on homeChat");
+
+    // 2. User later speaks in homeChat, then speaks in Feishu again so latestThread flips back to Feishu.
+    const [appN] = store.insertMessage({ thread: home.id, ts: hub.nextTs(), authorKind: "person", author: "qiao@hypershell.tech", text: "我在 App 里说过话", attachments: [] });
+    db.prepare("INSERT INTO deliveries(thread,n,session,delivered_at) VALUES(?,?,?,?)").run(home.id, appN, session, (now += 100));
+    const [feishuN2] = store.insertMessage({ thread: feishu.id, ts: "om_2", authorKind: "person", author: "ou_1", text: "回到飞书继续", attachments: [] });
+    db.prepare("INSERT INTO deliveries(thread,n,session,delivered_at) VALUES(?,?,?,?)").run(feishu.id, feishuN2, session, (now += 100));
+    assert.equal(store.latestThread(session)?.thread.id, feishu.id);
+
+    // secret_use reuses the existing homeChat and places the interactive card there.
+    await secrets.ask(session, { item: "CXO-Mac 管理员密码", reason: "跑 sudo", command: "sudo true", person: "qiao@hypershell.tech" });
+    assert.equal(store.homeChat(session)?.id, home.id, "reuses existing homeChat");
+    assert.equal(feishuPosts.length, 2);
+    const useCard = store.pendingCardHeader(home.id);
+    assert.ok(useCard !== null, "existing homeChat holds the pending vault use card");
+    const useReqId = (useCard[1] as { vault: { request: string } }).vault.request;
+
+    // cancel withdraws the card on homeChat cleanly.
+    secrets.cancel(session, useReqId);
+    assert.equal(store.pendingCardHeader(home.id), null);
+
+    // describe, remove, and browse also route interactive cards to homeChat while posting text to Feishu.
+    await secrets.describe(session, { item: "CXO-Mac 管理员密码", about: "本机管理员", reason: "补充说明" });
+    const descCard = store.pendingCardHeader(home.id);
+    assert.ok(descCard !== null && (descCard[1] as { vault?: { describe?: unknown } }).vault?.describe);
+    secrets.cancel(session, (descCard[1] as { vault: { request: string } }).vault.request);
+
+    await secrets.remove(session, { item: "CXO-Mac 管理员密码", reason: "清理测试" });
+    const remCard = store.pendingCardHeader(home.id);
+    assert.ok(remCard !== null && (remCard[1] as { vault?: { remove?: unknown } }).vault?.remove);
+    secrets.cancel(session, (remCard[1] as { vault: { request: string } }).vault.request);
+
+    await secrets.browse(session, { reason: "查找跨空间密钥" });
+    const browseCard = store.pendingCardHeader(home.id);
+    assert.ok(browseCard !== null && (browseCard[1] as { vault?: { browse?: unknown } }).vault?.browse);
+    const browseReqId = (browseCard[1] as { vault: { request: string } }).vault.request;
+    // reask on an active homeChat request stays on homeChat and does not post again to Feishu.
+    const feishuCountBeforeReask = feishuPosts.length;
+    assert.match(await secrets.reask(session, browseReqId), /already pending/);
+    assert.equal(feishuPosts.length, feishuCountBeforeReask);
+    secrets.cancel(session, browseReqId);
+
+    // 3. When homeChat is manually hidden/archived, fall back to external plain text without writing to the hidden chat.
+    db.prepare("UPDATE threads SET hidden_at = ?, hidden_by = ? WHERE id = ?").run(now, MANUAL, home.id);
+    await secrets.ask(session, { item: "CXO-Mac 管理员密码", reason: "隐藏后回退", command: "true" });
+    assert.equal(store.pendingCardHeader(home.id), null, "does not post card into hidden homeChat");
+    assert.equal(feishuPosts.length, feishuCountBeforeReask + 1);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });

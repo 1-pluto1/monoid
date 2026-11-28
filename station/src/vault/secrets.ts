@@ -23,6 +23,8 @@ import type { CardOutcomeSaver } from "../store/card-outbox.ts";
 import { type Json, STILLFAIL_SURFACE, type SessionThread } from "../store/store.ts";
 import { CARD_OCCUPIED, cardPlace, recordPostedCard } from "../sessions/card-place.ts";
 import type { Hub } from "../sessions/hub.ts";
+import { INTERNAL_CONNECT } from "../sessions/internal.ts";
+import { ensureConversationChat } from "../sessions/lifecycle.ts";
 import type { ReaderSelectConfig } from "../read/reader-select.ts";
 import { hold } from "../updates/holds.ts";
 import { stateOf } from "../browser/signins.ts";
@@ -221,6 +223,7 @@ type Away = { station: string; session?: string; workspace?: string; done(result
 
 /// A request as the station keeps it: the contract's, and where its card is.
 type Kept = { request: Request; thread: number | null; cardTs: string | null; raw?: string };
+type PostedCard = { thread: number; ts: string | null };
 
 /// What a tool or a route is told when it cannot go on.
 class Refused extends Error {}
@@ -1306,8 +1309,8 @@ export class Secrets {
     if (thread !== null) {
       request.chat = threadAddress(thread.thread.channel, thread.thread.threadTs);
       const posted = await this.#post(session, thread, request, listing, decider ?? undefined);
-      kept.thread = thread.thread.id;
-      kept.cardTs = posted;
+      kept.thread = posted.thread;
+      kept.cardTs = posted.ts;
     }
     this.#save(kept);
     this.#audit(request, "request", [mode, request.command ?? "", hosts.join(" ")].filter((s) => s !== "").join(" · "));
@@ -1339,35 +1342,82 @@ export class Secrets {
   }
 
   /// The card for request `r` in the session's chat: the vault's owner decides it in the app.
-  async #post(session: string, thread: SessionThread, r: Request, l: Listing, owner: string | undefined, requireEmpty = false, signal?: AbortSignal): Promise<string | null> {
+  async #post(session: string, thread: SessionThread, r: Request, l: Listing, owner: string | undefined, requireEmpty = false, signal?: AbortSignal): Promise<PostedCard> {
     const how = howWords(r.mode, r.hosts ?? l.hosts);
-    const stillfail = thread.thread.surface === STILLFAIL_SURFACE;
-    // In a still.fail chat the card says where it is approved; Slack has no card, so the words say it.
-    const where = stillfail ? [] : ["请在 still.fail 客户端的「密钥」中批准。"];
     const text = [
       `申请使用「${l.name}」${r.cross ? `（来自「${r.cross.workspaceName}」）` : ""}：${r.reason}`, ...(r.command ? [`命令：\`${r.command.replace(/`/g, "'")}\``] : []), `方式：${how}`,
-      ...(r.runOn ? [`运行在：${r.runOn.name}`] : []), ...(r.timeout ? [`申请时限：${r.timeout.kind === "idle" ? "闲置" : "固定"} ${r.timeout.seconds / 60} 分钟`] : []), ...where,
+      ...(r.runOn ? [`运行在：${r.runOn.name}`] : []), ...(r.timeout ? [`申请时限：${r.timeout.kind === "idle" ? "闲置" : "固定"} ${r.timeout.seconds / 60} 分钟`] : []),
     ].join("\n\n");
     // The scopes the item allows, the longest recommended.
     const lasts = this.#lastsOf(r, l);
     const scopes = SCOPES.filter((s) => allows(lasts, s));
-    const card = stillfail
-      ? {
-          type: "options",
-          options: [
-            ...scopes.map((s, i) => ({ ...SCOPE_WORDS[s], ...(i === scopes.length - 1 ? { recommended: true } : {}) })),
-            { label: "拒绝", detail: "通知 agent 已拒绝" },
-          ],
-          ...(owner ? { assignee: owner.toLowerCase() } : {}),
-          // The request as the app draws it; its outcome added once decided (#settle).
-          vault: { request: r.id, name: l.name, reason: r.reason, ...(r.command ? { command: r.command } : {}), mode: r.mode, hosts: hosted(r.mode) ? (r.hosts ?? l.hosts) : [], ...(r.runOn ? { station: r.runOn.name } : {}), ...(r.timeout ? { timeout: r.timeout } : {}), ...(r.cross ? { cross: r.cross } : {}) },
-        }
-      : null;
-    return this.#postCard(session, thread, text, card, requireEmpty, r, signal);
+    const card = {
+      type: "options",
+      options: [
+        ...scopes.map((s, i) => ({ ...SCOPE_WORDS[s], ...(i === scopes.length - 1 ? { recommended: true } : {}) })),
+        { label: "拒绝", detail: "通知 agent 已拒绝" },
+      ],
+      ...(owner ? { assignee: owner.toLowerCase() } : {}),
+      // The request as the app draws it; its outcome added once decided (#settle).
+      vault: { request: r.id, name: l.name, reason: r.reason, ...(r.command ? { command: r.command } : {}), mode: r.mode, hosts: hosted(r.mode) ? (r.hosts ?? l.hosts) : [], ...(r.runOn ? { station: r.runOn.name } : {}), ...(r.timeout ? { timeout: r.timeout } : {}), ...(r.cross ? { cross: r.cross } : {}) },
+    };
+    return this.#postCard(session, thread, text, "请在 still.fail 客户端的此对话或「密钥」中批准。", card, owner, requireEmpty, r, signal);
   }
 
-  /// A request's post in the session's chat, with its card where the chat shows cards; the card's ts, if it has one.
-  async #postCard(session: string, thread: SessionThread, text: string, card: Record<string, unknown> | null, requireEmpty = false, request?: Request, signal?: AbortSignal): Promise<string | null> {
+  /// The session's still.fail home chat, created on demand when a vault request starts from an external surface
+  /// (Feishu, Slack, group, Comma), so opening the chat link in the still.fail app shows the interactive approval card
+  /// immediately. Returns null when internal chat is unavailable, the session has ended, or its home chat is hidden.
+  #appCardThread(session: string, decider: string | undefined): SessionThread | null {
+    const hub = this.#d.hub;
+    if (!hub.internal) return null;
+    const row = hub.store.getSession(session);
+    if (row === null || row.archivedAt != null) return null;
+    const creator = row.createdBy || decider?.trim().toLowerCase() || "";
+    const home = ensureConversationChat(hub, session, creator, null);
+    if (home.hiddenAt != null || hub.store.manuallyArchived(home.id)) return null;
+    const joined = hub.store.sessionThreadById(session, home.id);
+    if (joined !== null) return joined;
+    hub.store.joinThread(home.id, session, INTERNAL_CONNECT);
+    return { connect: INTERNAL_CONNECT, thread: home };
+  }
+
+  /// A request's post in the session's chat, with its card in the still.fail chat so opening a session link from
+  /// Feishu, Slack, group, or Comma shows the approval card without writing in the app first.
+  async #postCard(
+    session: string,
+    thread: SessionThread,
+    text: string,
+    externalHint: string,
+    card: Record<string, unknown>,
+    decider: string | undefined,
+    requireEmpty = false,
+    request?: Request,
+    signal?: AbortSignal,
+  ): Promise<PostedCard> {
+    if (thread.thread.surface === STILLFAIL_SURFACE) {
+      const ts = await this.#deliverCard(session, thread, text, card, requireEmpty, request, signal);
+      return { thread: thread.thread.id, ts };
+    }
+    if (!requireEmpty) {
+      await this.#deliverCard(session, thread, `${text}\n\n${externalHint}`, null, false, request, signal);
+    }
+    const appThread = this.#appCardThread(session, decider);
+    if (appThread === null) {
+      return { thread: thread.thread.id, ts: null };
+    }
+    const ts = await this.#deliverCard(session, appThread, text, card, requireEmpty, request, signal);
+    return { thread: appThread.thread.id, ts };
+  }
+
+  async #deliverCard(
+    session: string,
+    thread: SessionThread,
+    text: string,
+    card: Record<string, unknown> | null,
+    requireEmpty = false,
+    request?: Request,
+    signal?: AbortSignal,
+  ): Promise<string | null> {
     const here = { channel: thread.thread.channel, threadTs: thread.thread.threadTs };
     signal?.throwIfAborted();
     const posted = await this.#d.hub.chat(thread.connect).post(here, text, []);
@@ -1418,22 +1468,22 @@ export class Secrets {
     // The original request may have been decided while the new message was being posted.
     const latest = this.#kept(ws, id);
     if (latest === null || latest.request.status !== "pending") {
-      if (posted !== null) this.#d.hub.store.withdrawCard(session, place.thread.thread.id, posted);
+      if (posted.ts !== null) this.#d.hub.store.withdrawCard(session, posted.thread, posted.ts);
       throw new Refused(`Request ${id} is no longer pending.`);
     }
     if (!this.#requestLive(latest.request, Math.floor(this.#d.now() / 1000))) {
-      if (posted !== null) this.#d.hub.store.withdrawCard(session, place.thread.thread.id, posted);
+      if (posted.ts !== null) this.#d.hub.store.withdrawCard(session, posted.thread, posted.ts);
       throw new Refused(`Request ${id} changed while it was checked; try again.`);
     }
     try {
       // The decision and the card location can change on another connection after the last read above.
       const changed = this.#d.db.prepare(`UPDATE vault_requests SET thread=?,card_ts=?
         WHERE ws=? AND id=? AND status='pending' AND body=? AND thread IS ? AND card_ts IS ?`)
-        .run(place.thread.thread.id, posted, ws, id, latest.raw!, latest.thread, latest.cardTs).changes;
+        .run(posted.thread, posted.ts, ws, id, latest.raw!, latest.thread, latest.cardTs).changes;
       if (changed === 0) throw new Refused(`Request ${id} changed while the card was posted; try again.`);
       this.#trackSaved(latest);
     } catch (error) {
-      if (posted !== null) this.#d.hub.store.withdrawCard(session, place.thread.thread.id, posted);
+      if (posted.ts !== null) this.#d.hub.store.withdrawCard(session, posted.thread, posted.ts);
       throw error;
     }
     return `The card for request ${id} is in the chat again. It is the same request; no secret was read again. ${UNDECIDED}`;
@@ -1476,8 +1526,9 @@ export class Secrets {
     const kept: Kept = { request, thread: null, cardTs: null };
     if (thread !== null) {
       request.chat = threadAddress(thread.thread.channel, thread.thread.threadTs);
-      kept.cardTs = await this.#postDescribe(session, thread, request, decider ?? undefined);
-      kept.thread = thread.thread.id;
+      const posted = await this.#postDescribe(session, thread, request, decider ?? undefined);
+      kept.thread = posted.thread;
+      kept.cardTs = posted.ts;
     }
     this.#save(kept);
     this.#audit(request, "describe-request", name === was.name ? "about" : `name ${name}`);
@@ -1494,25 +1545,21 @@ export class Secrets {
   }
 
   /// The card of a request to rename an item or say what it is: its name and about as they were and are to be.
-  async #postDescribe(session: string, thread: SessionThread, r: Request, decider: string | undefined, requireEmpty = false, signal?: AbortSignal): Promise<string | null> {
+  async #postDescribe(session: string, thread: SessionThread, r: Request, decider: string | undefined, requireEmpty = false, signal?: AbortSignal): Promise<PostedCard> {
     const d = r.describe!;
-    const stillfail = thread.thread.surface === STILLFAIL_SURFACE;
     const text = [
       `申请修改密钥「${d.was.name}」的${d.name !== d.was.name && d.about !== d.was.about ? "名称与说明" : d.name !== d.was.name ? "名称" : "说明"}：${r.reason}`,
       ...(d.name !== d.was.name ? [`名称改为：${d.name}`] : []),
       ...(d.about !== d.was.about ? [d.about === "" ? "清除说明" : `说明改为：${d.about}`] : []),
-      ...(stillfail ? [] : ["请在 still.fail 客户端的「密钥」中批准。"]),
     ].join("\n\n");
-    const card = stillfail
-      ? {
-          type: "options",
-          options: [{ ...DESCRIBE_WORDS.yes, recommended: true }, DESCRIBE_WORDS.no],
-          ...(decider ? { assignee: decider.toLowerCase() } : {}),
-          // The request as the app draws it: `describe` says it is one to rename; its outcome added once decided.
-          vault: { request: r.id, name: d.was.name, reason: r.reason, mode: r.mode, hosts: [], describe: { name: d.name, about: d.about, wasAbout: d.was.about } },
-        }
-      : null;
-    return this.#postCard(session, thread, text, card, requireEmpty, r, signal);
+    const card = {
+      type: "options",
+      options: [{ ...DESCRIBE_WORDS.yes, recommended: true }, DESCRIBE_WORDS.no],
+      ...(decider ? { assignee: decider.toLowerCase() } : {}),
+      // The request as the app draws it: `describe` says it is one to rename; its outcome added once decided.
+      vault: { request: r.id, name: d.was.name, reason: r.reason, mode: r.mode, hosts: [], describe: { name: d.name, about: d.about, wasAbout: d.was.about } },
+    };
+    return this.#postCard(session, thread, text, "请在 still.fail 客户端的此对话或「密钥」中批准。", card, decider, requireEmpty, r, signal);
   }
 
   /// What an agent is told of a request to rename an item, waiting (secret_describe's answer) or decided (a notice).
@@ -1599,8 +1646,9 @@ export class Secrets {
     const kept: Kept = { request, thread: null, cardTs: null };
     if (thread !== null) {
       request.chat = threadAddress(thread.thread.channel, thread.thread.threadTs);
-      kept.cardTs = await this.#postRemove(session, thread, request, decider ?? undefined);
-      kept.thread = thread.thread.id;
+      const posted = await this.#postRemove(session, thread, request, decider ?? undefined);
+      kept.thread = posted.thread;
+      kept.cardTs = posted.ts;
     }
     this.#save(kept);
     this.#audit(request, "remove-request", "");
@@ -1609,23 +1657,17 @@ export class Secrets {
   }
 
   /// The card of a request to delete an item: its name and why.
-  async #postRemove(session: string, thread: SessionThread, r: Request, decider: string | undefined, requireEmpty = false, signal?: AbortSignal): Promise<string | null> {
+  async #postRemove(session: string, thread: SessionThread, r: Request, decider: string | undefined, requireEmpty = false, signal?: AbortSignal): Promise<PostedCard> {
     const name = r.remove!.name;
-    const stillfail = thread.thread.surface === STILLFAIL_SURFACE;
-    const text = [
-      `申请删除密钥「${name}」：${r.reason}`,
-      ...(stillfail ? [] : ["请在 still.fail 客户端的「密钥」中批准。"]),
-    ].join("\n\n");
-    const card = stillfail
-      ? {
-          type: "options",
-          options: [{ ...REMOVE_WORDS.yes, recommended: true }, REMOVE_WORDS.no],
-          ...(decider ? { assignee: decider.toLowerCase() } : {}),
-          // The request as the app draws it: `remove` says it is one to delete; its outcome added once decided.
-          vault: { request: r.id, name, reason: r.reason, mode: r.mode, hosts: [], remove: { name } },
-        }
-      : null;
-    return this.#postCard(session, thread, text, card, requireEmpty, r, signal);
+    const text = `申请删除密钥「${name}」：${r.reason}`;
+    const card = {
+      type: "options",
+      options: [{ ...REMOVE_WORDS.yes, recommended: true }, REMOVE_WORDS.no],
+      ...(decider ? { assignee: decider.toLowerCase() } : {}),
+      // The request as the app draws it: `remove` says it is one to delete; its outcome added once decided.
+      vault: { request: r.id, name, reason: r.reason, mode: r.mode, hosts: [], remove: { name } },
+    };
+    return this.#postCard(session, thread, text, "请在 still.fail 客户端的此对话或「密钥」中批准。", card, decider, requireEmpty, r, signal);
   }
 
   /// What an agent is told of a request to delete an item, waiting (secret_delete's answer) or decided (a notice).
@@ -1706,8 +1748,9 @@ export class Secrets {
     const kept: Kept = { request, thread: null, cardTs: null };
     if (thread !== null) {
       request.chat = threadAddress(thread.thread.channel, thread.thread.threadTs);
-      kept.cardTs = await this.#postBrowse(session, thread, request);
-      kept.thread = thread.thread.id;
+      const posted = await this.#postBrowse(session, thread, request);
+      kept.thread = posted.thread;
+      kept.cardTs = posted.ts;
     }
     this.#save(kept);
     this.#audit(request, "browse-request", hint ?? "");
@@ -1715,23 +1758,19 @@ export class Secrets {
     return `Asked ${email} to share their personal secret list from other workspaces for this chat (request ${id}); the card is in your chat, approved in the still.fail app. ${UNDECIDED} Only their approval in the app shares the list: a reply in the chat saying yes does not.`;
   }
 
-  async #postBrowse(session: string, thread: SessionThread, r: Request, requireEmpty = false, signal?: AbortSignal): Promise<string | null> {
-    const stillfail = thread.thread.surface === STILLFAIL_SURFACE;
+  async #postBrowse(session: string, thread: SessionThread, r: Request, requireEmpty = false, signal?: AbortSignal): Promise<PostedCard> {
     const hint = r.browse?.workspace;
     const text = [
       `申请查看你在其它工作区的个人密钥列表：${r.reason}`,
       ...(hint ? [`目标工作区：${hint}`] : []),
-      ...(stillfail ? [] : ["请在 still.fail 客户端的「密钥」中批准。"]),
     ].join("\n\n");
-    const card = stillfail
-      ? {
-          type: "options",
-          options: [{ ...BROWSE_WORDS.yes, recommended: true }, BROWSE_WORDS.no],
-          assignee: r.owner,
-          vault: { request: r.id, name: "其它工作区的个人密钥", reason: r.reason, mode: "browse", hosts: [], browse: r.browse ?? {} },
-        }
-      : null;
-    return this.#postCard(session, thread, text, card, requireEmpty, r, signal);
+    const card = {
+      type: "options",
+      options: [{ ...BROWSE_WORDS.yes, recommended: true }, BROWSE_WORDS.no],
+      assignee: r.owner,
+      vault: { request: r.id, name: "其它工作区的个人密钥", reason: r.reason, mode: "browse", hosts: [], browse: r.browse ?? {} },
+    };
+    return this.#postCard(session, thread, text, "请在 still.fail 客户端的此对话或「密钥」中批准。", card, r.owner, requireEmpty, r, signal);
   }
 
   #saidBrowse(r: Request, items?: CrossListing[]): string {
@@ -2027,8 +2066,13 @@ export class Secrets {
     try {
       if (thread !== null) {
         request.chat = threadAddress(thread.thread.channel, thread.thread.threadTs);
-        kept.cardTs = a.quiet ? null : await this.#postSave(session, thread, request);
-        kept.thread = thread.thread.id;
+        if (a.quiet) {
+          kept.thread = thread.thread.id;
+        } else {
+          const posted = await this.#postSave(session, thread, request);
+          kept.thread = posted.thread;
+          kept.cardTs = posted.ts;
+        }
       }
       // If the predecessor exited while the card was being posted, its last certificate must be included before this
       // request is written. The exit callback may already have observed the still-unwritten posting above.
@@ -2049,31 +2093,32 @@ export class Secrets {
 
   /// The card of a request to keep a secret: what it is, whose, why (the app draws it from `vault.save`, offering to
   /// turn the vault on first where it is not).
-  async #postSave(session: string, thread: SessionThread, r: Request, requireEmpty = false, signal?: AbortSignal): Promise<string | null> {
+  async #postSave(session: string, thread: SessionThread, r: Request, requireEmpty = false, signal?: AbortSignal): Promise<PostedCard> {
     const s = r.save!;
-    const stillfail = thread.thread.surface === STILLFAIL_SURFACE;
     const kind = `（${KIND_WORDS[s.kind]}${s.username ? ` · ${s.username}` : s.filename ? ` · ${s.filename}` : ""}）`;
     const text = [
       s.oauth ? `请用 ${OAUTH[s.oauth]?.name ?? s.oauth} 授权，把「${s.name}」存入密钥库：${r.reason}`
       : s.typed ? `请填入「${s.name}」${kind}并存入密钥库：${r.reason}` : `申请将「${s.name}」存入密钥库${kind}：${r.reason}`,
       ...(s.about ? [`说明：${s.about}`] : []),
-      ...(stillfail ? [] : [s.oauth ? "请在 still.fail 客户端的「密钥」中授权并存入。" : s.typed ? "请在 still.fail 客户端的「密钥」中填写并存入。" : "请在 still.fail 客户端的「密钥」中批准。"]),
     ].join("\n\n");
-    const card = stillfail
-      ? {
-          type: "options",
-          options: [{ ...SAVE_WORDS.save, recommended: true }, SAVE_WORDS.deny],
-          assignee: r.owner,
-          // The request as the app draws it: `save` says it is one to keep; its outcome added once decided.
-          vault: {
-            request: r.id, name: s.name, reason: r.reason, ...(r.command ? { command: r.command } : {}), mode: s.modes[0], hosts: hosted(s.modes[0]!) ? s.hosts : [],
-            ...(s.about ? { about: s.about } : {}),
-            ...(r.runOn ? { station: r.runOn.name } : {}),
-            save: { kind: s.kind, ...(s.username ? { username: s.username } : {}), ...(s.filename ? { filename: s.filename } : {}), ...(s.typed ? { typed: true } : {}), ...(s.oauth ? { oauth: s.oauth } : {}) },
-          },
-        }
-      : null;
-    return this.#postCard(session, thread, text, card, requireEmpty, r, signal);
+    const externalHint = s.oauth
+      ? "请在 still.fail 客户端的此对话或「密钥」中授权并存入。"
+      : s.typed
+        ? "请在 still.fail 客户端的此对话或「密钥」中填写并存入。"
+        : "请在 still.fail 客户端的此对话或「密钥」中批准。";
+    const card = {
+      type: "options",
+      options: [{ ...SAVE_WORDS.save, recommended: true }, SAVE_WORDS.deny],
+      assignee: r.owner,
+      // The request as the app draws it: `save` says it is one to keep; its outcome added once decided.
+      vault: {
+        request: r.id, name: s.name, reason: r.reason, ...(r.command ? { command: r.command } : {}), mode: s.modes[0], hosts: hosted(s.modes[0]!) ? s.hosts : [],
+        ...(s.about ? { about: s.about } : {}),
+        ...(r.runOn ? { station: r.runOn.name } : {}),
+        save: { kind: s.kind, ...(s.username ? { username: s.username } : {}), ...(s.filename ? { filename: s.filename } : {}), ...(s.typed ? { typed: true } : {}), ...(s.oauth ? { oauth: s.oauth } : {}) },
+      },
+    };
+    return this.#postCard(session, thread, text, externalHint, card, r.owner, requireEmpty, r, signal);
   }
 
   /// What an agent is told of a request to keep a secret, waiting (secret_save's answer) or decided (a notice).
