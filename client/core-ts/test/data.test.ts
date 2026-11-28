@@ -2262,3 +2262,69 @@ test("multi_db_station_grouping_and_overlay_detection_work_across_accounts", asy
     assert.deepEqual((data.shown(overview("w1/a")) as J).profiles[0].models, ["m1", "m2"]);
   } finally { runner.shutdown(); }
 });
+
+test("setThreads_batches_existing_row_reads_for_full_and_incremental_updates", async () => {
+  const { data, open, db, runner } = fresh({ s1: ["w"] });
+  await open();
+  try {
+    const mk = (id: number, title: string, sessionsList: string[] = [`k${id}`]): J => ({
+      id,
+      title,
+      surface: "chat",
+      createdAt: id,
+      lastMessage: { createdAt: id },
+      sessions: sessionsList.map((session) => ({ session })),
+      last: id,
+      read: 0,
+      unread: 0,
+    });
+
+    const initial = Array.from({ length: 80 }, (_, i) => mk(i + 1, `t${i + 1}`, [`k${i + 1}`, `shared${i + 1}`]));
+    data.set(threads("w/a"), initial);
+    await run(data.written);
+
+    const counted = db();
+    // Pre-existing unlisted thread 999 with member old-m that will be re-listed with new-m only.
+    counted.run(
+      "INSERT INTO thread (station, id, listed, last, read, unread, sort_at, created_at, surface, first_member, json) VALUES (?, ?, 0, 1, 0, 0, 1, 1, 'chat', 'old-m', ?)",
+      ["w/a", 999, JSON.stringify({ id: 999, title: "archived", surface: "chat", createdAt: 1, lastMessage: { createdAt: 1 }, sessions: [{ session: "old-m" }] })],
+    );
+    counted.run("INSERT INTO thread_member (station, session, thread) VALUES (?, ?, ?)", ["w/a", "old-m", 999]);
+
+    const told: Topic[] = [];
+    data.onChange((topic) => told.push(topic));
+
+    // Full refresh: 75 unchanged/updated (10 changed titles), 5 dropped (76..80), 1 re-listed (999) + 4 brand new (101..104).
+    const next = [
+      ...initial.slice(0, 10).map((t) => mk(t.id, `${t.title}-edited`, [`k${t.id}`])),
+      ...initial.slice(10, 75),
+      mk(999, "restored", ["new-m"]),
+      ...Array.from({ length: 4 }, (_, i) => mk(101 + i, `new${i}`)),
+    ];
+    const readsBeforeFull = counted.reads.length;
+    data.set(threads("w/a"), next);
+    const fullThreadSelects = counted.reads.slice(readsBeforeFull).filter((q) => /\bFROM\s+(?:json_each\(\?\)\s+AS\s+k\s+CROSS\s+JOIN\s+)?thread\b/i.test(q));
+    assert.ok(fullThreadSelects.length <= 2, `expected <= 2 thread SELECTs for full setThreads, got ${fullThreadSelects.length}: ${fullThreadSelects.join(" | ")}`);
+    await run(data.written);
+
+    const members999 = counted.all("SELECT session FROM thread_member WHERE station = ? AND thread = ? ORDER BY session", ["w/a", 999]).map((r) => r[0]);
+    assert.deepEqual(members999, ["new-m"], "re-listed thread replaces old member with new member");
+    assert.ok(told.some((t) => t.topic === "session" && t.key === "old-m"), "removed member of re-listed thread is notified");
+    assert.ok(told.some((t) => t.topic === "session" && t.key === "k80"), "member of unlisted thread is notified");
+
+    // Incremental refresh with changed subset: 10 changed + 10 newly unlisted (66..75), with cache cleared for unlisted check.
+    told.length = 0;
+    const incremental = [
+      ...next.slice(0, 10).map((t) => mk(t.id, `${t.title}-v2`, [`k${t.id}`])),
+      ...next.slice(10, 65),
+      ...next.slice(75),
+    ];
+    const readsBeforeInc = counted.reads.length;
+    data.db("s1")!.setThreads("w/a", incremental, 2, new Set(Array.from({ length: 10 }, (_, i) => String(i + 1))));
+    const incThreadSelects = counted.reads.slice(readsBeforeInc).filter((q) => /\bFROM\s+(?:json_each\(\?\)\s+AS\s+k\s+CROSS\s+JOIN\s+)?thread\b/i.test(q));
+    assert.ok(incThreadSelects.length <= 3, `expected <= 3 thread SELECTs for incremental setThreads, got ${incThreadSelects.length}: ${incThreadSelects.join(" | ")}`);
+    await run(data.written);
+    assert.ok(told.some((t) => t.topic === "session" && t.key === "k75"), "member of incrementally unlisted thread is notified");
+    assert.equal((data.get(threads("w/a")) as J[]).length, incremental.length);
+  } finally { runner.shutdown(); }
+});

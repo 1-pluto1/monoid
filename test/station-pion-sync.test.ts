@@ -109,6 +109,39 @@ test("nodeOnlyReasonsInMessage enforces strict case-sensitive trailer block pars
     ),
     ["Node Effect fiber teardown has no Pion counterpart"],
   );
+  // GitHub single-commit squash with blank-line-separated `Co-authored-by:` footer and no `---------` (seen on #9230)
+  assert.deepEqual(
+    nodeOnlyReasonsInMessage(
+      [
+        "fix(station): clone carried subagent transcripts instead of copying them (#9230)",
+        "",
+        "Body text.",
+        "",
+        "Node-Station-Only: pion/station-main has no carrySubagents counterpart",
+        "",
+        "Co-authored-by: CommaBot <commabot@still.fail>",
+        "Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+        "",
+      ].join("\n"),
+    ),
+    ["pion/station-main has no carrySubagents counterpart"],
+  );
+  // Single-commit squash with mid-body fake trailer followed by prose + `Co-authored-by:` must still be rejected
+  assert.deepEqual(
+    nodeOnlyReasonsInMessage(
+      "fix(station): x (#9230)\n\nNode-Station-Only: mid-body fake trailer\n\nTrailing prose.\n\nCo-authored-by: Bot <bot@example.com>\n",
+    ),
+    [],
+  );
+  // Subject line itself must never be accepted as a trailer (with or without trailing `Co-authored-by:`)
+  assert.deepEqual(
+    nodeOnlyReasonsInMessage("Node-Station-Only: fake subject line (#9230)\n\nCo-authored-by: Bot <bot@example.com>\n"),
+    [],
+  );
+  assert.deepEqual(
+    nodeOnlyReasonsInMessage("Node-Station-Only: fake subject line without body\n"),
+    [],
+  );
   // GitHub multi-commit squash (`* <subject>` sections + `---------` + `Co-authored-by:`)
   assert.deepEqual(
     nodeOnlyReasonsInMessage(
