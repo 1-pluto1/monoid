@@ -123,3 +123,75 @@ test("the_chats_read_ahead_as_the_core_starts_are_looked_up_a_chat_a_turn", asyn
     runner.shutdown();
   }
 });
+
+test("refresh_notifies_each_waiting_owner_once_only_after_its_final_queued_block_finishes", async () => {
+  const stores = new Map<string, Map<string, string>>();
+  const storeOf = (station: string) => {
+    let map = stores.get(station);
+    if (!map) {
+      map = new Map<string, string>();
+      stores.set(station, map);
+    }
+    return {
+      has: (k: string) => map.has(k),
+      get: (k: string) => map.get(k) ?? null,
+      put: (k: string, value: string) => void map.set(k, value),
+    };
+  };
+  const data = {
+    dbs: () => [],
+    logSpan: () => null,
+    logRange: () => new Map(),
+    thread: () => undefined,
+    record: () => undefined,
+    flushMd: () => {},
+    mdStore: (station: string) => storeOf(station),
+  } as unknown as Data;
+
+  const events: [string, string, boolean][] = [];
+  let resolveDone!: () => void;
+  const done = new Promise<void>((resolve) => { resolveDone = resolve; });
+  const textOne = "**one** block";
+  const textTwo = "**two** block";
+  const runner = new Runner();
+  const ahead = new MdAhead(data, runner, () => 0, (station, of) => {
+    const map = stores.get(station)!;
+    const ready = of === "t:1" && station === "w/a"
+      ? map.has(mdKey(textOne)) && map.has(mdKey(textTwo))
+      : of === "t:2"
+        ? map.has(mdKey(textTwo))
+        : map.has(mdKey(textOne));
+    events.push([station, of, ready]);
+    if (events.length === 3) resolveDone();
+  });
+  try {
+    ahead.refresh("w/a", "t:1", textOne);
+    ahead.refresh("w/a", "t:1", textOne);
+    ahead.refresh("w/a", "t:1", textTwo);
+    ahead.refresh("w/a", "t:2", textTwo);
+    ahead.refresh("w/b", "t:1", textOne);
+    await done;
+    assert.deepEqual(events.map(([st, of]) => `${st}:${of}`).sort(), ["w/a:t:1", "w/a:t:2", "w/b:t:1"]);
+    for (const [, , ready] of events) assert.equal(ready, true);
+
+    const batchSize = 200;
+    let resolveBatch!: () => void;
+    const batchDone = new Promise<void>((resolve) => { resolveBatch = resolve; });
+    const batchEvents: string[] = [];
+    const batchStore = new Map<string, string>();
+    const batchAhead = new MdAhead(
+      { ...data, mdStore: () => ({ has: (k: string) => batchStore.has(k), get: (k: string) => batchStore.get(k) ?? null, put: (k: string, v: string) => void batchStore.set(k, v) }) } as unknown as Data,
+      runner,
+      () => 0,
+      (station, of) => {
+        batchEvents.push(`${station}:${of}:${batchStore.size}`);
+        resolveBatch();
+      },
+    );
+    for (let i = 0; i < batchSize; i++) batchAhead.refresh("w/a", "t:9", `item ${i}`);
+    await batchDone;
+    assert.deepEqual(batchEvents, [`w/a:t:9:${batchSize}`]);
+  } finally {
+    runner.shutdown();
+  }
+});
