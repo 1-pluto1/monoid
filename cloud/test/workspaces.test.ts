@@ -424,8 +424,6 @@ test("initSchema creates indexes for hot Directory lookups and stays idempotent"
       "invitations_by_email",
       "invitations_by_workspace",
       "feedback_by_station",
-      "outbox_by_target",
-      "outbox_by_next_at",
     ]) {
       assert.ok(indexes.has(name), `missing index ${name}`);
     }
@@ -435,9 +433,6 @@ test("initSchema creates indexes for hot Directory lookups and stays idempotent"
       ["invitations_by_email", "SELECT id FROM invitations WHERE email = 'a@b.c' AND expires_at > 100 ORDER BY expires_at"],
       ["invitations_by_workspace", "SELECT COUNT(*) AS n FROM invitations WHERE workspace = 'w1' AND expires_at > 100"],
       ["feedback_by_station", "SELECT id FROM feedback WHERE station = 's1' AND fixed_in IS NOT NULL AND told_at IS NULL AND status = 'fixed' ORDER BY number"],
-      ["outbox_by_next_at", "SELECT MIN(next_at) AS at FROM outbox"],
-      ["outbox_by_next_at", "SELECT id FROM outbox WHERE next_at <= 100"],
-      ["outbox_by_target", "SELECT id, body, tries FROM outbox WHERE kind = 'station' AND key = 's1' ORDER BY id"],
     ] as const;
     for (const [index, query] of plans) {
       const detail = (sqlite.prepare(`EXPLAIN QUERY PLAN ${query}`).all() as { detail: string }[]).map((r) => r.detail).join(" | ");

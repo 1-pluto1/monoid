@@ -46,8 +46,6 @@ export function initSchema(db: DirectoryDb, runMigrations: { freePlan(): void; s
       CREATE TABLE IF NOT EXISTS apple_identities (apple_sub TEXT PRIMARY KEY, user_sub TEXT NOT NULL, email TEXT NOT NULL, refresh_token TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS apple_identities_by_user ON apple_identities (user_sub);
       CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, key TEXT NOT NULL, body TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0);
-      CREATE INDEX IF NOT EXISTS outbox_by_target ON outbox (kind, key, next_at);
-      CREATE INDEX IF NOT EXISTS outbox_by_next_at ON outbox (next_at);
       CREATE TABLE IF NOT EXISTS live (kind TEXT NOT NULL, key TEXT NOT NULL, gen INTEGER NOT NULL, PRIMARY KEY (kind, key));
       CREATE TABLE IF NOT EXISTS hits (hour INTEGER NOT NULL, family TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (hour, family));
       CREATE TABLE IF NOT EXISTS operators (sub TEXT PRIMARY KEY, email TEXT NOT NULL, seen_at INTEGER NOT NULL);
