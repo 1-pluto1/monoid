@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { importJWK, jwtVerify } from "jose";
+import { DirectoryDb } from "../src/directory/db.ts";
+import { initSchema } from "../src/directory/schema.ts";
+import type { Env } from "../src/env.ts";
 import { harness } from "./harness.ts";
 
 const hex = (bytes: ArrayBuffer) => Buffer.from(bytes).toString("hex");
@@ -435,5 +439,55 @@ test("mutators return WorkspaceView matching GET /v1/workspaces/:id without chan
     await expectSameView(await alice("PATCH", `/v1/workspaces/${ws}/members/${bobMe.user.sub}`, { role: "admin" }), 1, beforeRole);
   } finally {
     await h.close();
+  }
+});
+
+test("initSchema creates indexes for hot Directory lookups and stays idempotent", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  try {
+    const sql = {
+      exec(query: string, ...args: unknown[]) {
+        if (args.length === 0 && !/^\s*(SELECT|PRAGMA)\b/i.test(query)) {
+          sqlite.exec(query);
+          return { toArray: () => [] };
+        }
+        const stmt = sqlite.prepare(query);
+        if (/^\s*(SELECT|PRAGMA)\b/i.test(query)) {
+          const rows = stmt.all(...(args as any[]));
+          return { toArray: () => rows };
+        }
+        stmt.run(...(args as any[]));
+        return { toArray: () => [] };
+      },
+    };
+    const db = new DirectoryDb({ storage: { sql } } as unknown as DurableObjectState, {} as Env);
+    const migrations = { freePlan() {}, stationMembers() {} };
+    initSchema(db, migrations);
+    initSchema(db, migrations);
+
+    const indexes = new Set(
+      (sqlite.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as { name: string }[]).map((r) => r.name),
+    );
+    for (const name of [
+      "workspaces_by_creator",
+      "invitations_by_email",
+      "invitations_by_workspace",
+      "feedback_by_station",
+    ]) {
+      assert.ok(indexes.has(name), `missing index ${name}`);
+    }
+
+    const plans = [
+      ["workspaces_by_creator", "SELECT COUNT(*) AS n FROM workspaces WHERE created_by = 'u1' AND max_members IS NULL"],
+      ["invitations_by_email", "SELECT id FROM invitations WHERE email = 'a@b.c' AND expires_at > 100 ORDER BY expires_at"],
+      ["invitations_by_workspace", "SELECT COUNT(*) AS n FROM invitations WHERE workspace = 'w1' AND expires_at > 100"],
+      ["feedback_by_station", "SELECT id FROM feedback WHERE station = 's1' AND fixed_in IS NOT NULL AND told_at IS NULL AND status = 'fixed' ORDER BY number"],
+    ] as const;
+    for (const [index, query] of plans) {
+      const detail = (sqlite.prepare(`EXPLAIN QUERY PLAN ${query}`).all() as { detail: string }[]).map((r) => r.detail).join(" | ");
+      assert.match(detail, new RegExp(`USING (?:COVERING )?INDEX ${index}`), `${query}: ${detail}`);
+    }
+  } finally {
+    sqlite.close();
   }
 });
