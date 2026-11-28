@@ -25,6 +25,8 @@ pub fn project_workspaces(
   accounts : Array[StoredAccount] = [],
   viewer_sub : String = "",
   viewer_email : String = "",
+  allow_workspace : Option[(String) -> Bool] = None,
+  active_sub : String = "",
 ) -> sql::SqlResult[base_codec::Json] {
   let rows = match store::list_workspaces(db) {
     sql::SqlResult::Err(e) => return sql::SqlResult::Err(e)
@@ -33,6 +35,10 @@ pub fn project_workspaces(
   let ws_items : Array[base_codec::Json] = []
   for i in 0..<rows.length() {
     let r = rows[i]
+    match allow_workspace {
+      Some(pred) => if !pred(r.id) { continue }
+      None => ()
+    }
     let j = parse_json_or_null(r.json)
     let name = match j_opt_str(j, "name") {
       Some(n) => n
@@ -42,7 +48,11 @@ pub fn project_workspaces(
       Some(s) => s
       None => "member"
     }
-    let stations_n = j_arr(j, "stations").length()
+    let stations_n = match base_codec::json_get(j, "stations") {
+      Some(base_codec::Json::Arr(xs)) => xs.length()
+      Some(base_codec::Json::Num(n, _)) => if n >= 0.0 { n.to_int() } else { 0 }
+      _ => 0
+    }
     let item : Array[(String, base_codec::Json)] = [
       ("id", base_codec::json_str(r.id)),
       ("name", base_codec::json_str(name)),
@@ -54,11 +64,24 @@ pub fn project_workspaces(
     push_opt_bool(item, "locked", j_opt_bool(j, "locked"))
     ws_items.push(base_codec::json_obj(item))
   }
+  let eff_active = if active_sub.length() > 0 { active_sub } else { viewer_sub }
   if accounts.length() > 0 {
+    let mut owner_idx = -1
+    if eff_active.length() > 0 {
+      for i in 0..<accounts.length() {
+        if accounts[i].sub == eff_active {
+          owner_idx = i
+          break
+        }
+      }
+    }
+    if owner_idx < 0 && active_sub.length() == 0 {
+      owner_idx = 0
+    }
     let grouped : Array[base_codec::Json] = []
     for i in 0..<accounts.length() {
       let a = accounts[i]
-      let wss = if i == 0 { ws_items } else { [] }
+      let wss = if i == owner_idx { ws_items } else { [] }
       grouped.push(base_codec::json_obj([
         ("account", account_view_obj(a.sub, a.email, a.name, a.picture)),
         ("workspaces", base_codec::json_arr(wss)),
@@ -74,9 +97,39 @@ pub fn project_workspaces(
     _ => []
   }
   if stored_accts.length() > 0 {
+    let mut owner_idx = -1
+    if eff_active.length() > 0 {
+      for i in 0..<stored_accts.length() {
+        let sub_or_id = match j_opt_str(stored_accts[i], "sub") {
+          Some(s) => s
+          None => match j_opt_str(stored_accts[i], "id") {
+            Some(s) => s
+            None => ""
+          }
+        }
+        if sub_or_id == eff_active {
+          owner_idx = i
+          break
+        }
+      }
+    }
+    if owner_idx < 0 && viewer_email.length() > 0 {
+      for i in 0..<stored_accts.length() {
+        match j_opt_str(stored_accts[i], "email") {
+          Some(em) => if em == viewer_email {
+            owner_idx = i
+            break
+          }
+          None => ()
+        }
+      }
+    }
+    if owner_idx < 0 && (active_sub.length() == 0 || stored_accts.length() == 1) {
+      owner_idx = 0
+    }
     let grouped : Array[base_codec::Json] = []
     for i in 0..<stored_accts.length() {
-      let wss = if i == 0 { ws_items } else { [] }
+      let wss = if i == owner_idx { ws_items } else { [] }
       grouped.push(base_codec::json_obj([
         ("account", stored_accts[i]),
         ("workspaces", base_codec::json_arr(wss)),
@@ -178,7 +231,11 @@ fn project_overview_row(ov : base_codec::Json) -> base_codec::Json {
 /// Project `stations` list topic (`Array[StationRow]`, strictly conforming to `shapes/station.ts`).
 /// Strips detail-only heavy fields (`runtimes`, `models`, `apiProviders`, `profiles`, `connects`,
 /// `slackUsers`, `slackTeams`, `logins`, `updates`, `agentEnv`).
-pub fn project_stations(db : sql::Sql, workspace_id : String) -> sql::SqlResult[base_codec::Json] {
+pub fn project_stations(
+  db : sql::Sql,
+  workspace_id : String,
+  allow_station : Option[(String) -> Bool] = None,
+) -> sql::SqlResult[base_codec::Json] {
   let rows = match store::list_workspace_stations_merged(db, workspace_id) {
     sql::SqlResult::Err(e) => return sql::SqlResult::Err(e)
     sql::SqlResult::Ok(rs) => rs
@@ -189,6 +246,10 @@ pub fn project_stations(db : sql::Sql, workspace_id : String) -> sql::SqlResult[
     let r = rows[i]
     if workspace_id.length() > 0 && !r.address.starts_with(prefix) {
       continue
+    }
+    match allow_station {
+      Some(pred) => if !pred(r.address) { continue }
+      None => ()
     }
     let j = parse_json_or_null(r.json)
     let id = match j_opt_str(j, "id") {

@@ -4,17 +4,29 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "core_api.h"
 
 extern void mb_core_attach_pion_runtime(void);
+extern int64_t pion_core_dir_owner_lock_acquire(const char *dir, int64_t dir_len);
+extern void pion_core_dir_owner_lock_release(int64_t handle);
+extern int32_t pion_core_accounts_read(const char *dir, int64_t dir_len);
+extern const uint8_t *pion_core_accounts_data(void);
+extern int64_t pion_core_accounts_len(void);
+extern int32_t pion_core_accounts_write_atomic(const char *dir, int64_t dir_len, const uint8_t *bytes, int64_t len);
+extern int32_t pion_core_accounts_remove_atomic(const char *dir, int64_t dir_len);
+extern int32_t pion_core_accounts_sync_dir(const char *dir, int64_t dir_len);
+extern void pion_core_test_set_fail_dir_fsync(int32_t enable);
 extern int mb_core_deliver_media(
     uint64_t call,
     int kind,
@@ -133,7 +145,62 @@ static void *foreign_screen_thread(void *arg) {
     return NULL;
 }
 
-int main(void) {
+static int run_exec_lock_probe(const char *self_exe, const char *dir) {
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        execl(self_exe, self_exe, "--lock-probe", dir, (char *)NULL);
+        _exit(127);
+    }
+    int st = 0;
+    assert(waitpid(pid, &st, 0) == pid && WIFEXITED(st));
+    return WEXITSTATUS(st);
+}
+
+int main(int argc, char **argv) {
+    // Self-exec child mode for genuine cross-process OS `flock` testing on `<dir>/.core.lock`.
+    if (argc >= 3 && strcmp(argv[1], "--lock-probe") == 0) {
+        const char *probe_dir = argv[2];
+        int64_t h = pion_core_dir_owner_lock_acquire(probe_dir, (int64_t)strlen(probe_dir));
+        if (h == 0) {
+            return 2; // contended on OS `flock`
+        }
+        if (h >= 1) {
+            pion_core_dir_owner_lock_release(h);
+            return 0; // acquired & released cleanly
+        }
+        return 3; // I/O error
+    }
+    // Self-exec child mode testing real `mb_core_start(<dir>)` fail-fast `data_dir_locked` against
+    // a live parent core instance holding `<dir>/.core.lock`!
+    if (argc >= 3 && strcmp(argv[1], "--second-core-start") == 0) {
+        const char *target_dir = argv[2];
+        memset(&g_ctx, 0, sizeof(g_ctx));
+        pthread_mutex_init(&g_ctx.mu, NULL);
+        pthread_cond_init(&g_ctx.cv, NULL);
+        mb_core_attach_pion_runtime();
+        mb_core_start(target_dir, "http://127.0.0.1:9", 1, on_host_message, &g_ctx);
+        recorded_msg_t *fm = wait_for_msg_index(&g_ctx, 0);
+        int ok_locked = (strstr(fm->json, "\"fatal\"") != NULL && strstr(fm->json, "data_dir_locked") != NULL) ? 1 : 0;
+        mb_core_stop();
+        return ok_locked ? 0 : 5;
+    }
+    // Self-exec child mode holding `<dir>/.core.lock` until SIGKILLed by parent (crash recovery test!).
+    if (argc >= 3 && strcmp(argv[1], "--lock-hold-sigkill") == 0) {
+        const char *hold_dir = argv[2];
+        int64_t h = pion_core_dir_owner_lock_acquire(hold_dir, (int64_t)strlen(hold_dir));
+        if (h < 1) {
+            return 4;
+        }
+        char locked = 'L';
+        ssize_t wr = write(STDOUT_FILENO, &locked, 1);
+        (void)wr;
+        char rel = 0;
+        ssize_t rd = read(STDIN_FILENO, &rel, 1);
+        (void)rd;
+        pion_core_dir_owner_lock_release(h);
+        return 0;
+    }
     memset(&g_ctx, 0, sizeof(g_ctx));
     pthread_mutex_init(&g_ctx.mu, NULL);
     pthread_cond_init(&g_ctx.cv, NULL);
@@ -143,6 +210,56 @@ int main(void) {
 
     char data_dir[128];
     snprintf(data_dir, sizeof(data_dir), "/tmp/pion_core_runtime_e2e_%ld", (long)time(NULL));
+    assert(mkdir(data_dir, 0755) == 0);
+
+    // 0a. Cold boot on completely empty `data_dir` (unauthenticated):
+    // verify `account.doc("me")` is null, `workspaces.list` is [], `chat.draft` returns `unauthenticated`,
+    // and `default.db` is NEVER created on disk!
+    {
+        char unauth_dir[160];
+        snprintf(unauth_dir, sizeof(unauth_dir), "%s_unauth", data_dir);
+        mb_core_start(unauth_dir, "https://app.still.fail", 1, on_host_message, &g_ctx);
+        int uidx = 0;
+        recorded_msg_t *um = wait_for_msg_index(&g_ctx, uidx++);
+        assert(strstr(um->json, "\"id\":0") != NULL);
+        send_json("{\"id\":901,\"call\":\"account.doc\",\"params\":{\"name\":\"me\"}}");
+        um = wait_for_msg_index(&g_ctx, uidx++);
+        printf("[core_runtime_e2e] unauth account.doc(me) -> %s\n", um->json);
+        assert(strstr(um->json, "\"id\":901") != NULL && strstr(um->json, "\"ok\":null") != NULL);
+        send_json("{\"id\":902,\"call\":\"workspaces.list\",\"params\":{}}");
+        um = wait_for_msg_index(&g_ctx, uidx++);
+        printf("[core_runtime_e2e] unauth workspaces.list -> %s\n", um->json);
+        assert(strstr(um->json, "\"id\":902") != NULL && strstr(um->json, "\"workspaces\":[]") != NULL);
+        send_json("{\"id\":903,\"call\":\"chat.draft\",\"params\":{\"chat\":\"c-1\",\"text\":\"nope\"}}");
+        um = wait_for_msg_index(&g_ctx, uidx++);
+        printf("[core_runtime_e2e] unauth chat.draft -> %s\n", um->json);
+        assert(strstr(um->json, "\"id\":903") != NULL && strstr(um->json, "unauthenticated") != NULL);
+        mb_core_stop();
+        char def_db_path[256];
+        snprintf(def_db_path, sizeof(def_db_path), "%s/databases/default.db", unauth_dir);
+        struct stat st_def;
+        assert(stat(def_db_path, &st_def) != 0);
+        // Reset recorded messages for the main authenticated E2E run.
+        pthread_mutex_lock(&g_ctx.mu);
+        for (int i = 0; i < g_ctx.count; i++) {
+            free(g_ctx.msgs[i].json);
+            free(g_ctx.msgs[i].bytes);
+        }
+        g_ctx.count = 0;
+        pthread_mutex_unlock(&g_ctx.mu);
+    }
+
+    // Seed signed-in TS `StoredAccount` (`accounts` file) for the main authenticated E2E run.
+    {
+        char acct_path[256];
+        snprintf(acct_path, sizeof(acct_path), "%s/accounts", data_dir);
+        FILE *af = fopen(acct_path, "w");
+        assert(af != NULL);
+        fputs("[{\"sub\":\"u-e2e\",\"email\":\"alice@still.fail\",\"name\":\"Alice\",\"picture\":\"\","
+              "\"access\":\"tok-e2e\",\"refresh\":\"ref-e2e\",\"access_expires\":1900000000,"
+              "\"session\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\"}]", af);
+        fclose(af);
+    }
 
     printf("[core_runtime_e2e] starting mb_core_start at %s\n", data_dir);
     mb_core_start(data_dir, "https://app.still.fail", 1, on_host_message, &g_ctx);
@@ -476,37 +593,6 @@ int main(void) {
     assert(strstr(m->json, "\"id\":56") != NULL && strstr(m->json, "\"pending\":true") != NULL && strstr(m->json, "\"messages\":[]") != NULL);
     send_json("{\"id\":56,\"unsubscribe\":true}");
 
-    send_json("{\"id\":57,\"call\":\"auth.begin\",\"params\":{}}");
-    m = wait_for_msg_index(&g_ctx, next_idx++);
-    printf("[core_runtime_e2e] #57 auth.begin -> %s\n", m->json);
-    assert(strstr(m->json, "\"id\":57") != NULL && strstr(m->json, "\"verifier\"") == NULL);
-    const char *st_pos = strstr(m->json, "\"state\":\"");
-    assert(st_pos != NULL);
-    st_pos += 9;
-    char auth_state[128];
-    size_t si = 0;
-    while (st_pos[si] != '\0' && st_pos[si] != '"' && si + 1 < sizeof(auth_state)) {
-        auth_state[si] = st_pos[si];
-        si++;
-    }
-    auth_state[si] = '\0';
-    assert(si > 0);
-    char auth_complete_req[384];
-    snprintf(auth_complete_req, sizeof(auth_complete_req),
-             "{\"id\":58,\"call\":\"auth.complete\",\"params\":{\"query\":\"?state=%s&code=e2e_secret_code_99\"}}",
-             auth_state);
-    send_json(auth_complete_req);
-    m = wait_for_msg_index(&g_ctx, next_idx++);
-    printf("[core_runtime_e2e] #58 auth.complete {query} -> %s\n", m->json);
-    assert(strstr(m->json, "\"id\":58") != NULL && strstr(m->json, "\"ok\":true") != NULL);
-    assert(strstr(m->json, "e2e_secret_code_99") == NULL && strstr(m->json, "verifier") == NULL);
-
-    send_json("{\"id\":59,\"call\":\"auth.complete\",\"params\":{\"query\":\"?error=access_denied&error_description=UNVERIFIED_XSS_LEAK\"}}");
-    m = wait_for_msg_index(&g_ctx, next_idx++);
-    printf("[core_runtime_e2e] #59 auth.complete error query -> %s\n", m->json);
-    assert(strstr(m->json, "\"id\":59") != NULL && strstr(m->json, "\"error\"") != NULL);
-    assert(strstr(m->json, "UNVERIFIED_XSS_LEAK") == NULL);
-
     // 6. Binary payload round-trip + screen_ack / screen_input / route_media
     static const uint8_t bin[4] = {'P', 'I', 'O', 'N'};
     static const char echo_req[] = "{\"id\":30,\"call\":\"echo.bytes\",\"params\":{\"ok\":true}}";
@@ -537,7 +623,7 @@ int main(void) {
     }
 
     atomic_store(&g_ctx.stopped, 0);
-    mb_core_start(data_dir, "https://app.still.fail", 1, on_host_message, &g_ctx);
+    mb_core_start(data_dir, "http://127.0.0.1:9", 1, on_host_message, &g_ctx);
     // Restart handshake MUST strictly increment device-level `connSeq` (`conn2 > conn1`)!
     m = wait_for_msg_index(&g_ctx, next_idx++);
     printf("[core_runtime_e2e] restart auth handshake -> %s\n", m->json);
@@ -578,7 +664,241 @@ int main(void) {
     assert(strstr(m->json, "\"id\":42") != NULL && strstr(m->json, conn2_kv) != NULL && strstr(m->json, "\"authGen\"") == NULL);
     send_json("{\"id\":42,\"unsubscribe\":true}");
 
-    mb_core_stop();
+    // Offline OAuth begin / direct-param bypass rejection / error-query non-leakage checks:
+    // Production native ABI ALWAYS requires real Cloud `/v1/auth/token` exchange and MUST reject
+    // caller-supplied `sub`/`email`/`access` when Cloud is unreachable without leaking code/verifier
+    // or opening an account DB! (Real `/v1/auth/token` exchange is exercised in `core_runtime_live_net_e2e.c`.)
+    send_json("{\"id\":57,\"call\":\"auth.begin\",\"params\":{}}");
+    m = wait_for_msg_index(&g_ctx, next_idx++);
+    printf("[core_runtime_e2e] #57 auth.begin -> %s\n", m->json);
+    assert(strstr(m->json, "\"id\":57") != NULL && strstr(m->json, "\"verifier\"") == NULL);
+    const char *st_pos = strstr(m->json, "\"state\":\"");
+    assert(st_pos != NULL);
+    st_pos += 9;
+    char auth_state[128];
+    size_t si = 0;
+    while (st_pos[si] != '\0' && st_pos[si] != '"' && si + 1 < sizeof(auth_state)) {
+        auth_state[si] = st_pos[si];
+        si++;
+    }
+    auth_state[si] = '\0';
+    assert(si > 0);
+    char evil_db_path[256];
+    snprintf(evil_db_path, sizeof(evil_db_path), "%s/databases/account-u-evil.db", data_dir);
+    char auth_complete_req[512];
+    snprintf(auth_complete_req, sizeof(auth_complete_req),
+             "{\"id\":58,\"call\":\"auth.complete\",\"params\":{\"query\":\"?state=%s&code=e2e_secret_code_99\",\"sub\":\"u-evil\",\"email\":\"evil@still.fail\",\"access\":\"forged-tok\"}}",
+             auth_state);
+    send_json(auth_complete_req);
+    m = wait_for_msg_index(&g_ctx, next_idx++);
+    printf("[core_runtime_e2e] #58 auth.complete without Cloud rejected -> %s\n", m->json);
+    assert(strstr(m->json, "\"id\":58") != NULL && strstr(m->json, "\"error\"") != NULL);
+    assert(strstr(m->json, "\"ok\":true") == NULL);
+    assert(strstr(m->json, "e2e_secret_code_99") == NULL && strstr(m->json, "verifier") == NULL && strstr(m->json, "forged-tok") == NULL);
+    {
+        struct stat st_evil;
+        assert(stat(evil_db_path, &st_evil) != 0);
+    }
+
+    send_json("{\"id\":59,\"call\":\"auth.complete\",\"params\":{\"query\":\"?error=access_denied&error_description=UNVERIFIED_XSS_LEAK\"}}");
+    m = wait_for_msg_index(&g_ctx, next_idx++);
+    printf("[core_runtime_e2e] #59 auth.complete error query -> %s\n", m->json);
+    assert(strstr(m->json, "\"id\":59") != NULL && strstr(m->json, "\"error\"") != NULL);
+    assert(strstr(m->json, "UNVERIFIED_XSS_LEAK") == NULL);
+
+    // 7a. Same-account re-login failure/cancel MUST preserve original `<data_dir>/accounts` tuple untouched,
+    //     and mid-flight `auth.refresh` interrupted by `mb_core_stop()` MUST NOT deadlock after restart!
+    {
+        send_json("{\"id\":60,\"call\":\"auth.refresh\",\"params\":{\"sub\":\"u-e2e\"}}");
+        // Immediately stop while `auth.refresh` may still be in flight: must release cleanly with 0 deadlock!
+        mb_core_stop();
+
+        // Verify original `u-e2e` / `ref-e2e` tuple on disk is still completely intact!
+        char acct_path[256];
+        snprintf(acct_path, sizeof(acct_path), "%s/accounts", data_dir);
+        FILE *af = fopen(acct_path, "r");
+        assert(af != NULL);
+        char abuf[1024];
+        size_t an = fread(abuf, 1, sizeof(abuf) - 1, af);
+        fclose(af);
+        abuf[an] = '\0';
+        assert(strstr(abuf, "\"sub\":\"u-e2e\"") != NULL && strstr(abuf, "\"refresh\":\"ref-e2e\"") != NULL);
+
+        // Same-process restart + immediate `auth.refresh` MUST complete promptly (0 Semaphore/mutex deadlock)!
+        atomic_store(&g_ctx.stopped, 0);
+        mb_core_start(data_dir, "http://127.0.0.1:9", 1, on_host_message, &g_ctx);
+        m = wait_for_msg_index(&g_ctx, next_idx++);
+        assert(strstr(m->json, "\"id\":0") != NULL && strstr(m->json, "\"auth\":{") != NULL);
+        send_json("{\"id\":61,\"call\":\"auth.refresh\",\"params\":{\"sub\":\"u-e2e\"}}");
+        m = wait_for_msg_index(&g_ctx, next_idx++);
+        printf("[core_runtime_e2e] #61 post-stop-mid-refresh auth.refresh -> %s\n", m->json);
+        assert(strstr(m->json, "\"id\":61") != NULL && strstr(m->json, "\"error\"") != NULL);
+        mb_core_stop();
+        printf("[core_runtime_e2e] post-stop restart non-deadlock + accounts preservation OK\n");
+    }
+
+    // 7b. Genuine separate-process (`fork` + `execl`) exclusive `<dir>/.core.lock` mutual exclusion +
+    //     stale-handle release immunity + zero-block `accounts_remove_atomic`!
+    {
+        int64_t dlen = (int64_t)strlen(data_dir);
+        int64_t h1 = pion_core_dir_owner_lock_acquire(data_dir, dlen);
+        assert(h1 >= 1);
+        // Same-process second acquire MUST be contended (`0`).
+        assert(pion_core_dir_owner_lock_acquire(data_dir, dlen) == 0);
+        // Independent exec'd child process MUST observe OS `flock` contention (`exit 2`).
+        assert(run_exec_lock_probe(argv[0], data_dir) == 2);
+        assert(pion_core_accounts_read(data_dir, dlen) == 1);
+        assert(pion_core_accounts_len() > 0 && pion_core_accounts_data() != NULL);
+        pion_core_dir_owner_lock_release(h1);
+
+        // Acquire new `h2 > h1` and invoke STALE `release(h1)`: MUST be a no-op and MUST NOT release `h2`!
+        int64_t h2 = pion_core_dir_owner_lock_acquire(data_dir, dlen);
+        assert(h2 > h1);
+        pion_core_dir_owner_lock_release(h1);
+        assert(run_exec_lock_probe(argv[0], data_dir) == 2);
+        pion_core_dir_owner_lock_release(h2);
+
+        // After releasing `h2`, independent exec'd child MUST immediately acquire & release (`exit 0`)!
+        assert(run_exec_lock_probe(argv[0], data_dir) == 0);
+
+        // P1-3 + P1-4: Verify strict 3-state `write_atomic` / `remove_atomic` (`0`, `-1`, `-2`) +
+        // `pion_core_accounts_sync_dir` (single `<dir>/accounts` source of truth, ZERO in-place overwrite):
+        char rm_dir[256];
+        snprintf(rm_dir, sizeof(rm_dir), "%s_rm", data_dir);
+        assert(mkdir(rm_dir, 0700) == 0);
+        int64_t rlen = (int64_t)strlen(rm_dir);
+        const char *two_accts = "[{\"sub\":\"u-alice\",\"refresh\":\"ref-a\"},{\"sub\":\"u-bob\",\"refresh\":\"ref-b\"}]";
+        const char *one_acct = "[{\"sub\":\"u-bob\",\"refresh\":\"ref-b\"}]";
+        assert(pion_core_accounts_write_atomic(rm_dir, rlen, (const uint8_t *)two_accts, (int64_t)strlen(two_accts)) == 0);
+        assert(pion_core_accounts_sync_dir(rm_dir, rlen) == 0);
+
+        // Inject directory fsync failure: `rename`/`unlink` succeeds and MUST return `-2` (NOT `-1`!),
+        // and `pion_core_accounts_sync_dir` MUST return `-1` until cleared!
+        pion_core_test_set_fail_dir_fsync(1);
+        assert(pion_core_accounts_write_atomic(rm_dir, rlen, (const uint8_t *)one_acct, (int64_t)strlen(one_acct)) == -2);
+        assert(pion_core_accounts_read(rm_dir, rlen) == 1);
+        assert(pion_core_accounts_len() == (int64_t)strlen(one_acct));
+        assert(memcmp(pion_core_accounts_data(), one_acct, strlen(one_acct)) == 0);
+        assert(pion_core_accounts_sync_dir(rm_dir, rlen) == -1);
+        assert(pion_core_accounts_remove_atomic(rm_dir, rlen) == -2);
+        assert(pion_core_accounts_read(rm_dir, rlen) == 0);
+        pion_core_test_set_fail_dir_fsync(0);
+        assert(pion_core_accounts_sync_dir(rm_dir, rlen) == 0);
+        assert(pion_core_accounts_remove_atomic(rm_dir, rlen) == 0); // idempotent on ENOENT
+
+        // P2-1: Recursive directory creation (3-level nested nonexistent path) BEFORE `.core.lock`!
+        char nested_dir[320];
+        snprintf(nested_dir, sizeof(nested_dir), "%s_nested/lv1/lv2/lv3", data_dir);
+        int64_t hn = pion_core_dir_owner_lock_acquire(nested_dir, (int64_t)strlen(nested_dir));
+        assert(hn >= 1);
+        pion_core_dir_owner_lock_release(hn);
+        struct stat st_nest;
+        assert(stat(nested_dir, &st_nest) == 0 && S_ISDIR(st_nest.st_mode));
+
+        // P2-2: Unified 16 MiB inclusive boundary — 16 MiB write/read both succeed; 16 MiB + 1 both fail!
+        const size_t max_bytes = 16u * 1024u * 1024u;
+        uint8_t *big_buf = (uint8_t *)malloc(max_bytes + 1);
+        assert(big_buf != NULL);
+        memset(big_buf, ' ', max_bytes + 1);
+        big_buf[0] = '[';
+        big_buf[1] = ']';
+        assert(pion_core_accounts_write_atomic(rm_dir, rlen, big_buf, (int64_t)max_bytes) == 0);
+        assert(pion_core_accounts_read(rm_dir, rlen) == 1);
+        assert(pion_core_accounts_len() == (int64_t)max_bytes);
+        assert(pion_core_accounts_write_atomic(rm_dir, rlen, big_buf, (int64_t)(max_bytes + 1)) == -1);
+        char big_path[320];
+        snprintf(big_path, sizeof(big_path), "%s/accounts", rm_dir);
+        FILE *bf = fopen(big_path, "wb");
+        assert(bf != NULL);
+        assert(fwrite(big_buf, 1, max_bytes + 1, bf) == max_bytes + 1);
+        fclose(bf);
+        assert(pion_core_accounts_read(rm_dir, rlen) == -1);
+        assert(pion_core_accounts_remove_atomic(rm_dir, rlen) == 0);
+        free(big_buf);
+        printf("[core_runtime_e2e] .core.lock flock + stale immunity + 3-state -2/sync_dir + nested mkdir + 16 MiB boundary OK\n");
+    }
+
+    // 7c. R11 E2E: Real `fork()+execl()` single-owner `<dir>/.core.lock` fail-fast enforcement:
+    //     1) Parent starts live core on `data_dir` (holding `<dir>/.core.lock`).
+    //     2) Independent exec'd child calls `mb_core_start(data_dir)` -> MUST fail fast with
+    //        `data_dir_locked` fatal WITHOUT touching parent's DB or `accounts`!
+    //     3) Parent calls `mb_core_stop()` -> subsequent cold boot immediately acquires `.core.lock`,
+    //        recovers `alice@still.fail`, persisted `theme=light`, and persisted `default_station`!
+    {
+        atomic_store(&g_ctx.stopped, 0);
+        mb_core_start(data_dir, "http://127.0.0.1:9", 1, on_host_message, &g_ctx);
+        m = wait_for_msg_index(&g_ctx, next_idx++);
+        assert(strstr(m->json, "\"id\":0") != NULL && strstr(m->json, "\"auth\":{") != NULL);
+
+        // Spawn independent exec'd second core instance targeting the SAME `data_dir`:
+        pid_t second = fork();
+        assert(second >= 0);
+        if (second == 0) {
+            execl(argv[0], argv[0], "--second-core-start", data_dir, (char *)NULL);
+            _exit(127);
+        }
+        int sst = 0;
+        assert(waitpid(second, &sst, 0) == second && WIFEXITED(sst) && WEXITSTATUS(sst) == 0);
+
+        // Parent's live core state is 100% intact (`alice@still.fail` & `theme=light`):
+        send_json("{\"id\":62,\"subscribe\":{\"topic\":\"accounts\"},\"keyed\":true}");
+        m = wait_for_msg_index(&g_ctx, next_idx++);
+        assert(strstr(m->json, "\"id\":62") != NULL && strstr(m->json, "alice@still.fail") != NULL);
+        send_json("{\"id\":63,\"call\":\"settings.get\",\"params\":{\"key\":\"theme\"}}");
+        m = wait_for_msg_index(&g_ctx, next_idx++);
+        assert(strstr(m->json, "\"id\":63") != NULL && strstr(m->json, "\"value\":\"light\"") != NULL);
+        mb_core_stop();
+
+        // After parent stops, a fresh restart immediately acquires `.core.lock` and reads Alice + `theme=light`!
+        atomic_store(&g_ctx.stopped, 0);
+        mb_core_start(data_dir, "http://127.0.0.1:9", 1, on_host_message, &g_ctx);
+        m = wait_for_msg_index(&g_ctx, next_idx++);
+        assert(strstr(m->json, "\"id\":0") != NULL && strstr(m->json, "\"auth\":{") != NULL);
+        send_json("{\"id\":64,\"call\":\"settings.get\",\"params\":{\"key\":\"theme\"}}");
+        m = wait_for_msg_index(&g_ctx, next_idx++);
+        assert(strstr(m->json, "\"id\":64") != NULL && strstr(m->json, "\"value\":\"light\"") != NULL);
+        mb_core_stop();
+        printf("[core_runtime_e2e] single-owner .core.lock fail-fast data_dir_locked + clean handoff OK\n");
+    }
+
+    // 7d. R11 E2E: Real `SIGKILL` crash recovery — OS kernel automatically releases `<dir>/.core.lock`
+    //     on sudden process death (ZERO zombie lock!), and parent starts immediately!
+    {
+        int ready_pipe[2];
+        assert(pipe(ready_pipe) == 0);
+        pid_t holder = fork();
+        assert(holder >= 0);
+        if (holder == 0) {
+            close(ready_pipe[0]);
+            dup2(ready_pipe[1], STDOUT_FILENO);
+            close(ready_pipe[1]);
+            execl(argv[0], argv[0], "--lock-hold-sigkill", data_dir, (char *)NULL);
+            _exit(127);
+        }
+        close(ready_pipe[1]);
+        char locked = 0;
+        assert(read(ready_pipe[0], &locked, 1) == 1 && locked == 'L');
+        close(ready_pipe[0]);
+
+        // While child holds `.core.lock`, probe MUST report contended (`2`)!
+        assert(run_exec_lock_probe(argv[0], data_dir) == 2);
+
+        // Hard-kill child with `SIGKILL` (no cleanup handler can run!):
+        assert(kill(holder, SIGKILL) == 0);
+        int kst = 0;
+        assert(waitpid(holder, &kst, 0) == holder && WIFSIGNALED(kst) && WTERMSIG(kst) == SIGKILL);
+
+        // OS kernel released `.core.lock` immediately -> parent `mb_core_start` succeeds at 0ms!
+        atomic_store(&g_ctx.stopped, 0);
+        mb_core_start(data_dir, "http://127.0.0.1:9", 1, on_host_message, &g_ctx);
+        m = wait_for_msg_index(&g_ctx, next_idx++);
+        assert(strstr(m->json, "\"id\":0") != NULL && strstr(m->json, "\"auth\":{") != NULL);
+        send_json("{\"id\":65,\"call\":\"settings.get\",\"params\":{\"key\":\"theme\"}}");
+        m = wait_for_msg_index(&g_ctx, next_idx++);
+        assert(strstr(m->json, "\"id\":65") != NULL && strstr(m->json, "\"value\":\"light\"") != NULL);
+        mb_core_stop();
+        printf("[core_runtime_e2e] SIGKILL crash recovery (zero zombie .core.lock) OK\n");
+    }
 
     // 8. Corrupt `device/auth` MUST NOT be overwritten (protects TS `capRev:*` records!),
     //    and `connSeq` MUST persist to `device/conn_seq_floor` and stay strictly monotonic across restarts!
@@ -589,7 +909,7 @@ int main(void) {
         fclose(f);
     }
     atomic_store(&g_ctx.stopped, 0);
-    mb_core_start(data_dir, "https://app.still.fail", 1, on_host_message, &g_ctx);
+    mb_core_start(data_dir, "http://127.0.0.1:9", 1, on_host_message, &g_ctx);
     m = wait_for_msg_index(&g_ctx, next_idx++);
     printf("[core_runtime_e2e] restart #3 (corrupt device/auth) handshake -> %s\n", m->json);
     assert(strstr(m->json, "\"id\":0") != NULL && strstr(m->json, "\"auth\":{") != NULL);
@@ -621,7 +941,7 @@ int main(void) {
 
     // Restart #4 while `device/auth` is still corrupt -> reads `device/conn_seq_floor` and increments `conn4 > conn3`!
     atomic_store(&g_ctx.stopped, 0);
-    mb_core_start(data_dir, "https://app.still.fail", 1, on_host_message, &g_ctx);
+    mb_core_start(data_dir, "http://127.0.0.1:9", 1, on_host_message, &g_ctx);
     m = wait_for_msg_index(&g_ctx, next_idx++);
     printf("[core_runtime_e2e] restart #4 (floor recovery) handshake -> %s\n", m->json);
     long long conn4 = extract_conn_seq(m->json);

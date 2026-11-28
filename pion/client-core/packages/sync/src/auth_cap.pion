@@ -80,6 +80,8 @@ pub struct AuthGenTracker {
   locked_vaults : Map[String, Bool]
   listeners : Array[BoundaryListener]
   mut next_listener_id : Int
+  mut station_ws_resolver : Option[(String) -> String]
+  mut default_workspace_resolver : Option[() -> String]
 }
 
 pub fn AuthGenTracker::new(conn_seq : Int64 = 1L) -> AuthGenTracker {
@@ -97,7 +99,111 @@ pub fn AuthGenTracker::new(conn_seq : Int64 = 1L) -> AuthGenTracker {
     locked_vaults: Map::new(),
     listeners: [],
     next_listener_id: 1,
+    station_ws_resolver: None,
+    default_workspace_resolver: None,
   }
+}
+
+/// Register a station-to-workspace resolver (wired to `MembershipAuthority`) so bare station
+/// addresses in `auth_gen_of` / `vault_gen_of` / `matches_topic` resolve to their canonical workspace.
+pub fn AuthGenTracker::set_station_ws_resolver(
+  self : AuthGenTracker,
+  resolver : (String) -> String,
+) -> Unit {
+  self.station_ws_resolver = Some(resolver)
+}
+
+/// Register the active default workspace resolver so parameterless scoped topics (`chats`,
+/// `stations`, `profiles`, `usage`, `settings`, `fleet`, `search`, etc.) resolve to the EXACT
+/// same effective workspace as the topic projectors (`ClientCore::evaluate_view_topic`).
+pub fn AuthGenTracker::set_default_workspace_resolver(
+  self : AuthGenTracker,
+  resolver : () -> String,
+) -> Unit {
+  self.default_workspace_resolver = Some(resolver)
+}
+
+fn is_default_workspace_scoped_topic(name : String) -> Bool {
+  name == "chats" || name == "chat" || name == "chatRow" || name == "chatJobs" ||
+  name == "stations" || name == "profiles" || name == "profilesOverview" ||
+  name == "models" || name == "settings" || name == "stationUpdates" ||
+  name == "archive" || name == "fleet" || name == "usage" || name == "agentRates" ||
+  name == "railCard" || name == "longJobs" || name == "search" || name == "chatSearch" ||
+  name == "workspace" || name == "lock" || name == "vaults" || name == "vaultItems" ||
+  name == "vaultUses" || name == "vaultSecrets" || name == "vaultApprovals" ||
+  name == "draft"
+}
+
+fn AuthGenTracker::resolve_topic_workspace(
+  self : AuthGenTracker,
+  topic : protocol::Topic,
+) -> Option[String] {
+  match topic.param("workspace") {
+    Some(base_codec::Json::Str(w)) => if w.length() > 0 { return Some(w) }
+    _ => ()
+  }
+  match topic.param("scope") {
+    Some(base_codec::Json::Str(s)) => if s.length() > 0 { return Some(s) }
+    _ => ()
+  }
+  if topic.name == "composer" {
+    match topic.param("key") {
+      Some(base_codec::Json::Str(k)) => {
+        if k.starts_with("new:") {
+          let ws = k.slice(4, k.length())
+          if ws.length() > 0 {
+            return Some(ws)
+          }
+        } else {
+          match draft_at_key(k) {
+            Some((st, _)) => {
+              match st.index_of("/") {
+                idx if idx > 0 => return Some(st.slice(0, idx))
+                _ => match self.station_ws_resolver {
+                  Some(resolve) => {
+                    let ws = resolve(st)
+                    if ws.length() > 0 { return Some(ws) }
+                  }
+                  None => ()
+                }
+              }
+            }
+            None => ()
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  match topic.param("station") {
+    Some(base_codec::Json::Str(st)) =>
+    if st.length() > 0 {
+      match st.index_of("/") {
+        idx if idx > 0 => return Some(st.slice(0, idx))
+        _ =>
+        match self.station_ws_resolver {
+          Some(resolve) => {
+            let ws = resolve(st)
+            if ws.length() > 0 { return Some(ws) } else { return Some(st) }
+          }
+          None => return Some(st)
+        }
+      }
+    }
+    _ => ()
+  }
+  if is_default_workspace_scoped_topic(topic.name) {
+    match self.default_workspace_resolver {
+      Some(get_def) => {
+        let def_ws = get_def()
+        if def_ws.length() > 0 {
+          return Some(def_ws)
+        }
+      }
+      None => ()
+    }
+  }
+  None
 }
 
 /// Construct an `AuthGenTracker` whose `conn_seq` is durably read from and incremented in
@@ -261,6 +367,18 @@ pub fn AuthGenTracker::bump_workspace(self : AuthGenTracker, ws : String) -> Int
   next
 }
 
+/// Advance `aggregateAuthGen` directly for cross-workspace aggregate topics.
+pub fn AuthGenTracker::bump_aggregate(self : AuthGenTracker) -> Int {
+  let next = self.aggregate_auth_gen() + 1
+  self.aggregate_auth_gen = next
+  next
+}
+
+/// Advance `vaultGen` for all vaults of workspace `ws`.
+pub fn AuthGenTracker::bump_vault_workspace(self : AuthGenTracker, ws : String) -> Int {
+  self.bump_vault(ws)
+}
+
 /// Advance `vaultGen` for one vault (`ws/vault_id`) or all vaults of `ws` without bumping
 /// non-vault workspace `authGen`. Single-vault bump advances `ws/vault_id` and `vaults` aggregate
 /// `ws` WITHOUT touching sibling vaults (`ws/v2`) (`client/core-ts/src/auth-gen.ts:539-554`).
@@ -306,9 +424,12 @@ pub fn AuthGenTracker::bump_vault(
 
 /// Atomically advance BOTH `authGen(ws)` and `vaultGen(ws)` in a single boundary notification
 /// (used on member/device lock security-boundary transitions).
+/// Pass `emit=false` when advancing internal generations during staged DB installation before
+/// the final `bump_all()` publishes the authoritative boundary.
 pub fn AuthGenTracker::bump_workspace_and_vault(
   self : AuthGenTracker,
   ws : String,
+  emit : Bool = true,
 ) -> (Int, Int) {
   let next_ag = self.workspace_auth_gen(ws) + 1
   self.ws_gens.set(ws, next_ag)
@@ -334,7 +455,9 @@ pub fn AuthGenTracker::bump_workspace_and_vault(
       self.vault_item_gens.set(vks[i], next_vg)
     }
   }
-  self.notify(AuthBoundaryEvent::WorkspaceAndVault(ws, next_ag, next_vg))
+  if emit {
+    self.notify(AuthBoundaryEvent::WorkspaceAndVault(ws, next_ag, next_vg))
+  }
   (next_ag, next_vg)
 }
 
@@ -433,7 +556,7 @@ pub fn AuthGenTracker::auth_gen_of(self : AuthGenTracker, topic : protocol::Topi
   if is_aggregate_topic(topic.name) {
     return self.aggregate_auth_gen()
   }
-  match protocol::topic_workspace(topic) {
+  match self.resolve_topic_workspace(topic) {
     Some(ws) =>
     if ws == "all" || ws == "*" {
       self.global_gen
@@ -449,7 +572,7 @@ pub fn AuthGenTracker::vault_gen_of(self : AuthGenTracker, topic : protocol::Top
   if !is_vault_topic(topic.name) {
     return 0
   }
-  match (protocol::topic_workspace(topic), protocol::topic_vault_id(topic)) {
+  match (self.resolve_topic_workspace(topic), protocol::topic_vault_id(topic)) {
     (Some(ws), Some(vid)) => self.vault_gen(ws, vid)
     (Some(ws), None) => self.vault_workspace_gen(ws)
     _ => self.vault_global_gen
@@ -503,7 +626,7 @@ pub fn AuthGenTracker::matches_topic(
       if is_aggregate_topic(topic.name) {
         return true
       }
-      match protocol::topic_workspace(topic) {
+      match self.resolve_topic_workspace(topic) {
         Some(tws) => tws == ws
         None => false
       }
@@ -512,7 +635,7 @@ pub fn AuthGenTracker::matches_topic(
       if !is_vault_topic(topic.name) {
         return false
       }
-      match protocol::topic_workspace(topic) {
+      match self.resolve_topic_workspace(topic) {
         Some(tws) => tws == ws
         None => false
       }
@@ -521,7 +644,7 @@ pub fn AuthGenTracker::matches_topic(
       if !is_vault_topic(topic.name) {
         return false
       }
-      match protocol::topic_workspace(topic) {
+      match self.resolve_topic_workspace(topic) {
         Some(tws) =>
         if tws != ws {
           false

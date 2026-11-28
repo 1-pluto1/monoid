@@ -1,0 +1,2492 @@
+// Comprehensive Slice 2B-1 unit & adversarial tests covering all 5 First-Class Invariants:
+// 1. Account-owned SQLite DB lifecycle (`unauthenticated` isolation, immutable `db_account_sub`,
+//    atomic `switch_account_db`, and last-account 401 logout).
+// 2. Non-reentrant serialized membership commit boundary (`in_commit_guard`, single-tx DDL + meta,
+//    barrier-controlled async host purge mirror coalescing & non-reentry, `op_gen <= completed_purge_gen`).
+// 3. Merged effective `account_doc("me")` on out-of-order `/v1/me` vs `/v1/workspaces`, strict 26-char ULID,
+//    `CloudSync` `session_gen` fence + dynamic WS token + `/v1/me` reconcile on connect/reconnect/403/404,
+//    role change bumping `authGen` & `cred_epoch` without any confirmation latch.
+// 4. TS `accounts.ts` exact epoch-second `access_expires`, 26-char ULID `request_id`, and
+//    `AccountRefreshCoordinator` pre-request `#adoptStored` + 200/401 bidirectional disk CAS.
+// 5. Strict `ws/st` addressing, permanent multi-owner bare station quarantine (`__quarantined_bare__`),
+//    `moved` source-only cleanup, and unified O(1) read gate across all views, aggregates, and direct RPCs.
+
+import "base_codec"
+import "effect"
+import "protocol"
+import "shell"
+import "sql"
+import "store"
+import "views"
+import "wire"
+
+let ULID_WS1 : String = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+let ULID_WS2 : String = "01ARZ3NDEKTSV4RRFFQ69G5FBW"
+let ULID_WS3 : String = "01ARZ3NDEKTSV4RRFFQ69G5FCX"
+
+fn mt_call(core : ClientCore, id : Int64, name : String, params : base_codec::Json) -> protocol::CoreEvent {
+  match core.handle_request(protocol::CoreRequest::Call(id, name, params, None)) {
+    Some(ev) => ev
+    None => panic("expected CoreEvent for call " + name)
+  }
+}
+
+fn make_sim_db(rt : effect::Runtime) -> (SimAccountDb, sql::Sql) {
+  let sim = SimAccountDb::new(rt)
+  let db = match sql::Sql::open(sim.sh, "acct-sim") {
+    sql::SqlResult::Ok(d) => d
+    sql::SqlResult::Err(e) => panic("sql open failed: " + e.to_string())
+  }
+  (sim, db)
+}
+
+fn mt_put_workspace(db : sql::Sql, wid : String, raw : String) -> Unit {
+  let _ = db.run(sql_workspace_put(), params=[
+    base_codec::json_str(wid),
+    base_codec::json_str(raw),
+    base_codec::json_int64(1000L),
+  ])
+}
+
+fn mt_opt_str_is(o : Option[String], expected : String) -> Bool {
+  match o {
+    Some(s) => s == expected
+    None => false
+  }
+}
+
+fn mt_opt_i64_is(o : Option[Int64], expected : Int64) -> Bool {
+  match o {
+    Some(v) => v == expected
+    None => false
+  }
+}
+
+fn mt_sub(core : ClientCore, id : Int64, name : String, params : Array[(String, base_codec::Json)]) -> protocol::CoreEvent {
+  let topic = protocol::Topic::{ name: name, params: params }
+  match core.handle_request(protocol::CoreRequest::Subscribe(id, topic, true, None, None)) {
+    Some(ev) => ev
+    None => panic("expected CoreEvent for subscribe " + name)
+  }
+}
+
+fn mt_expect_err_code(ev : protocol::CoreEvent, expected : String, label : String) -> Unit {
+  match ev {
+    protocol::CoreEvent::Err(_, err) => {
+      debug_assert(err.code == expected, label + ": expected err code " + expected + ", got " + err.code + " (" + err.message + ")")
+    }
+    _ => panic(label + ": expected CoreEvent::Err(" + expected + ")")
+  }
+}
+
+fn mt_expect_ok_json(ev : protocol::CoreEvent, label : String) -> base_codec::Json {
+  match ev {
+    protocol::CoreEvent::Ok(_, j, _) => j
+    protocol::CoreEvent::Err(_, err) => panic(label + ": unexpected Err(" + err.code + ": " + err.message + ")")
+    _ => panic(label + ": expected CoreEvent::Ok")
+  }
+}
+
+fn mt_expect_val_json(ev : protocol::CoreEvent, label : String) -> base_codec::Json {
+  match ev {
+    protocol::CoreEvent::Value(_, j, _) => j
+    protocol::CoreEvent::Waiting(_) => panic(label + ": unexpected Waiting")
+    protocol::CoreEvent::Err(_, err) => panic(label + ": unexpected Err(" + err.code + ": " + err.message + ")")
+    _ => panic(label + ": expected CoreEvent::Value")
+  }
+}
+
+fn mt_is_waiting(ev : protocol::CoreEvent) -> Bool {
+  match ev {
+    protocol::CoreEvent::Waiting(_) => true
+    _ => false
+  }
+}
+
+fn mt_make_me(sub : String, email : String, workspaces : Array[(String, String, String)]) -> CloudMe {
+  let refs : Array[CloudWorkspaceRef] = []
+  let raw_ws : Array[base_codec::Json] = []
+  for i in 0..<workspaces.length() {
+    let (wid, wname, wrole) = workspaces[i]
+    refs.push(CloudWorkspaceRef::{ id: wid, name: wname, role: wrole })
+    raw_ws.push(base_codec::json_obj([
+      ("id", base_codec::json_str(wid)),
+      ("name", base_codec::json_str(wname)),
+      ("role", base_codec::json_str(wrole)),
+      ("created_at", base_codec::json_int64(1700000000L)),
+      ("stations", base_codec::json_int(1)),
+      ("members", base_codec::json_int(1)),
+    ]))
+  }
+  let raw = base_codec::json_obj([
+    ("user", base_codec::json_obj([
+      ("sub", base_codec::json_str(sub)),
+      ("email", base_codec::json_str(email)),
+      ("name", base_codec::json_str("User")),
+    ])),
+    ("workspaces", base_codec::json_arr(raw_ws)),
+    ("relay_urls", base_codec::json_arr([])),
+  ])
+  CloudMe::{
+    sub: sub,
+    email: email,
+    name: "User",
+    workspaces: refs,
+    relays: [],
+    raw: raw,
+  }
+}
+
+fn mt_make_ws(wid : String, wname : String, role : String, station_ids : Array[String], sub : String = "u-alice") -> CloudWorkspace {
+  let sts : Array[CloudStation] = []
+  let raw_sts : Array[base_codec::Json] = []
+  for i in 0..<station_ids.length() {
+    let sid = station_ids[i]
+    sts.push(CloudStation::{
+      id: sid,
+      name: "Station " + sid,
+      online: true,
+      url: None,
+      endpoint_id: None,
+      relay: None,
+      ips: [],
+      mode: None,
+      emoji: None,
+      icon: None,
+      version: None,
+      joined: true,
+    })
+    raw_sts.push(base_codec::json_obj([
+      ("id", base_codec::json_str(sid)),
+      ("name", base_codec::json_str("Station " + sid)),
+      ("online", base_codec::json_bool(true)),
+    ]))
+  }
+  let raw = base_codec::json_obj([
+    ("id", base_codec::json_str(wid)),
+    ("name", base_codec::json_str(wname)),
+    ("role", base_codec::json_str(role)),
+    ("rev", base_codec::json_int(1)),
+    ("created_at", base_codec::json_int64(1700000000L)),
+    ("members", base_codec::json_arr([
+      base_codec::json_obj([
+        ("sub", base_codec::json_str(sub)),
+        ("email", base_codec::json_str("alice@still.fail")),
+        ("role", base_codec::json_str(role)),
+      ]),
+    ])),
+    ("stations", base_codec::json_arr(raw_sts)),
+  ])
+  CloudWorkspace::{
+    id: wid,
+    name: wname,
+    rev: 1,
+    members: [CloudMember::{ sub: sub, email: "alice@still.fail", role: role }],
+    stations: sts,
+    raw: raw,
+  }
+}
+
+// ── Test 1: Invariant 1 — Account-owned DB lifecycle, unauthenticated isolation, atomic switch_account_db ──
+
+test "Slice 2B-1 Invariant 1: unauthenticated isolation, atomic switch_account_db, immutable db_account_sub, and logout" {
+  let rt = effect::Runtime::new()
+  let (_, unauth_db) = make_sim_db(rt)
+  // Even if something tried to plant data in the unauth DB, `unauthenticated=true` MUST leak 0 rows!
+  let _ = store::put_account_doc(unauth_db, "me", base_codec::json_stringify(mt_make_me("u-ghost", "ghost@still.fail", [(ULID_WS1, "Ghost WS", "owner")]).raw))
+  mt_put_workspace(unauth_db, ULID_WS1, "{\"id\":\"" + ULID_WS1 + "\",\"name\":\"Ghost WS\"}")
+  let core = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, unauth_db, core_offline_transport(), fn() -> Unit {})
+  core.membership.set_unauthenticated(true)
+
+  // All account/workspace projections & RPCs MUST return empty / null / unauthenticated!
+  let doc_me = mt_expect_ok_json(mt_call(core, 1L, "account.doc", base_codec::json_obj([("name", base_codec::json_str("me"))])), "unauth account.doc(me)")
+  match doc_me {
+    base_codec::Json::Null => ()
+    _ => panic("unauthenticated account.doc(me) must be null")
+  }
+  let ws_list = mt_expect_ok_json(mt_call(core, 2L, "workspaces.list", base_codec::json_obj([])), "unauth workspaces.list")
+  match base_codec::json_get(ws_list, "workspaces") {
+    Some(base_codec::Json::Arr(xs)) => debug_assert(xs.length() == 0, "unauth workspaces.list empty")
+    _ => panic("expected workspaces array")
+  }
+  let ws_sub = mt_expect_val_json(mt_sub(core, 3L, "workspaces", []), "unauth workspaces sub")
+  match ws_sub {
+    base_codec::Json::Arr(xs) => debug_assert(xs.length() == 0, "unauth workspaces topic empty")
+    _ => panic("expected empty array")
+  }
+  mt_expect_err_code(mt_call(core, 4L, "workspace.get", base_codec::json_obj([("workspace", base_codec::json_str(ULID_WS1))])), "unauthenticated", "unauth workspace.get")
+  mt_expect_err_code(mt_call(core, 5L, "chat.open", base_codec::json_obj([("station", base_codec::json_str(ULID_WS1 + "/st-1")), ("thread", base_codec::json_int(1))])), "unauthenticated", "unauth chat.open")
+  mt_expect_err_code(mt_call(core, 6L, "draft.put", base_codec::json_obj([("key", base_codec::json_str("new:" + ULID_WS1)), ("value", base_codec::json_obj([("text", base_codec::json_str("hi"))]))])), "unauthenticated", "unauth draft.put")
+  mt_expect_err_code(mt_call(core, 7L, "vault.secrets", base_codec::json_obj([])), "unauthenticated", "unauth vault.secrets")
+  mt_expect_err_code(mt_call(core, 8L, "chat.send", base_codec::json_obj([("station", base_codec::json_str(ULID_WS1 + "/st-1")), ("thread", base_codec::json_int(1)), ("text", base_codec::json_str("no"))])), "unauthenticated", "unauth chat.send")
+  match core.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner")]), req_seq=1L) {
+    Err(m) => debug_assert(m == "unauthenticated", "unauth commit_cloud_me refused")
+    _ => panic("unauth commit_cloud_me must fail")
+  }
+  // Unscoped smoke settings on ephemeral unauth DB remain allowed; explicit workspace scope is blocked.
+  let _ = mt_expect_ok_json(mt_call(core, 9L, "settings.set", base_codec::json_obj([("key", base_codec::json_str("smoke.theme")), ("value", base_codec::json_str("dark"))])), "unauth unscoped settings.set")
+  mt_expect_err_code(mt_call(core, 10L, "settings.get", base_codec::json_obj([("workspace", base_codec::json_str(ULID_WS1)), ("key", base_codec::json_str("theme"))])), "unauthenticated", "unauth scoped settings.get")
+
+  // Prepare Alice's dedicated account DB with persisted workspace + pending purge for ULID_WS2!
+  let (alice_sim, alice_db) = make_sim_db(rt)
+  mt_put_workspace(alice_db, ULID_WS1, "{\"id\":\"" + ULID_WS1 + "\",\"name\":\"Alice WS1\",\"role\":\"owner\",\"stations\":[{\"id\":\"st-1\",\"name\":\"St1\",\"online\":true}]}")
+  mt_put_workspace(alice_db, ULID_WS2, "{\"id\":\"" + ULID_WS2 + "\",\"name\":\"Alice Stale WS2\",\"role\":\"member\",\"stations\":[{\"id\":\"st-2\",\"name\":\"St2\",\"online\":true}]}")
+  let host_purges = base_codec::json_obj([
+    (ULID_WS2, base_codec::json_obj([
+      ("op_gen", base_codec::json_int64(3L)),
+      ("stations", base_codec::json_arr([base_codec::json_str(ULID_WS2 + "/st-2")])),
+    ])),
+  ])
+
+  // Atomically switch ALL DB holders from unauthenticated DB to Alice's DB!
+  match core.switch_account_db(alice_db, "u-alice", host_purges_doc=Some(host_purges), host_purges_shared=false) {
+    Ok(_) => ()
+    Err(e) => panic("switch_account_db failed: " + e)
+  }
+  debug_assert(core.membership.is_unauthenticated() == false, "authenticated after switch_account_db")
+  debug_assert(mt_opt_str_is(core.db_account_sub, "u-alice"), "bound to u-alice")
+  // Pending purge for ULID_WS2 MUST have been executed during switch_account_db!
+  debug_assert(alice_sim.workspaces.get(ULID_WS2).is_none(), "pending purge WS2 deleted from Alice DB")
+  debug_assert(alice_sim.workspaces.get(ULID_WS1).is_some(), "WS1 preserved in Alice DB")
+  debug_assert(mt_opt_i64_is(core.membership.completed_purge_gen_of(ULID_WS2), 4L), "completed_purge_gen recorded for WS2")
+
+  // Writing a draft now lands in Alice's DB, NEVER in `unauth_db`!
+  let _ = mt_expect_ok_json(
+    mt_call(core, 11L, "draft.put", base_codec::json_obj([
+      ("key", base_codec::json_str("new:" + ULID_WS1)),
+      ("value", base_codec::json_obj([("text", base_codec::json_str("alice private draft"))])),
+    ])),
+    "alice draft.put",
+  )
+  debug_assert(alice_sim.drafts.get(ULID_WS1 + ":new").is_some(), "draft landed in Alice DB")
+
+  // Cross-account switch MUST be rejected with `account_sub_mismatch` and 0 side effects!
+  let (_, bob_db) = make_sim_db(rt)
+  match core.switch_account_db(bob_db, "u-bob") {
+    Err(m) => debug_assert(m.starts_with("account_sub_mismatch"), "cross-account switch_account_db refused")
+    Ok(_) => panic("cross-account switch_account_db must fail")
+  }
+  match core.commit_cloud_me(mt_make_me("u-bob", "bob@still.fail", [(ULID_WS3, "Bob WS", "owner")]), req_seq=2L) {
+    Err(m) => debug_assert(m.starts_with("account_sub_mismatch"), "cross-account commit_cloud_me refused")
+    _ => panic("cross-account commit_cloud_me must fail")
+  }
+  debug_assert(mt_opt_str_is(core.db_account_sub, "u-alice"), "still bound to u-alice")
+
+  // Register Alice then simulate permanent 401 refresh removing the last account:
+  core.auth_store.register_account(views::StoredAccount::{
+    sub: "u-alice",
+    email: "alice@still.fail",
+    name: "Alice",
+    picture: "",
+    access: "acc-1",
+    refresh: "ref-1",
+    access_expires: 1900000000L,
+  })
+  core.account_sessions.set("u-alice", "sess-1")
+  let invalidated = core.invalidate_session("u-alice", expected_session=Some("sess-1"), expected_refresh=Some("ref-1"))
+  debug_assert(invalidated, "last account invalidated")
+  debug_assert(core.membership.is_session_invalidated() && core.membership.is_unauthenticated(), "marked invalidated + unauthenticated")
+  debug_assert(!core.can_read_workspace(ULID_WS1), "WS1 unreadable after logout")
+}
+
+// ── Test 2: Invariant 2 — Non-reentrant commit guard + adversarial barrier async host mirror ──
+
+test "Slice 2B-1 Invariant 2: non-reentrant commit guard, barrier-paused async host mirror, coalescing, and stale op_gen discard" {
+  let rt = effect::Runtime::new()
+  let (sim, db) = make_sim_db(rt)
+  let core = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, db, core_offline_transport(), fn() -> Unit {})
+  let _ = core.set_db_account_sub("u-alice")
+  let _ = core.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner"), (ULID_WS2, "W2", "owner")]), req_seq=1L)
+  let _ = core.commit_cloud_workspace(mt_make_ws(ULID_WS1, "W1", "owner", ["st-1"]), req_seq=2L)
+  let _ = core.commit_cloud_workspace(mt_make_ws(ULID_WS2, "W2", "owner", ["st-2"]), req_seq=3L)
+
+  // 1. Direct re-entrancy inside commit guard MUST be rejected with `reentrant_membership_commit`!
+  match core.membership.enter_commit_guard() {
+    Ok(_) => ()
+    Err(e) => panic("enter_commit_guard: " + e)
+  }
+  match core.drop_workspace(ULID_WS2) {
+    Err(m) => debug_assert(m == "reentrant_membership_commit", "reentrant drop_workspace blocked")
+    Ok(_) => panic("reentrant drop_workspace must be blocked")
+  }
+  match core.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner")]), req_seq=4L) {
+    Err(m) => debug_assert(m == "reentrant_membership_commit", "reentrant commit_cloud_me blocked")
+    _ => panic("reentrant commit_cloud_me must be blocked")
+  }
+  core.membership.leave_commit_guard()
+
+  // 2. Adversarial barrier-controlled async host mirror test:
+  //    Pause the async host mirror write triggered by dropping WS2; while that host write is STILL IN FLIGHT,
+  //    commit a newer rejoin of WS2 + new workspace data; then release the barrier!
+  //    Verify:
+  //    - `commit_cloud_me` (drop WS2) completed synchronously without blocking on the host mirror.
+  //    - While barrier is held, rejoin of WS2 commits cleanly (0 re-entry, 0 clobber of new `account_doc("me")`).
+  //    - Releasing the barrier triggers the single coalesced follow-up write carrying the latest snapshot!
+  let pending_host_writes : Array[(String, base_codec::Json, (Result[Unit, String]) -> Unit)] = []
+  let completed_host_writes : Array[(String, base_codec::Json)] = []
+  core.membership.set_host_pending_purges_async_writer(fn(
+    key : String,
+    doc : base_codec::Json,
+    done : (Result[Unit, String]) -> Unit,
+  ) -> Unit {
+    // Assert we are NEVER invoked while inside `in_commit_guard`!
+    debug_assert(!core.membership.is_in_commit_guard(), "async host writer MUST NEVER run inside commit guard")
+    pending_host_writes.push((key, doc, done))
+  })
+
+  // Step A: Drop WS2 via `/v1/me` (seq=5). SQLite commits immediately; host write #1 is paused at barrier!
+  match core.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner")]), req_seq=5L) {
+    Ok(true) => ()
+    _ => panic("drop WS2 via commit_cloud_me failed")
+  }
+  debug_assert(sim.workspaces.get(ULID_WS2).is_none(), "WS2 dropped in SQLite immediately")
+  debug_assert(pending_host_writes.length() == 1, "exactly 1 in-flight async host mirror write queued")
+  debug_assert(pending_host_writes[0].0 == "device/pending_purges/u-alice", "per-account host mirror key")
+
+  // Step B: While host write #1 is STILL blocked at the barrier, rejoin WS2 at seq=6 AND write new WS2 detail at seq=7!
+  match core.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner"), (ULID_WS2, "W2 Rejoined", "admin")]), req_seq=6L) {
+    Ok(true) => ()
+    _ => panic("rejoin WS2 while host write paused failed")
+  }
+  match core.commit_cloud_workspace(mt_make_ws(ULID_WS2, "W2 Rejoined", "admin", ["st-2-new"]), req_seq=7L) {
+    Ok(true) => ()
+    _ => panic("commit rejoined WS2 detail failed")
+  }
+  // Because host write #1 is still in flight, single-in-flight queue MUST coalesce (still 1 in-flight, not 2 concurrent!).
+  debug_assert(pending_host_writes.length() == 1, "single-in-flight coalesced while write #1 paused")
+
+  // Step C: Release barrier on write #1 -> coalesced write #2 fires automatically -> release write #2!
+  let (k1, d1, done1) = pending_host_writes[0]
+  completed_host_writes.push((k1, d1))
+  done1(Ok(()))
+  debug_assert(pending_host_writes.length() == 2, "coalesced follow-up mirror write enqueued after write #1 completed")
+  let (k2, d2, done2) = pending_host_writes[1]
+  completed_host_writes.push((k2, d2))
+  done2(Ok(()))
+
+  // Verify rejoined WS2 data and new `account_doc("me")` are 100% intact (0 wipe, 0 old `me` overwrite)!
+  debug_assert(core.can_read_workspace(ULID_WS2), "rejoined WS2 remains readable")
+  debug_assert(sim.workspaces.get(ULID_WS2).is_some(), "rejoined WS2 row intact")
+  let me_after = match store::get_account_doc(db, "me") {
+    sql::SqlResult::Ok(Some(raw)) => raw
+    _ => ""
+  }
+  debug_assert(me_after.contains("W2 Rejoined"), "account_doc(me) has rejoined W2")
+
+  // Step D: Simulate restart with STALE host mirror (`op_gen <= completed_purge_gen[WS2]`) AND
+  // strict shared-key parsing (flat `{ws: ...}` on shared `device/pending_purges` MUST be ignored!).
+  let comp_g = match core.membership.completed_purge_gen_of(ULID_WS2) { Some(g) => g; None => 0L }
+  debug_assert(comp_g >= 1L, "completed_purge_gen persisted for rejoined WS2")
+  let auth2 = MembershipAuthority::new()
+  let stale_host_doc = base_codec::json_obj([
+    (ULID_WS2, base_codec::json_obj([
+      ("op_gen", base_codec::json_int64(comp_g)),
+      ("stations", base_codec::json_arr([base_codec::json_str(ULID_WS2 + "/st-2")])),
+    ])),
+  ])
+  match auth2.bind_account_sub("u-alice", db=Some(db), host_purges_doc=Some(stale_host_doc), host_purges_shared=false) {
+    Ok(_) => ()
+    Err(e) => panic("auth2 bind failed: " + e)
+  }
+  debug_assert(!auth2.has_pending_purge(ULID_WS2), "stale host mirror with op_gen <= completed_purge_gen MUST be discarded")
+  debug_assert(auth2.is_workspace_readable(ULID_WS2), "rejoined WS2 MUST remain readable on restart")
+
+  // Legacy shared storage MUST reject flat `{ws: ...}` shape and ONLY accept `doc[account_sub]`!
+  let auth3 = MembershipAuthority::new()
+  let flat_shared_doc = base_codec::json_obj([
+    (ULID_WS1, base_codec::json_obj([
+      ("op_gen", base_codec::json_int64(99L)),
+      ("stations", base_codec::json_arr([base_codec::json_str(ULID_WS1 + "/st-1")])),
+    ])),
+  ])
+  let _ = auth3.bind_account_sub("u-alice", db=Some(db), host_purges_doc=Some(flat_shared_doc), host_purges_shared=true)
+  debug_assert(!auth3.has_pending_purge(ULID_WS1), "shared storage MUST NOT parse flat {ws:...} shape")
+
+  // Step E: Session invalidation while host write is in-flight cancels queued mirror follow-up!
+  let pending_inval : Array[(Result[Unit, String]) -> Unit] = []
+  core.membership.set_host_pending_purges_async_writer(fn(_k : String, _d : base_codec::Json, done : (Result[Unit, String]) -> Unit) -> Unit {
+    pending_inval.push(done)
+  })
+  let _ = core.drop_workspace(ULID_WS2)
+  debug_assert(pending_inval.length() == 1, "host write started for drop")
+  core.membership.enqueue_host_pending_purges_sync()
+  core.membership.mark_session_invalidated()
+  pending_inval[0](Ok(()))
+  debug_assert(pending_inval.length() == 1, "stale follow-up mirror write cancelled after session_gen bump")
+}
+
+// ── Test 3: Invariant 3 — Merged effective `account_doc("me")`, strict ULID, CloudSync session_gen & role change ──
+
+test "Slice 2B-1 Invariant 3: merged effective account_doc(me) on out-of-order seq, strict ULID, dynamic WS & role cred_epoch" {
+  let rt = effect::Runtime::new()
+  let (sim, db) = make_sim_db(rt)
+  let core = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, db, core_offline_transport(), fn() -> Unit {})
+  let _ = core.set_db_account_sub("u-alice")
+  let cred_refreshes : Array[String] = []
+  core.set_on_credential_refresh(fn(ws : String) -> Unit { cred_refreshes.push(ws) })
+
+  // Initial commit at seq=1: WS1 (owner) + WS2 (owner).
+  let _ = core.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner"), (ULID_WS2, "W2 Old", "owner")]), req_seq=1L)
+  let _ = core.commit_cloud_workspace(mt_make_ws(ULID_WS1, "W1", "owner", ["st-1"]), req_seq=2L)
+  let _ = core.commit_cloud_workspace(mt_make_ws(ULID_WS2, "W2 Old", "owner", ["st-2"]), req_seq=3L)
+
+  // Newer `/v1/workspaces/WS2` commits at seq=11 (role changed to member, name updated to "W2 Fresh", 2 stations)
+  // AND `/v1/workspaces/WS3` commits at seq=12 (brand-new workspace WS3 not yet in older `/v1/me`!).
+  let ep_before = core.membership.cred_epoch_of(ULID_WS2)
+  let gen_before = core.auth.workspace_auth_gen(ULID_WS2)
+  match core.commit_cloud_workspace(mt_make_ws(ULID_WS2, "W2 Fresh", "member", ["st-2", "st-2b"]), req_seq=11L) {
+    Ok(true) => ()
+    _ => panic("commit WS2 seq=11 failed")
+  }
+  // Role change (owner -> member) in Slice 2B-1 bumps `authGen` & `cred_epoch` and triggers `fresh=true` cred refresh,
+  // while keeping WS2 immediately readable without any confirmation latch.
+  debug_assert(mt_opt_str_is(core.membership.role_of(ULID_WS2), "member"), "WS2 role updated to member")
+  debug_assert(core.membership.cred_epoch_of(ULID_WS2) == ep_before + 1L, "cred_epoch bumped on role change")
+  debug_assert(core.auth.workspace_auth_gen(ULID_WS2) == gen_before + 1, "authGen bumped on role change")
+  debug_assert(cred_refreshes.length() == 1 && cred_refreshes[0] == ULID_WS2, "fresh=true cred refresh fired")
+  debug_assert(core.can_read_workspace(ULID_WS2), "WS2 remains readable without Slice 2B-2 confirmation latch")
+
+  match core.commit_cloud_workspace(mt_make_ws(ULID_WS3, "W3 Brand New", "admin", ["st-3"]), req_seq=12L) {
+    Ok(true) => ()
+    _ => panic("commit WS3 seq=12 failed")
+  }
+
+  // Now older `/v1/me` at seq=10 arrives: removes WS1, has STALE WS2 ("W2 Old", role="owner"), and omits WS3!
+  match core.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS2, "W2 Old", "owner")]), req_seq=10L) {
+    Ok(true) => ()
+    _ => panic("commit_cloud_me seq=10 failed")
+  }
+  // 1. WS1 (ws_commit_seq=2 < 10) MUST be dropped!
+  debug_assert(!core.can_read_workspace(ULID_WS1) && sim.workspaces.get(ULID_WS1).is_none(), "WS1 dropped by /v1/me seq=10")
+  // 2. WS2 (ws_commit_seq=11 >= 10) MUST keep newer role="member", name="W2 Fresh", stations=2 in BOTH workspace table AND merged `account_doc("me")`!
+  debug_assert(mt_opt_str_is(core.membership.role_of(ULID_WS2), "member"), "WS2 role not regressed to owner")
+  // 3. WS3 (ws_commit_seq=12 >= 10) MUST survive AND appear in merged `account_doc("me")`!
+  debug_assert(core.can_read_workspace(ULID_WS3) && sim.workspaces.get(ULID_WS3).is_some(), "WS3 survived older /v1/me")
+
+  let me_doc = mt_expect_ok_json(mt_call(core, 20L, "account.doc", base_codec::json_obj([("name", base_codec::json_str("me"))])), "merged account.doc(me)")
+  match base_codec::json_get(me_doc, "workspaces") {
+    Some(base_codec::Json::Arr(xs)) => {
+      debug_assert(xs.length() == 2, "merged me has WS2 + surviving WS3 (and NOT dropped WS1)")
+      let mut saw_ws2_fresh = false
+      let mut saw_ws3 = false
+      for i in 0..<xs.length() {
+        let wid = j_str(xs[i], "id")
+        if wid == ULID_WS2 {
+          debug_assert(j_str(xs[i], "role") == "member", "merged me WS2 role == member")
+          debug_assert(j_str(xs[i], "name") == "W2 Fresh", "merged me WS2 name == W2 Fresh")
+          debug_assert(j_int(xs[i], "stations") == 2, "merged me WS2 stations == 2")
+          saw_ws2_fresh = true
+        } else if wid == ULID_WS3 {
+          debug_assert(j_str(xs[i], "role") == "admin", "merged me WS3 role == admin")
+          debug_assert(j_str(xs[i], "name") == "W3 Brand New", "merged me WS3 name == W3 Brand New")
+          saw_ws3 = true
+        }
+      }
+      debug_assert(saw_ws2_fresh && saw_ws3, "merged account_doc(me) matches workspace table 100%")
+    }
+    _ => panic("expected workspaces array in merged me")
+  }
+
+  // Strict 26-char Crockford Base32 ULID validation:
+  match parse_cloud_me_strict(base_codec::json_obj([
+    ("user", base_codec::json_obj([("sub", base_codec::json_str("u1"))])),
+    ("workspaces", base_codec::json_arr([
+      base_codec::json_obj([
+        ("id", base_codec::json_str("ws-not-ulid")),
+        ("name", base_codec::json_str("Bad")),
+        ("role", base_codec::json_str("owner")),
+        ("created_at", base_codec::json_int(1)),
+        ("stations", base_codec::json_int(0)),
+        ("members", base_codec::json_int(1)),
+      ]),
+    ])),
+  ])) {
+    Err(_) => ()
+    Ok(_) => panic("non-ULID workspace id must be rejected")
+  }
+  match parse_cloud_workspace_strict(mt_make_ws(ULID_WS1, "W1", "owner", ["st-1"]).raw, ULID_WS2) {
+    Err(_) => ()
+    Ok(_) => panic("mismatched workspace id must be rejected")
+  }
+
+  // CloudSync `session_gen` fence + dynamic WS token + `/v1/me` reconcile on connect/reconnect/403/404:
+  let pending : Array[(Int64, String, base_codec::Json)] = []
+  let sh = shell::Shell::stood_in(
+    rt,
+    fn(id : Int64, op : String, args : base_codec::Json, _b : Option[Bytes]) -> Unit {
+      pending.push((id, op, args))
+    },
+    fn(_op : String, _args : base_codec::Json) -> shell::AskResult {
+      shell::AskResult::Ok(base_codec::json_obj([]))
+    },
+    fn(n : Int) -> Bytes { Bytes::new(n) },
+  )
+  let cs = CloudSync::new(sh, db, "https://cloud.example", token="tok-initial", bound_sub="u-alice", bound_session="s1")
+  let mut me_commits = 0
+  let mut ws_commits = 0
+  let mut unauth_hits = 0
+  cs.set_commit_hooks(
+    on_me_fetched=Some(fn(_m : CloudMe, _seq : Int64) -> Unit { me_commits += 1 }),
+    on_workspace_fetched=Some(fn(_w : CloudWorkspace, _seq : Int64) -> Unit { ws_commits += 1 }),
+    on_unauthorized_err=Some(fn(_e : CloudHttpError) -> Unit { unauth_hits += 1 }),
+  )
+  cs.start_events_ws(fn(_ev : CloudEvent) -> Unit {})
+  let _ = rt.run_ready()
+  debug_assert(pending.length() == 1 && pending[0].1 == "ws.open", "WS opened")
+  debug_assert(base_codec::json_stringify(pending[0].2).contains("stillfail-token.tok-initial"), "initial WS uses tok-initial")
+
+  // Answer WS open -> triggers initial `/v1/me` reconcile AND starts ws.next!
+  sh.answer(pending[0].0, base_codec::json_obj([("id", base_codec::json_int(1))]))
+  let _ = rt.run_ready()
+  let mut me_req_id = 0L
+  let mut ws_next_id = 0L
+  for i in 1..<pending.length() {
+    if pending[i].1 == "fetch" && j_str(pending[i].2, "url").contains("/v1/me") {
+      me_req_id = pending[i].0
+    } else if pending[i].1 == "ws.next" {
+      ws_next_id = pending[i].0
+    }
+  }
+  debug_assert(me_req_id > 0L && ws_next_id > 0L, "initial WS connect triggers /v1/me reconcile + ws.next")
+
+  // Push WorkspaceChanged event -> fetch `/v1/workspaces/ULID_WS2` -> 403 MUST trigger `/v1/me` reconcile (NOT drop)!
+  sh.answer(ws_next_id, base_codec::json_obj([
+    ("text", base_codec::json_str("{\"type\":\"workspace\",\"id\":\"" + ULID_WS2 + "\"}")),
+  ]))
+  let _ = rt.run_ready()
+  let mut ws_fetch_id = 0L
+  for i in 0..<pending.length() {
+    if pending[i].1 == "fetch" && j_str(pending[i].2, "url").contains("/v1/workspaces/" + ULID_WS2) {
+      ws_fetch_id = pending[i].0
+    }
+  }
+  debug_assert(ws_fetch_id > 0L, "WorkspaceChanged fetched workspace")
+  let fetches_before_403 = pending.length()
+  sh.answer(
+    ws_fetch_id,
+    base_codec::json_obj([("status", base_codec::json_int(403)), ("headers", base_codec::json_arr([])), ("redirected", base_codec::json_bool(false))]),
+    bytes=Some("{\"error\":\"forbidden\"}".to_bytes()),
+  )
+  let _ = rt.run_ready()
+  let mut saw_403_me = false
+  for i in fetches_before_403..<pending.length() {
+    if pending[i].1 == "fetch" && j_str(pending[i].2, "url").contains("/v1/me") {
+      saw_403_me = true
+    }
+  }
+  debug_assert(saw_403_me, "workspace 403 triggers /v1/me reconcile")
+
+  // Stop CloudSync (bumps `session_gen`) BEFORE answering `me_req_id`: stale callback MUST be dropped!
+  let gen_before_stop = cs.session_gen()
+  cs.stop()
+  debug_assert(cs.session_gen() == gen_before_stop + 1L, "stop() bumps session_gen immediately")
+  sh.answer(
+    me_req_id,
+    base_codec::json_obj([("status", base_codec::json_int(200)), ("headers", base_codec::json_arr([])), ("redirected", base_codec::json_bool(false))]),
+    bytes=Some(base_codec::json_stringify(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS2, "W2", "owner")]).raw).to_bytes()),
+  )
+  let _ = rt.run_ready()
+  debug_assert(me_commits == 0, "stale /v1/me callback after stop() dropped by session_gen fence")
+
+  // Rotate token dynamically and restart WS -> reconnect MUST use the new token!
+  cs.set_origin_and_token("", "tok-rotated-2")
+  let before_reopen = pending.length()
+  cs.start_events_ws(fn(_ev : CloudEvent) -> Unit {})
+  let _ = rt.run_ready()
+  debug_assert(pending.length() > before_reopen, "restarted WS opened")
+  debug_assert(base_codec::json_stringify(pending[before_reopen].2).contains("stillfail-token.tok-rotated-2"), "restarted WS reads dynamic rotated token")
+  cs.stop()
+}
+
+// ── Test 4: Invariant 4 — TS `accounts.ts` pre-request #adoptStored + 200/401 bidirectional disk CAS ──
+
+test "Slice 2B-1 Invariant 4: AccountRefreshCoordinator pre-request adoptStored, 200/401 bidirectional disk CAS, sibling isolation, and cred_epoch decoupling" {
+  let rt = effect::Runtime::new()
+  let (_, db) = make_sim_db(rt)
+  let core = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, db, core_offline_transport(), fn() -> Unit {})
+  let _ = core.set_db_account_sub("u-alice")
+  let ep0 = core.membership.cred_epoch_of(ULID_WS1)
+
+  let alice0 = views::StoredAccount::{
+    sub: "u-alice",
+    email: "alice@still.fail",
+    name: "Alice",
+    picture: "",
+    access: "acc-old",
+    refresh: "ref-1",
+    access_expires: 1700000010L,
+  }
+  let bob0 = views::StoredAccount::{
+    sub: "u-bob",
+    email: "bob@still.fail",
+    name: "Bob",
+    picture: "",
+    access: "bob-acc",
+    refresh: "bob-ref",
+    access_expires: 1700009000L,
+  }
+  let mem_accts : Array[views::StoredAccount] = [alice0, bob0]
+  let mem_sess : Map[String, String] = Map::new()
+  mem_sess.set("u-alice", "sess-a1")
+  mem_sess.set("u-bob", "sess-b1")
+
+  // Case 1: Pre-request `#adoptStored` — another core already rotated Alice's token on disk (unexpired)!
+  // Refresh MUST adopt disk tuple and return Ok with 0 HTTP calls!
+  let alice_disk_fresh = views::StoredAccount::{
+    sub: "u-alice",
+    email: "alice@still.fail",
+    name: "Alice",
+    picture: "",
+    access: "acc-adopted-fresh",
+    refresh: "ref-2-from-other-core",
+    access_expires: 1700005000L,
+  }
+  let disk_doc_ref : Array[HostStorageRead] = [
+    HostStorageRead::Found(serialize_stored_accounts([alice_disk_fresh, bob0], sessions=Some(mem_sess))),
+  ]
+  let mut http_calls = 0
+  let mut adopted_access = ""
+  let coord = AccountRefreshCoordinator::new()
+  let host1 = AccountRefreshHost::{
+    read_accounts_k: fn(rk : (HostStorageRead) -> Unit) -> Unit { rk(disk_doc_ref[0]) },
+    write_accounts_k: fn(doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit {
+      disk_doc_ref[0] = HostStorageRead::Found(doc)
+      wk(Ok(()))
+    },
+    do_refresh_http_k: fn(_rtok : String, _now : Int64, hk : (effect::Exit[Result[RefreshedTokens, RefreshTokenError]]) -> Unit) -> Unit {
+      http_calls += 1
+      hk(effect::Exit::Succeeded(Err(RefreshTokenError::Transient("must not be called"))))
+    },
+    get_mem_tuple: fn(sub : String) -> Option[(String, String)] {
+      for i in 0..<mem_accts.length() {
+        if mem_accts[i].sub == sub {
+          let sid = match mem_sess.get(sub) { Some(s) => s; None => "" }
+          return Some((sid, mem_accts[i].refresh))
+        }
+      }
+      None
+    },
+    on_adopt_or_update: fn(u : views::StoredAccount, _sid : String, all : Array[views::StoredAccount], _ss : Map[String, String]) -> Unit {
+      mem_accts.clear()
+      for i in 0..<all.length() { mem_accts.push(all[i]) }
+      adopted_access = u.access
+    },
+    on_invalidated: fn(_sub : String, _sid : String, _ref : String, _confirmed : Option[(Array[views::StoredAccount], Map[String, String])]) -> Unit {},
+    now_ms: fn() -> Int64 { 1700000000000L },
+  }
+  let mut out1 : Option[AccountRefreshOutcome] = None
+  coord.refresh_k(host1, "u-alice", "sess-a1", "ref-1", fn(o : AccountRefreshOutcome) -> Unit { out1 = Some(o) })
+  let _ = rt.run_ready()
+  debug_assert(http_calls == 0, "pre-request adoptStored made 0 HTTP requests for unexpired disk token")
+  debug_assert(adopted_access == "acc-adopted-fresh", "adopted fresh disk access token")
+  match out1 {
+    Some(AccountRefreshOutcome::Ok(tok, true)) => debug_assert(tok == "acc-adopted-fresh", "returned adopted token")
+    _ => panic("expected AccountRefreshOutcome::Ok(_, true)")
+  }
+  // Sibling Bob preserved verbatim!
+  debug_assert(mem_accts.length() == 2 && mem_accts[1].sub == "u-bob" && mem_accts[1].refresh == "bob-ref", "sibling Bob preserved")
+
+  // Case 2: 200 write-back CAS preserves sibling Bob & writes epoch seconds `access_expires`,
+  // and OAuth refresh NEVER bumps station `cred_epoch`!
+  let mut sent_refresh = ""
+  let host2 = AccountRefreshHost::{
+    read_accounts_k: fn(rk : (HostStorageRead) -> Unit) -> Unit { rk(disk_doc_ref[0]) },
+    write_accounts_k: fn(doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit {
+      disk_doc_ref[0] = HostStorageRead::Found(doc)
+      wk(Ok(()))
+    },
+    do_refresh_http_k: fn(rtok : String, _now : Int64, hk : (effect::Exit[Result[RefreshedTokens, RefreshTokenError]]) -> Unit) -> Unit {
+      sent_refresh = rtok
+      hk(effect::Exit::Succeeded(Ok(RefreshedTokens::{
+        access: "acc-3",
+        refresh: "ref-3",
+        access_expires: 1700009999L,
+        name: Some("Alice Renamed"),
+      })))
+    },
+    get_mem_tuple: host1.get_mem_tuple,
+    on_adopt_or_update: host1.on_adopt_or_update,
+    on_invalidated: host1.on_invalidated,
+    now_ms: fn() -> Int64 { 1700005000000L },
+  }
+  let mut out2 : Option[AccountRefreshOutcome] = None
+  coord.refresh_k(host2, "u-alice", "sess-a1", "ref-2-from-other-core", fn(o : AccountRefreshOutcome) -> Unit { out2 = Some(o) })
+  let _ = rt.run_ready()
+  debug_assert(sent_refresh == "ref-2-from-other-core", "used latest refresh token")
+  match out2 {
+    Some(AccountRefreshOutcome::Ok(tok, false)) => debug_assert(tok == "acc-3", "200 CAS succeeded")
+    _ => panic("expected 200 CAS Ok")
+  }
+  debug_assert(core.membership.cred_epoch_of(ULID_WS1) == ep0, "OAuth refresh NEVER bumps station cred_epoch")
+  // Verify disk JSON has exact `access_expires` (seconds), `session`, and sibling Bob!
+  match disk_doc_ref[0] {
+    HostStorageRead::Found(doc) => {
+      let s = base_codec::json_stringify(doc)
+      debug_assert(s.contains("\"access_expires\":1700009999") && !s.contains("accessExpires"), "epoch-second access_expires written")
+      debug_assert(s.contains("\"session\":\"sess-a1\"") && s.contains("\"sub\":\"u-bob\""), "session ID + sibling preserved on disk")
+    }
+    _ => panic("expected Found disk doc")
+  }
+
+  // Case 3: Stale 401 when disk already rotated to `ref-4` MUST NOT remove Alice or clobber disk!
+  let alice_disk_rot4 = views::StoredAccount::{
+    sub: "u-alice",
+    email: "alice@still.fail",
+    name: "Alice Renamed",
+    picture: "",
+    access: "acc-4",
+    refresh: "ref-4",
+    access_expires: 1700019999L,
+  }
+  let mut invalid_called = false
+  let mut write_called_on_stale_401 = false
+  let host3 = AccountRefreshHost::{
+    read_accounts_k: fn(rk : (HostStorageRead) -> Unit) -> Unit {
+      // Phase 1 sees `ref-3`; Phase 3B (after 401) sees `ref-4` rotated on disk!
+      rk(disk_doc_ref[0])
+    },
+    write_accounts_k: fn(_doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit {
+      write_called_on_stale_401 = true
+      wk(Ok(()))
+    },
+    do_refresh_http_k: fn(_rtok : String, _now : Int64, hk : (effect::Exit[Result[RefreshedTokens, RefreshTokenError]]) -> Unit) -> Unit {
+      // Simulate another core rotating disk while HTTP was in-flight!
+      disk_doc_ref[0] = HostStorageRead::Found(serialize_stored_accounts([alice_disk_rot4, bob0], sessions=Some(mem_sess)))
+      hk(effect::Exit::Succeeded(Err(RefreshTokenError::InvalidSession(401, "invalid_grant"))))
+    },
+    get_mem_tuple: host1.get_mem_tuple,
+    on_adopt_or_update: host1.on_adopt_or_update,
+    on_invalidated: fn(_sub : String, _sid : String, _ref : String, _confirmed : Option[(Array[views::StoredAccount], Map[String, String])]) -> Unit {
+      invalid_called = true
+    },
+    now_ms: fn() -> Int64 { 1700009999000L },
+  }
+  let mut out3 : Option[AccountRefreshOutcome] = None
+  coord.refresh_k(host3, "u-alice", "sess-a1", "ref-3", fn(o : AccountRefreshOutcome) -> Unit { out3 = Some(o) })
+  let _ = rt.run_ready()
+  match out3 {
+    Some(AccountRefreshOutcome::Stale(_)) => ()
+    _ => panic("stale 401 after disk rotation must return Stale")
+  }
+  debug_assert(!invalid_called && !write_called_on_stale_401, "stale 401 did NOT remove Alice or clobber disk")
+
+  // Case 4: Matching 401 CAS removes ONLY Alice and preserves sibling Bob on disk!
+  mem_accts[0] = alice_disk_rot4
+  let mut removed_sub = ""
+  let mut rem_count = -1
+  let host4 = AccountRefreshHost::{
+    read_accounts_k: fn(rk : (HostStorageRead) -> Unit) -> Unit { rk(disk_doc_ref[0]) },
+    write_accounts_k: fn(doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit {
+      disk_doc_ref[0] = HostStorageRead::Found(doc)
+      wk(Ok(()))
+    },
+    do_refresh_http_k: fn(_rtok : String, _now : Int64, hk : (effect::Exit[Result[RefreshedTokens, RefreshTokenError]]) -> Unit) -> Unit {
+      hk(effect::Exit::Succeeded(Err(RefreshTokenError::InvalidSession(401, "invalid_grant"))))
+    },
+    get_mem_tuple: host1.get_mem_tuple,
+    on_adopt_or_update: host1.on_adopt_or_update,
+    on_invalidated: fn(sub : String, _sid : String, _ref : String, confirmed : Option[(Array[views::StoredAccount], Map[String, String])]) -> Unit {
+      removed_sub = sub
+      match confirmed {
+        Some((rem, _)) => { rem_count = rem.length() }
+        None => { rem_count = -2 }
+      }
+    },
+    now_ms: fn() -> Int64 { 1700019999000L },
+  }
+  let mut out4 : Option[AccountRefreshOutcome] = None
+  coord.refresh_k(host4, "u-alice", "sess-a1", "ref-4", fn(o : AccountRefreshOutcome) -> Unit { out4 = Some(o) })
+  let _ = rt.run_ready()
+  match out4 {
+    Some(AccountRefreshOutcome::InvalidSession(401, _, true)) => ()
+    _ => panic("matching 401 CAS must return InvalidSession(_, _, true)")
+  }
+  debug_assert(removed_sub == "u-alice" && rem_count == 1, "401 CAS removed Alice and kept sibling Bob")
+  match disk_doc_ref[0] {
+    HostStorageRead::Found(doc) => {
+      let parsed = parse_stored_accounts_strict(doc)
+      match parsed {
+        Some(xs) => debug_assert(xs.length() == 1 && xs[0].sub == "u-bob", "disk contains only sibling Bob")
+        None => panic("expected valid accounts array on disk")
+      }
+    }
+    _ => panic("expected Found disk doc")
+  }
+}
+
+// ── Test 5: Invariant 5 — Strict ws/st addressing, permanent bare quarantine, and full O(1) read gate ──
+
+test "Slice 2B-1 Invariant 5: strict ws/st, permanent ambiguous bare quarantine, moved source-only, and full O(1) view/RPC read gate" {
+  let rt = effect::Runtime::new()
+  let (sim, db) = make_sim_db(rt)
+  let core = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, db, core_offline_transport(), fn() -> Unit {})
+  let _ = core.set_db_account_sub("u-alice")
+
+  // 1. Cross-workspace station prefix MUST be rejected by `resolve_station_for_workspace` & `commit_cloud_workspace`!
+  match resolve_station_for_workspace(ULID_WS1, ULID_WS2 + "/st-evil") {
+    Err(m) => debug_assert(m.starts_with("station_workspace_mismatch"), "cross-ws station rejected")
+    Ok(_) => panic("cross-ws station must be rejected")
+  }
+  match core.commit_cloud_workspace(mt_make_ws(ULID_WS1, "W1", "owner", [ULID_WS2 + "/st-evil"]), req_seq=1L) {
+    Err(m) => debug_assert(m.starts_with("station_workspace_mismatch"), "commit_cloud_workspace rejects cross-ws station")
+    _ => panic("commit_cloud_workspace must reject cross-ws station")
+  }
+
+  // 2. Permanent quarantine of multi-owner bare station alias (`st-shared` claimed by both WS1 and WS2):
+  let _ = core.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner"), (ULID_WS2, "W2", "owner")]), req_seq=2L)
+  let _ = core.commit_cloud_workspace(mt_make_ws(ULID_WS1, "W1", "owner", ["st-shared", "st-ws1-only"]), req_seq=3L)
+  let _ = core.commit_cloud_workspace(mt_make_ws(ULID_WS2, "W2", "owner", ["st-shared", "st-ws2-only"]), req_seq=4L)
+  debug_assert(core.membership.is_ambiguous_bare_station("st-shared"), "st-shared is ambiguous bare alias")
+  debug_assert(!core.can_read_station("st-shared"), "ambiguous bare st-shared fails closed")
+  debug_assert(core.can_read_station(ULID_WS1 + "/st-shared"), "canonical WS1/st-shared readable")
+  debug_assert(core.can_read_station(ULID_WS2 + "/st-shared"), "canonical WS2/st-shared readable")
+
+  // Drop WS1 -> `st-shared` MUST stay permanently quarantined (even after only WS2 remains AND after restart!),
+  // and `st-ws1-only` (exclusive bare) + `WS1/*` are purged while `WS2/st-shared` & `st-ws2-only` stay intact!
+  let _ = store::put_draft(db, ULID_WS1, "new", "{\"text\":\"ws1 new draft\"}")
+  let _ = store::put_draft(db, ULID_WS2, "new", "{\"text\":\"ws2 new draft\"}")
+  let _ = store::put_account_doc(db, "usage:" + ULID_WS1, "{\"cost\":99}")
+  let _ = store::put_account_doc(db, "vaults:" + ULID_WS1, "{\"vaults\":[{\"id\":\"v1\"}]}")
+  let _ = store::put_account_doc(
+    db,
+    "vault_secrets",
+    "[{\"workspace\":\"" + ULID_WS1 + "\",\"vault\":\"v1\",\"name\":\"S1\"},{\"workspace\":\"" + ULID_WS2 + "\",\"vault\":\"v2\",\"name\":\"S2\"},{\"vault\":\"personal\",\"name\":\"P1\"},{\"name\":\"UNOWNED\"}]",
+  )
+  // Seed moved chat from WS2 -> WS1 so we verify moved target authorization!
+  let _ = store::put_moved(
+    db,
+    ULID_WS2 + "/st-ws2-only",
+    "sess-moved",
+    Some(store::MovedTo::{
+      station: ULID_WS1 + "/st-ws1-only",
+      thread: Some(50),
+      there: Some(60),
+      at: Some(1000L),
+      came: false,
+    }),
+  )
+
+  match core.drop_workspace(ULID_WS1) {
+    Ok(_) => ()
+    Err(e) => panic("drop WS1 failed: " + e)
+  }
+  debug_assert(core.membership.is_ambiguous_bare_station("st-shared"), "st-shared stays permanently quarantined after WS1 drop")
+  debug_assert(!core.can_read_station("st-shared"), "bare st-shared still fails closed")
+  // Verify persistence across simulated restart!
+  let auth_restarted = MembershipAuthority::new()
+  let _ = auth_restarted.bind_account_sub("u-alice", db=Some(db))
+  debug_assert(auth_restarted.is_ambiguous_bare_station("st-shared"), "quarantined bare st-shared persisted in __quarantined_bare__")
+  debug_assert(!auth_restarted.is_station_readable("st-shared", fallback_ws=ULID_WS2), "restarted bare st-shared still fails closed")
+
+  // Verify `new:<WS1>` draft purged while `new:<WS2>` draft preserved!
+  debug_assert(sim.drafts.get(ULID_WS1 + ":new").is_none(), "new:WS1 draft purged")
+  debug_assert(sim.drafts.get(ULID_WS2 + ":new").is_some(), "new:WS2 draft preserved")
+
+  // 3. Full O(1) read gate verification across views, aggregates, and direct-read RPCs on revoked WS1 vs readable WS2!
+  debug_assert(mt_is_waiting(mt_sub(core, 30L, "workspace", [("workspace", base_codec::json_str(ULID_WS1))])), "revoked workspace topic Waiting")
+  debug_assert(mt_is_waiting(mt_sub(core, 31L, "vaults", [("workspace", base_codec::json_str(ULID_WS1))])), "revoked vaults topic Waiting")
+  debug_assert(mt_is_waiting(mt_sub(core, 32L, "vaultItems", [("workspace", base_codec::json_str(ULID_WS1))])), "revoked vaultItems topic Waiting")
+  debug_assert(mt_is_waiting(mt_sub(core, 33L, "composer", [("key", base_codec::json_str("new:" + ULID_WS1))])), "revoked new:WS1 composer Waiting")
+  debug_assert(mt_is_waiting(mt_sub(core, 34L, "draft", [("station", base_codec::json_str(ULID_WS1)), ("chat", base_codec::json_str("new"))])), "revoked new:WS1 draft Waiting")
+  // Readable WS2 `vaultItems` & `vaultSecrets` MUST project directly as Value (NEVER stuck Waiting!).
+  let vi2 = mt_expect_val_json(mt_sub(core, 35L, "vaultItems", [("workspace", base_codec::json_str(ULID_WS2)), ("vault", base_codec::json_str("v2"))]), "readable WS2 vaultItems")
+  debug_assert(base_codec::json_stringify(vi2).contains("S2") && !base_codec::json_stringify(vi2).contains("S1"), "readable WS2 vaultItems projects S2 only")
+
+  // Direct-read RPCs:
+  mt_expect_err_code(mt_call(core, 40L, "workspace.get", base_codec::json_obj([("workspace", base_codec::json_str(ULID_WS1))])), "access_revoked", "revoked workspace.get")
+  mt_expect_err_code(mt_call(core, 41L, "draft.get", base_codec::json_obj([("key", base_codec::json_str("new:" + ULID_WS1))])), "access_revoked", "revoked new:WS1 draft.get")
+  mt_expect_err_code(
+    mt_call(core, 42L, "composer.carry", base_codec::json_obj([("key", base_codec::json_str("new:" + ULID_WS2)), ("to", base_codec::json_str("new:" + ULID_WS1))])),
+    "access_revoked",
+    "composer.carry checks destination too",
+  )
+  mt_expect_err_code(mt_call(core, 43L, "lock.status", base_codec::json_obj([("workspace", base_codec::json_str(ULID_WS1))])), "access_revoked", "revoked lock.status")
+  // Moved chat from readable WS2 -> revoked WS1 MUST be blocked!
+  mt_expect_err_code(
+    mt_call(core, 44L, "chat.open", base_codec::json_obj([("station", base_codec::json_str(ULID_WS2 + "/st-ws2-only")), ("session", base_codec::json_str("sess-moved"))])),
+    "access_revoked",
+    "moved chat to revoked station blocked",
+  )
+  // `vault.secrets` & `account.doc("vault_secrets")` MUST filter out revoked WS1 AND unowned records, keeping WS2 & personal!
+  let vs_rpc = mt_expect_ok_json(mt_call(core, 45L, "vault.secrets", base_codec::json_obj([])), "vault.secrets filtered")
+  let vs_str = base_codec::json_stringify(vs_rpc)
+  debug_assert(vs_str.contains("S2") && vs_str.contains("P1") && !vs_str.contains("S1") && !vs_str.contains("UNOWNED"), "vault.secrets filters revoked + unowned")
+  let vs_doc = mt_expect_ok_json(mt_call(core, 46L, "account.doc", base_codec::json_obj([("name", base_codec::json_str("vault_secrets"))])), "account.doc(vault_secrets) filtered")
+  let vsd_str = base_codec::json_stringify(vs_doc)
+  debug_assert(vsd_str.contains("S2") && vsd_str.contains("P1") && !vsd_str.contains("S1") && !vsd_str.contains("UNOWNED"), "account.doc(vault_secrets) filters revoked + unowned")
+  // `account.doc("usage:<revoked>")` & `account.doc("vaults:<revoked>")` return null!
+  match mt_expect_ok_json(mt_call(core, 47L, "account.doc", base_codec::json_obj([("name", base_codec::json_str("usage:" + ULID_WS1))])), "usage revoked") {
+    base_codec::Json::Null => ()
+    _ => panic("revoked account.doc(usage:WS1) must be null")
+  }
+  match mt_expect_ok_json(mt_call(core, 48L, "account.doc", base_codec::json_obj([("name", base_codec::json_str("vaults:" + ULID_WS1))])), "vaults revoked") {
+    base_codec::Json::Null => ()
+    _ => panic("revoked account.doc(vaults:WS1) must be null")
+  }
+  // Selector consistency check (`thread` vs `session` disagree -> `chat_selector_mismatch`):
+  sim.chats.set(ULID_WS2 + "/st-ws2-only:0:c-1", SimChatRow::{
+    station: ULID_WS2 + "/st-ws2-only",
+    archived: 0,
+    id: "c-1",
+    ord: 1.0,
+    thread: Some(10),
+    session: Some("sess-10"),
+    pinned_at: None,
+    last_active: 1000L,
+    unread: 0,
+    tone: None,
+    asks: 0,
+    json: "{\"thread\":10,\"session\":\"sess-10\"}",
+  })
+  sim.chat_order.push(ULID_WS2 + "/st-ws2-only:0:c-1")
+  sim.chats.set(ULID_WS2 + "/st-ws2-only:0:c-2", SimChatRow::{
+    station: ULID_WS2 + "/st-ws2-only",
+    archived: 0,
+    id: "c-2",
+    ord: 2.0,
+    thread: Some(20),
+    session: Some("sess-20"),
+    pinned_at: None,
+    last_active: 1000L,
+    unread: 0,
+    tone: None,
+    asks: 0,
+    json: "{\"thread\":20,\"session\":\"sess-20\"}",
+  })
+  sim.chat_order.push(ULID_WS2 + "/st-ws2-only:0:c-2")
+  mt_expect_err_code(
+    mt_call(core, 49L, "chat.open", base_codec::json_obj([
+      ("station", base_codec::json_str(ULID_WS2 + "/st-ws2-only")),
+      ("thread", base_codec::json_int(10)),
+      ("session", base_codec::json_str("sess-20")),
+    ])),
+    "chat_selector_mismatch",
+    "mismatched thread+session rejected",
+  )
+}
+
+// ── Test 6: `exchange_auth_code_k`, `SyncScheduler` cred_epoch fail-open retry, strict station payload validation ──
+
+test "Slice 2B-1: exchange_auth_code_k, cred_epoch fail-open retry, and strict station snapshot/entries validation" {
+  let rt = effect::Runtime::new()
+  let pending : Array[(Int64, String, base_codec::Json, Option[Bytes])] = []
+  let sh = shell::Shell::stood_in(
+    rt,
+    fn(id : Int64, op : String, args : base_codec::Json, body : Option[Bytes]) -> Unit {
+      pending.push((id, op, args, body))
+    },
+    fn(_op : String, _args : base_codec::Json) -> shell::AskResult {
+      shell::AskResult::Ok(base_codec::json_obj([]))
+    },
+    fn(n : Int) -> Bytes { Bytes::new(n) },
+  )
+  let mut got_sub = ""
+  let mut got_exp = 0L
+  let _ = rt.fork(fn(k : (effect::Exit[Unit]) -> Unit) -> Unit {
+    exchange_auth_code_k(sh, "https://cloud.example", "code-1", "ver-1", "stillfail://cb", fn(ex : effect::Exit[Result[AuthTokenExchange, CloudHttpError]]) -> Unit {
+      match ex {
+        effect::Exit::Succeeded(Ok(t)) => {
+          got_sub = t.subject
+          got_exp = t.expires_at
+        }
+        _ => ()
+      }
+      k(effect::Exit::Succeeded(()))
+    })
+  })
+  let _ = rt.run_ready()
+  debug_assert(pending.length() == 1 && j_str(pending[0].2, "url") == "https://cloud.example/v1/auth/token", "POST /v1/auth/token")
+  sh.answer(
+    pending[0].0,
+    base_codec::json_obj([("status", base_codec::json_int(200)), ("headers", base_codec::json_arr([])), ("redirected", base_codec::json_bool(false))]),
+    bytes=Some("{\"access_token\":\"a1\",\"refresh_token\":\"r1\",\"subject\":\"u-ex\",\"email\":\"ex@still.fail\",\"name\":\"Ex\",\"expires_at\":1800000000}".to_bytes()),
+  )
+  let _ = rt.run_ready()
+  debug_assert(got_sub == "u-ex" && got_exp == 1800000000L, "parsed /v1/auth/token")
+
+  // Strict station snapshot & thread entries validation:
+  debug_assert(is_valid_chats_snapshot_payload(base_codec::json_arr([])), "array GET /chats valid")
+  debug_assert(is_valid_chats_snapshot_payload(base_codec::json_obj([("chats", base_codec::json_arr([]))])), "object {chats:[]} valid")
+  debug_assert(!is_valid_chats_snapshot_payload(base_codec::json_obj([("error", base_codec::json_str("denied"))])), "error object rejected")
+  debug_assert(!is_valid_thread_entries_payload(base_codec::json_arr([]), 0), "bare array thread entries rejected")
+  debug_assert(is_valid_thread_entries_payload(base_codec::json_obj([("entries", base_codec::json_arr([]))]), 0), "object {entries:[]} valid")
+  debug_assert(!is_valid_thread_entries_payload(base_codec::json_obj([("ok", base_codec::json_bool(true))]), 0), "missing entries rejected")
+}
+
+// ── Test 7 (R2 Group 1): Zero synchronous host reads across all membership commits & DB switches ──
+
+test "Slice 2B-1 R2: unbound commit_cloud_me rejected and explicit host_purges_read recorded cleanly" {
+  let rt = effect::Runtime::new()
+  let (_, db1) = make_sim_db(rt)
+  let (_, db2) = make_sim_db(rt)
+  let core = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, db1, core_offline_transport(), fn() -> Unit {})
+
+  // Unbound `commit_cloud_me` (when authenticated flag is false but `db_account_sub == None`) returns `account_sub_unbound`.
+  match core.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner")]), req_seq=1L) {
+    Err(m) => debug_assert(m.starts_with("account_sub_unbound"), "unbound commit_cloud_me must fail with account_sub_unbound")
+    _ => panic("unbound commit_cloud_me must fail")
+  }
+
+  // `switch_account_db` with explicit `HostStorageRead::ReadError` records warning cleanly without failing switch!
+  match core.switch_account_db(db2, "u-alice", host_purges_read=Some(HostStorageRead::ReadError("disk_busy"))) {
+    Ok(_) => ()
+    Err(e) => panic("switch_account_db failed: " + e)
+  }
+  match core.membership.last_host_persist_warn {
+    Some(w) => debug_assert(w == "disk_busy", "ReadError recorded cleanly")
+    None => panic("expected ReadError recorded")
+  }
+
+  // `commit_cloud_me`, `commit_cloud_workspace`, `drop_workspace`, `retry_pending_purges` all work cleanly:
+  match core.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner"), (ULID_WS2, "W2", "admin")]), req_seq=1L) {
+    Ok(true) => ()
+    _ => panic("commit_cloud_me failed")
+  }
+  match core.commit_cloud_workspace(mt_make_ws(ULID_WS1, "W1", "owner", ["st-1"]), req_seq=2L) {
+    Ok(true) => ()
+    _ => panic("commit_cloud_workspace failed")
+  }
+  match core.drop_workspace(ULID_WS2) {
+    Ok(_) => ()
+    Err(e) => panic("drop_workspace failed: " + e)
+  }
+  let _ = core.retry_pending_purges()
+}
+
+// ── Test 8 (R2 Groups 2, 3, 5): Fail-closed auth.complete persistence, switch_to_unauthenticated_db, sessions.list/jobs.open gates, 401 Absent, shared dir lock ──
+
+test "Slice 2B-1 R2: fail-closed direct auth.complete, unauth switch + sessions/jobs gates, 401 Absent preserves siblings, shared dir lock" {
+  let rt = effect::Runtime::new()
+  let (_, db) = make_sim_db(rt)
+  let core = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, db, core_offline_transport(), fn() -> Unit {})
+  core.membership.set_unauthenticated(true)
+
+  // 1. Direct-param `auth.complete` with failing `on_accounts_persisted` MUST fail with `storage_error`
+  //    and keep `unauthenticated == true` and `auth_store` empty!
+  let b_res = mt_expect_ok_json(mt_call(core, 1L, "auth.begin", base_codec::json_obj([])), "auth.begin")
+  let st_tok = j_str(b_res, "state")
+  core.set_on_accounts_persisted(fn(_doc : base_codec::Json) -> Result[Unit, String] {
+    Err("disk_full")
+  })
+  mt_expect_err_code(
+    mt_call(core, 2L, "auth.complete", base_codec::json_obj([
+      ("state", base_codec::json_str(st_tok)),
+      ("code", base_codec::json_str("c1")),
+      ("sub", base_codec::json_str("u-alice")),
+      ("email", base_codec::json_str("alice@still.fail")),
+      ("access", base_codec::json_str("acc-1")),
+    ])),
+    "storage_error",
+    "failed accounts persistence must return storage_error",
+  )
+  debug_assert(core.membership.is_unauthenticated(), "read gate MUST remain closed when persistence fails")
+  debug_assert(core.auth_store.accounts.length() == 0, "auth_store MUST remain unchanged on persistence failure")
+
+  // 2. Bind Alice, populate live events session/job, verify `sessions.list` & `jobs.open` work while readable,
+  //    then `switch_to_unauthenticated_db` immediately clears DB binding & gates both to empty!
+  let _ = core.set_db_account_sub("u-alice")
+  let _ = core.membership.bind_station_checked(ULID_WS1, "st-1")
+  let _ = core.events.apply_sse_batch([
+    wire::Event::{ name: "session", data: "{\"key\":\"sess-live\",\"running\":true,\"listed\":true}", id: Some("s1") },
+  ])
+  core.events.track_job(JobStatus::{ id: "job-live", session: Some("sess-live"), open: true, chat: Some("c-1") })
+  let sess_ok = mt_expect_ok_json(mt_call(core, 3L, "sessions.list", base_codec::json_obj([])), "auth sessions.list")
+  debug_assert(base_codec::json_stringify(sess_ok).contains("sess-live"), "sessions.list returns live session when readable")
+  let jobs_ok = mt_expect_ok_json(mt_call(core, 4L, "jobs.open", base_codec::json_obj([])), "auth jobs.open")
+  debug_assert(base_codec::json_stringify(jobs_ok).contains("job-live"), "jobs.open returns live job when readable")
+
+  // Revoking WS1 gates `sessions.list` & `jobs.open` to empty even before logout:
+  let _ = core.drop_workspace(ULID_WS1)
+  let sess_rev = mt_expect_ok_json(mt_call(core, 5L, "sessions.list", base_codec::json_obj([])), "revoked sessions.list")
+  debug_assert(!base_codec::json_stringify(sess_rev).contains("sess-live"), "revoked station sessions.list must be empty")
+  let jobs_rev = mt_expect_ok_json(mt_call(core, 6L, "jobs.open", base_codec::json_obj([])), "revoked jobs.open")
+  debug_assert(!base_codec::json_stringify(jobs_rev).contains("job-live"), "revoked station jobs.open must be empty")
+
+  // `switch_to_unauthenticated_db` resets DB, clears `db_account_sub`, sets `unauthenticated = true`:
+  let (_, fresh_mem_db) = make_sim_db(rt)
+  core.switch_to_unauthenticated_db(fresh_mem_db)
+  debug_assert(core.db_account_sub.is_none(), "db_account_sub cleared on unauth switch")
+  debug_assert(core.membership.is_unauthenticated(), "unauthenticated after switch_to_unauthenticated_db")
+  // Same `ClientCore` can now switch cleanly to a different account (`u-bob`)!
+  let (_, bob_db) = make_sim_db(rt)
+  match core.switch_account_db(bob_db, "u-bob") {
+    Ok(_) => ()
+    Err(e) => panic("same-process re-login switch to u-bob failed: " + e)
+  }
+  debug_assert(mt_opt_str_is(core.db_account_sub, "u-bob"), "re-bound to u-bob cleanly")
+
+  // 3. 401 CAS `Absent` branch returns `Stale("stale_401")` and NEVER invokes `on_invalidated` (preserves siblings)!
+  let coord = AccountRefreshCoordinator::new()
+  let mut phase = 0
+  let mut invalidated_called = false
+  let mut outcome_stale = false
+  let host = AccountRefreshHost::{
+    read_accounts_k: fn(rk : (HostStorageRead) -> Unit) -> Unit {
+      phase += 1
+      if phase == 1 {
+        let a = views::StoredAccount::{ sub: "u-a", email: "a@still.fail", name: "A", picture: "", access: "acc-a", refresh: "ref-a", access_expires: 100L }
+        let b = views::StoredAccount::{ sub: "u-b", email: "b@still.fail", name: "B", picture: "", access: "acc-b", refresh: "ref-b", access_expires: 9999L }
+        let s : Map[String, String] = Map::new()
+        s.set("u-a", "sa")
+        s.set("u-b", "sb")
+        rk(HostStorageRead::Found(serialize_stored_accounts([a, b], sessions=Some(s))))
+      } else {
+        rk(HostStorageRead::Absent)
+      }
+    },
+    write_accounts_k: fn(_doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit { wk(Ok(())) },
+    do_refresh_http_k: fn(_rtok : String, _now : Int64, hk : (effect::Exit[Result[RefreshedTokens, RefreshTokenError]]) -> Unit) -> Unit {
+      hk(effect::Exit::Succeeded(Err(RefreshTokenError::InvalidSession(401, "invalid_grant"))))
+    },
+    get_mem_tuple: fn(_sub : String) -> Option[(String, String)] { Some(("sa", "ref-a")) },
+    on_adopt_or_update: fn(_u, _s, _all, _ss) -> Unit {},
+    on_invalidated: fn(_sub, _sid, _ref, _confirmed) -> Unit { invalidated_called = true },
+    now_ms: fn() -> Int64 { 200000L },
+  }
+  let _ = rt.fork(fn(fk : (effect::Exit[Unit]) -> Unit) -> Unit {
+    coord.refresh_k(host, "u-a", "sa", "ref-a", fn(out : AccountRefreshOutcome) -> Unit {
+      match out {
+        AccountRefreshOutcome::Stale(m) => if m == "stale_401" { outcome_stale = true }
+        _ => ()
+      }
+      fk(effect::Exit::Succeeded(()))
+    })
+  })
+  let _ = rt.run_ready()
+  debug_assert(outcome_stale && !invalidated_called, "401 CAS Absent must return Stale and never wipe siblings")
+
+  // 4. Single-owner coordinator mutex serializes concurrent `upsert_account_cas_k` calls in-process!
+  let c_ser = AccountRefreshCoordinator::new()
+  let disk_ref : Array[Option[base_codec::Json]] = [None]
+  let write_gates : Array[(Result[Unit, String]) -> Unit] = []
+  let mut c1_done = false
+  let mut c2_done = false
+  let acct1 = views::StoredAccount::{ sub: "u-1", email: "1@still.fail", name: "One", picture: "", access: "a1", refresh: "r1", access_expires: 1900000000L }
+  let acct2 = views::StoredAccount::{ sub: "u-2", email: "2@still.fail", name: "Two", picture: "", access: "a2", refresh: "r2", access_expires: 1900000000L }
+  let read_fn = fn(rk : (HostStorageRead) -> Unit) -> Unit {
+    match disk_ref[0] {
+      Some(d) => rk(HostStorageRead::Found(d))
+      None => rk(HostStorageRead::Absent)
+    }
+  }
+  let write_fn = fn(doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit {
+    disk_ref[0] = Some(doc)
+    write_gates.push(wk)
+  }
+  let _ = rt.fork(fn(fk : (effect::Exit[Unit]) -> Unit) -> Unit {
+    c_ser.upsert_account_cas_k(read_fn, write_fn, acct1, "s1", fn(_r) -> Unit {
+      c1_done = true
+      fk(effect::Exit::Succeeded(()))
+    })
+  })
+  let _ = rt.fork(fn(fk : (effect::Exit[Unit]) -> Unit) -> Unit {
+    c_ser.upsert_account_cas_k(read_fn, write_fn, acct2, "s2", fn(_r) -> Unit {
+      c2_done = true
+      fk(effect::Exit::Succeeded(()))
+    })
+  })
+  let _ = rt.run_ready()
+  // Second upsert MUST still be blocked waiting for the coordinator mutex (only 1 pending write gate)!
+  debug_assert(write_gates.length() == 1 && !c1_done && !c2_done, "coordinator mutex must serialize concurrent upserts")
+  let g1 = write_gates[0]
+  g1(Ok(()))
+  let _ = rt.run_ready()
+  debug_assert(c1_done && write_gates.length() == 2 && !c2_done, "second upsert starts only after first releases mutex")
+  let g2 = write_gates[1]
+  g2(Ok(()))
+  let _ = rt.run_ready()
+  debug_assert(c2_done, "second upsert finished")
+  match disk_ref[0] {
+    Some(final_doc) => {
+      let s = base_codec::json_stringify(final_doc)
+      debug_assert(s.contains("u-1") && s.contains("u-2"), "both siblings preserved across serialized upserts")
+    }
+    None => panic("expected persisted accounts doc")
+  }
+}
+
+// ── Test 9 (R2 Groups 4 & 5): Fresh `/v1/me` workspace visibility, bidirectional `me(seq1)->ws(seq2)`, `bind_account_context` WS stop, strict WorkspaceSummary, `chatRow`/`link.parse` dual-side gates, fail-closed schema probe ──
+
+test "Slice 2B-1 R2: fresh me visibility, bidirectional me->ws merge, bind_account_context WS stop, strict summary, chatRow/link.parse gates, fail-closed probe" {
+  let rt = effect::Runtime::new()
+  let (sim, db) = make_sim_db(rt)
+  let core = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, db, core_offline_transport(), fn() -> Unit {})
+  let _ = core.set_db_account_sub("u-alice")
+  core.set_viewer("alice@still.fail", sub="u-alice", role="owner")
+
+  // 1. Fresh DB: single `commit_cloud_me(seq=1)` immediately populates SQLite `workspace` summary rows!
+  match core.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "Fresh W1", "owner"), (ULID_WS2, "Fresh W2", "owner")]), req_seq=1L) {
+    Ok(true) => ()
+    _ => panic("fresh commit_cloud_me failed")
+  }
+  debug_assert(sim.workspaces.get(ULID_WS1).is_some() && sim.workspaces.get(ULID_WS2).is_some(), "workspace rows immediately visible after first /v1/me")
+  let ws_topic = mt_expect_val_json(mt_sub(core, 1L, "workspaces", []), "workspaces sub after /v1/me")
+  let ws_topic_s = base_codec::json_stringify(ws_topic)
+  debug_assert(ws_topic_s.contains("Fresh W1") && ws_topic_s.contains("Fresh W2"), "workspaces topic shows summaries immediately")
+
+  // 2. Bidirectional consistency in `me(seq=1) -> ws(seq=2)` order: `commit_cloud_workspace` updates BOTH `workspace` AND `account_doc("me")`!
+  match core.commit_cloud_workspace(mt_make_ws(ULID_WS2, "Updated W2 Detail", "member", ["st-2"]), req_seq=2L) {
+    Ok(true) => ()
+    _ => panic("commit_cloud_workspace(seq=2) failed")
+  }
+  let me_after_ws = match store::get_account_doc(db, "me") {
+    sql::SqlResult::Ok(Some(s)) => s
+    _ => panic("missing account_doc(me)")
+  }
+  debug_assert(me_after_ws.contains("Updated W2 Detail") && me_after_ws.contains("\"role\":\"member\""), "me(seq1)->ws(seq2) must update account_doc(me) atomically")
+
+  // 3. `CloudSync::bind_account_context` changing session stops old WS so `is_events_ws_running() == false`!
+  let sh = shell::Shell::stood_in(
+    rt,
+    fn(_id : Int64, _op : String, _args : base_codec::Json, _body : Option[Bytes]) -> Unit {},
+    fn(_op : String, _args : base_codec::Json) -> shell::AskResult { shell::AskResult::Ok(base_codec::json_obj([])) },
+    fn(n : Int) -> Bytes { Bytes::new(n) },
+  )
+  let cs = CloudSync::new(sh, db, "https://cloud.example", token="t1", bound_sub="u-alice", bound_session="sess-1")
+  cs.start_events_ws(fn(_ev : CloudEvent) -> Unit {})
+  debug_assert(cs.is_events_ws_running(), "events WS running before session change")
+  match cs.bind_account_context("u-alice", session="sess-2") {
+    Ok(_) => ()
+    Err(e) => panic("bind_account_context same sub new session failed: " + e)
+  }
+  debug_assert(!cs.is_events_ws_running(), "bind_account_context session change MUST stop old WS fiber")
+
+  // 4. Strict `WorkspaceSummary` validation: reject fractional `stations`/`members` & wrong optional field types!
+  let bad_frac_st = base_codec::json_parse("{\"user\":{\"sub\":\"u1\"},\"workspaces\":[{\"id\":\"" + ULID_WS1 + "\",\"name\":\"W1\",\"role\":\"owner\",\"created_at\":1,\"stations\":1.5,\"members\":1}]}")
+  match bad_frac_st {
+    base_codec::JsonParseResult::Ok(j) => debug_assert(parse_cloud_me_strict(j).is_err(), "fractional stations rejected")
+    _ => panic("parse json")
+  }
+  let bad_frac_mem = base_codec::json_parse("{\"user\":{\"sub\":\"u1\"},\"workspaces\":[{\"id\":\"" + ULID_WS1 + "\",\"name\":\"W1\",\"role\":\"owner\",\"created_at\":1,\"stations\":1,\"members\":2.5}]}")
+  match bad_frac_mem {
+    base_codec::JsonParseResult::Ok(j) => debug_assert(parse_cloud_me_strict(j).is_err(), "fractional members rejected")
+    _ => panic("parse json")
+  }
+  let bad_emoji = base_codec::json_parse("{\"user\":{\"sub\":\"u1\"},\"workspaces\":[{\"id\":\"" + ULID_WS1 + "\",\"name\":\"W1\",\"role\":\"owner\",\"created_at\":1,\"stations\":1,\"members\":1,\"emoji\":123}]}")
+  match bad_emoji {
+    base_codec::JsonParseResult::Ok(j) => debug_assert(parse_cloud_me_strict(j).is_err(), "non-string emoji rejected")
+    _ => panic("parse json")
+  }
+  let bad_relays = base_codec::json_parse("{\"user\":{\"sub\":\"u1\"},\"workspaces\":[{\"id\":\"" + ULID_WS1 + "\",\"name\":\"W1\",\"role\":\"owner\",\"created_at\":1,\"stations\":1,\"members\":1,\"relays\":[42]}]}")
+  match bad_relays {
+    base_codec::JsonParseResult::Ok(j) => debug_assert(parse_cloud_me_strict(j).is_err(), "non-string relays elem rejected")
+    _ => panic("parse json")
+  }
+  let bad_ways_off = base_codec::json_parse("{\"user\":{\"sub\":\"u1\"},\"workspaces\":[{\"id\":\"" + ULID_WS1 + "\",\"name\":\"W1\",\"role\":\"owner\",\"created_at\":1,\"stations\":1,\"members\":1,\"ways_off\":\"relay\"}]}")
+  match bad_ways_off {
+    base_codec::JsonParseResult::Ok(j) => debug_assert(parse_cloud_me_strict(j).is_err(), "non-array ways_off rejected")
+    _ => panic("parse json")
+  }
+  let good_opt = base_codec::json_parse("{\"user\":{\"sub\":\"u1\"},\"workspaces\":[{\"id\":\"" + ULID_WS1 + "\",\"name\":\"W1\",\"role\":\"owner\",\"created_at\":1,\"stations\":1,\"members\":1,\"emoji\":\"🚀\",\"icon\":null,\"relays\":[\"https://r1\"],\"ways_off\":[\"relay\"]}]}")
+  match good_opt {
+    base_codec::JsonParseResult::Ok(j) => debug_assert(parse_cloud_me_strict(j).is_ok(), "valid optional fields accepted")
+    _ => panic("parse json")
+  }
+
+  // 5. `chatRow` & `link.parse` dual-side authorization: moved pointer from readable W1/st-1 -> revoked W2/st-2!
+  let _ = core.membership.bind_station_checked(ULID_WS1, "st-1")
+  let _ = core.membership.bind_station_checked(ULID_WS2, "st-2")
+  let _ = core.drop_workspace(ULID_WS2)
+  sim.moved_rows.set(
+    ULID_WS1 + "/st-1:sess-moved",
+    (ULID_WS1 + "/st-1", "sess-moved", ULID_WS2 + "/st-2", Some(9), Some(99), Some(1000L), 0),
+  )
+  sim.chats.set(ULID_WS2 + "/st-2:0:sess-moved", SimChatRow::{
+    station: ULID_WS2 + "/st-2",
+    archived: 0,
+    id: "sess-moved",
+    ord: 1.0,
+    thread: Some(99),
+    session: Some("sess-moved"),
+    pinned_at: None,
+    last_active: 1000L,
+    unread: 0,
+    tone: None,
+    asks: 0,
+    json: "{\"id\":\"sess-moved\",\"title\":\"Secret Revoked Chat\",\"thread\":99,\"session\":\"sess-moved\"}",
+  })
+  sim.chat_order.push(ULID_WS2 + "/st-2:0:sess-moved")
+  match mt_sub(core, 2L, "chatRow", [("station", base_codec::json_str(ULID_WS1 + "/st-1")), ("session", base_codec::json_str("sess-moved"))]) {
+    protocol::CoreEvent::Value(_, base_codec::Json::Null, _) => ()
+    _ => panic("chatRow pointing at revoked moved destination must return Value(Null)")
+  }
+  core.set_cloud_origin("https://app.still.fail")
+  let lp_rev = mt_expect_ok_json(
+    mt_call(core, 3L, "link.parse", base_codec::json_obj([
+      ("url", base_codec::json_str("https://app.still.fail/o/" + ULID_WS1 + "/st-1/sess-moved")),
+    ])),
+    "link.parse to revoked moved destination",
+  )
+  match lp_rev {
+    base_codec::Json::Null => ()
+    _ => panic("link.parse MUST return null when moved destination station is revoked")
+  }
+
+  // 6. Schema probe (`sqlite_master`) failure during `commit_cloud_me` MUST fail closed (latch revoked + pending_purges)!
+  let (fail_sim, fail_db) = make_sim_db(rt)
+  let fail_core = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, fail_db, core_offline_transport(), fn() -> Unit {})
+  let _ = fail_core.set_db_account_sub("u-alice")
+  let _ = fail_core.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner"), (ULID_WS2, "W2", "owner")]), req_seq=1L)
+  fail_sim.fail_sqlite_master = true
+  match fail_core.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner")]), req_seq=2L) {
+    Err(_) => ()
+    _ => panic("commit_cloud_me must fail when sqlite_master probe fails")
+  }
+  debug_assert(!fail_core.can_read_workspace(ULID_WS2), "WS2 must fail closed (revoked) when sqlite_master probe fails")
+  debug_assert(fail_core.membership.has_pending_purge(ULID_WS2), "WS2 must have pending_purge latched on probe failure")
+}
+
+// ── Test 10 (R3 Items 2, 5, 6): Outbound frame + registry scrub on 401/switch, member demotion scrubs admin fields, opened moved chatRow target-ws invalidation ──
+
+test "Slice 2B-1 R3: outbound outbox & registry scrub on 401/switch, member demotion scrubs admin fields, opened moved chatRow target-ws dependency" {
+  let rt = effect::Runtime::new()
+  let (sim_a, db_a) = make_sim_db(rt)
+  let core = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, db_a, core_offline_transport(), fn() -> Unit {})
+  let _ = core.set_db_account_sub("u-alice")
+  core.set_viewer("alice@still.fail", sub="u-alice", role="admin")
+
+  // 1. Item 2: Outbound frame queue + account-scoped registries scrubbed on 401 (EVEN WITH SIBLING) and on switch_to_unauthenticated_db -> switch_account_db(Bob)!
+  core.auth_store.register_account(views::StoredAccount::{
+    sub: "u-alice", email: "alice@still.fail", name: "Alice", picture: "", access: "a1", refresh: "r1", access_expires: 1900000000L,
+  })
+  core.auth_store.register_account(views::StoredAccount::{
+    sub: "u-sib", email: "sib@still.fail", name: "Sib", picture: "", access: "a2", refresh: "r2", access_expires: 1900000000L,
+  })
+  core.account_sessions.set("u-alice", "s-alice")
+  core.account_sessions.set("u-sib", "s-sib")
+  let ep_before = core.account_epoch
+  core.outbox.tell(CoreEvent::EntryAdded(
+    ULID_WS1 + "/st-1",
+    42,
+    store::Entry::{
+      n: 1,
+      kind: "message",
+      author_kind: "person",
+      author: "alice",
+      text: "alice-secret-entry-payload",
+      notice: None,
+      files: 0,
+      letter: false,
+    },
+    None,
+  ))
+  let _ = mt_expect_ok_json(
+    mt_call(core, 1L, "download.join", base_codec::json_obj([
+      ("reader", base_codec::json_str("dl-alice-1")),
+      ("fileKey", base_codec::json_str("alice-secret.pdf")),
+      ("name", base_codec::json_str("alice-secret.pdf")),
+      ("start", base_codec::json_int(0)),
+      ("end", base_codec::json_int(1024)),
+    ])),
+    "alice download.join",
+  )
+  debug_assert(core.outbox.waiting() == 1 && core.downloads_held.length() == 1, "alice queued frame & download")
+
+  // 401 active account invalidation WITH sibling remaining MUST still clear outbox & all account registries!
+  let inv = core.invalidate_session("u-alice", expected_session=Some("s-alice"), expected_refresh=Some("r1"), persist_accounts=false)
+  debug_assert(inv, "alice invalidated")
+  debug_assert(core.account_epoch > ep_before, "account_epoch advanced on 401")
+  debug_assert(core.outbox.waiting() == 0, "outbound outbox cleared on 401 with sibling")
+  debug_assert(core.drain_frame().length() == 0, "drain_frame empty on 401")
+  debug_assert(core.downloads_held.length() == 0, "downloads_held cleared on 401 with sibling")
+
+  // Re-seed Alice frame & download, switch to unauth :memory:, then same-process switch to Bob:
+  let (_, mem_db) = make_sim_db(rt)
+  let (_, db_b) = make_sim_db(rt)
+  core.outbox.tell(CoreEvent::EntryAdded(
+    ULID_WS1 + "/st-1",
+    42,
+    store::Entry::{
+      n: 2,
+      kind: "message",
+      author_kind: "person",
+      author: "alice",
+      text: "alice-secret-entry-2",
+      notice: None,
+      files: 0,
+      letter: false,
+    },
+    None,
+  ))
+  core.downloads_held.push(views::DownloadEntry::{
+    id: "dl-alice-2",
+    station: ULID_WS1 + "/st-1",
+    name: "alice-secret-2.pdf",
+    size: 2048L,
+    loaded: 0L,
+    state: "going",
+    error: None,
+    started_at: 1000L,
+  })
+  core.switch_to_unauthenticated_db(mem_db)
+  debug_assert(core.outbox.waiting() == 0 && core.downloads_held.length() == 0, "unauth switch clears outbox & downloads")
+  match core.switch_account_db(db_b, "u-bob") {
+    Ok(_) => ()
+    Err(e) => panic("switch_account_db(u-bob) failed: " + e)
+  }
+  debug_assert(core.drain_frame().length() == 0, "0 Alice frames drained after Bob login")
+  let bob_dls = mt_expect_val_json(mt_sub(core, 2L, "downloads", []), "bob downloads sub")
+  let bob_dls_s = base_codec::json_stringify(bob_dls)
+  debug_assert(!bob_dls_s.contains("alice-secret"), "0 Alice downloads leaked to Bob")
+
+  // 2. Item 5: `/v1/me` demoting role from `admin` -> `member` scrubs `invitations`, `added`, `lock_requests` in same tx!
+  let (sim_m, db_m) = make_sim_db(rt)
+  let mcore = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, db_m, core_offline_transport(), fn() -> Unit {})
+  let _ = mcore.set_db_account_sub("u-alice")
+  mcore.set_viewer("alice@still.fail", sub="u-alice", role="admin")
+  mt_put_workspace(
+    db_m,
+    ULID_WS1,
+    "{\"id\":\"" + ULID_WS1 + "\",\"name\":\"Admin WS\",\"role\":\"admin\",\"rev\":5,\"invitations\":[{\"id\":\"inv-secret-1\"}],\"added\":[{\"id\":\"add-secret-1\"}],\"lock_requests\":3,\"stations\":[{\"id\":\"st-1\",\"name\":\"St1\",\"online\":true}],\"members\":[{\"sub\":\"u-alice\",\"email\":\"alice@still.fail\",\"role\":\"admin\"}]}",
+  )
+  match mcore.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "Admin WS", "member")]), req_seq=1L) {
+    Ok(true) => ()
+    _ => panic("commit_cloud_me demotion failed")
+  }
+  let ws_got = mt_expect_ok_json(
+    mt_call(mcore, 10L, "workspace.get", base_codec::json_obj([("workspace", base_codec::json_str(ULID_WS1))])),
+    "workspace.get after member demotion",
+  )
+  let ws_got_s = base_codec::json_stringify(ws_got)
+  debug_assert(ws_got_s.contains("\"role\":\"member\""), "demoted role updated to member")
+  debug_assert(!ws_got_s.contains("inv-secret-1") && !ws_got_s.contains("add-secret-1"), "manager-only invitations/added scrubbed on demotion")
+  debug_assert(ws_got_s.contains("\"invitations\":[]") && ws_got_s.contains("\"added\":[]") && ws_got_s.contains("\"lock_requests\":0"), "scrubbed fields set to empty/0")
+  let ws_list = mt_expect_ok_json(mt_call(mcore, 11L, "workspaces.list", base_codec::json_obj([])), "workspaces.list after demotion")
+  let ws_list_s = base_codec::json_stringify(ws_list)
+  debug_assert(!ws_list_s.contains("inv-secret-1") && !ws_list_s.contains("add-secret-1") && ws_list_s.contains("\"lock_requests\":0"), "workspaces.list reflects scrubbed admin fields")
+
+  // 3. Item 6: Already-opened `chatRow` on readable `W1/st-1` pointing via `moved` to `W2/st-2` automatically
+  //    re-projects to `Waiting` when `W2` is revoked (even though `W1` remains untouched)!
+  let _ = mcore.commit_cloud_me(
+    mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner"), (ULID_WS2, "W2", "owner")]),
+    req_seq=2L,
+  )
+  let _ = mcore.membership.bind_station_checked(ULID_WS1, "st-1")
+  let _ = mcore.membership.bind_station_checked(ULID_WS2, "st-2")
+  sim_m.moved_rows.set(
+    ULID_WS1 + "/st-1:sess-mv-live",
+    (ULID_WS1 + "/st-1", "sess-mv-live", ULID_WS2 + "/st-2", Some(12), Some(24), Some(2000L), 0),
+  )
+  sim_m.chats.set(ULID_WS2 + "/st-2:0:sess-mv-live", SimChatRow::{
+    station: ULID_WS2 + "/st-2",
+    archived: 0,
+    id: "sess-mv-live",
+    ord: 1.0,
+    thread: Some(24),
+    session: Some("sess-mv-live"),
+    pinned_at: None,
+    last_active: 2000L,
+    unread: 0,
+    tone: None,
+    asks: 0,
+    json: "{\"id\":\"sess-mv-live\",\"title\":\"Moved Target Title\",\"thread\":24,\"session\":\"sess-mv-live\"}",
+  })
+  sim_m.chat_order.push(ULID_WS2 + "/st-2:0:sess-mv-live")
+
+  // Open `chatRow` sub id=77 on W1/st-1 while W2 is still readable:
+  let cr_val = mt_expect_val_json(
+    mt_sub(mcore, 77L, "chatRow", [("station", base_codec::json_str(ULID_WS1 + "/st-1")), ("session", base_codec::json_str("sess-mv-live"))]),
+    "initial moved chatRow sub",
+  )
+  debug_assert(base_codec::json_stringify(cr_val).contains("Moved Target Title"), "initial moved chatRow projects target W2 row")
+
+  // Attach wire sink and revoke W2 via `/v1/me` (W1 stays active!):
+  // Moved `chatRow` MUST emit `Value(Json::Null)` (NOT `Waiting`) so `client.mbt` immediately clears stale `s.value`!
+  let emitted : Array[String] = []
+  mcore.set_wire_sink(fn(j : String, _b : Option[Bytes]) -> Unit { emitted.push(j) })
+  match mcore.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner")]), req_seq=3L) {
+    Ok(true) => ()
+    _ => panic("revoke W2 via commit_cloud_me failed")
+  }
+  let mut saw_sub77_null = false
+  let mut saw_sub77_waiting = false
+  let mut saw_sub77_leak = false
+  for i in 0..<emitted.length() {
+    let s = emitted[i]
+    if s.contains("\"id\":77") {
+      if s.contains("\"value\":null") {
+        saw_sub77_null = true
+      }
+      if s.contains("\"waiting\":true") {
+        saw_sub77_waiting = true
+      }
+      if s.contains("Moved Target Title") {
+        saw_sub77_leak = true
+      }
+    }
+  }
+  debug_assert(saw_sub77_null && !saw_sub77_waiting && !saw_sub77_leak, "opened moved chatRow sub MUST auto-reproject to Value(null) on target ws revocation")
+  let _ = sim_a
+}
+
+// ── Test 11 (R4 Items 2, 3, 4, 6): In-flight auth.complete cancel/begin CAS rollback, staged retry_pending_purges emit_boundary=false, notify isolation/filtering, and outbox per-station authorization gate ──
+
+test "Slice 2B-1 R4: auth.complete in-flight CAS rollback, silent staged pending_purges, notify isolation & filtering, and per-station outbox gate" {
+  let rt = effect::Runtime::new()
+
+  // 1. Item 2: In-flight `upsert_account_cas_k` + `rollback_account_cas_k` when `auth.cancel` / new `auth.begin` races with disk write!
+  let coord = AccountRefreshCoordinator::new()
+  let sib = views::StoredAccount::{
+    sub: "u-sib", email: "sib@still.fail", name: "Sib", picture: "", access: "asib", refresh: "rsib", access_expires: 1900000000L,
+  }
+  let sib_sessions : Map[String, String] = Map::new()
+  sib_sessions.set("u-sib", "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+  let disk_doc : Array[base_codec::Json] = [serialize_stored_accounts([sib], sessions=Some(sib_sessions))]
+  let write_count : Array[Int] = [0]
+
+  // (a) `auth.cancel` BEFORE write_accounts_k: `pre_write_check` aborts with 0 disk writes!
+  let login_gen : Array[Int64] = [1L]
+  let captured_gen_a = login_gen[0]
+  login_gen[0] = 2L // simulated `auth.cancel`
+  let cand_a = views::StoredAccount::{
+    sub: "u-new", email: "new@still.fail", name: "New", picture: "", access: "anew1", refresh: "rnew1", access_expires: 1900000000L,
+  }
+  let res_a : Array[String] = [""]
+  let _ = rt.fork(fn(fk : (effect::Exit[Unit]) -> Unit) -> Unit {
+    coord.upsert_account_cas_k(
+      fn(rk : (HostStorageRead) -> Unit) -> Unit { rk(HostStorageRead::Found(disk_doc[0])) },
+      fn(doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit {
+        write_count[0] = write_count[0] + 1
+        disk_doc[0] = doc
+        wk(Ok(()))
+      },
+      cand_a,
+      "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+      fn(r : Result[(Array[views::StoredAccount], Map[String, String]), String]) -> Unit {
+        match r {
+          Err(m) => { res_a[0] = m }
+          Ok(_) => { res_a[0] = "unexpected_ok" }
+        }
+        fk(effect::Exit::Succeeded(()))
+      },
+      pre_write_check=Some(fn() -> Result[Unit, String] {
+        if login_gen[0] != captured_gen_a { Err("login_expired") } else { Ok(()) }
+      }),
+    )
+  })
+  let _ = rt.run_ready()
+  debug_assert(res_a[0] == "login_expired" && write_count[0] == 0, "pre_write_check aborts cancelled login with 0 disk writes")
+
+  // (b) `auth.cancel` / new `auth.begin` DURING in-flight `write_accounts_k`: rollback CAS removes `(u-new, sid1, rnew1)` while preserving sibling `u-sib`!
+  let captured_gen_b = login_gen[0]
+  let deferred_wk : Array[Option[(Result[Unit, String]) -> Unit]] = [None]
+  let rolled_back : Array[Bool] = [false]
+  let installed_b : Array[Bool] = [false]
+  let _ = rt.fork(fn(fk : (effect::Exit[Unit]) -> Unit) -> Unit {
+    coord.upsert_account_cas_k(
+      fn(rk : (HostStorageRead) -> Unit) -> Unit { rk(HostStorageRead::Found(disk_doc[0])) },
+      fn(doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit {
+        write_count[0] = write_count[0] + 1
+        disk_doc[0] = doc
+        deferred_wk[0] = Some(wk)
+      },
+      cand_a,
+      "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+      fn(r : Result[(Array[views::StoredAccount], Map[String, String]), String]) -> Unit {
+        match r {
+          Ok(_) => if login_gen[0] != captured_gen_b {
+            coord.rollback_account_cas_k(
+              fn(rk : (HostStorageRead) -> Unit) -> Unit { rk(HostStorageRead::Found(disk_doc[0])) },
+              fn(doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit {
+                disk_doc[0] = doc
+                wk(Ok(()))
+              },
+              "u-new",
+              "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+              "rnew1",
+              fn(rb : Result[Bool, String]) -> Unit {
+                match rb {
+                  Ok(v) => { rolled_back[0] = v }
+                  Err(_) => ()
+                }
+                fk(effect::Exit::Succeeded(()))
+              },
+            )
+          } else {
+            installed_b[0] = true
+            fk(effect::Exit::Succeeded(()))
+          }
+          Err(_) => fk(effect::Exit::Succeeded(()))
+        }
+      },
+      pre_write_check=Some(fn() -> Result[Unit, String] {
+        if login_gen[0] != captured_gen_b { Err("login_expired") } else { Ok(()) }
+      }),
+    )
+  })
+  let _ = rt.run_ready()
+  debug_assert(write_count[0] == 1 && deferred_wk[0].is_some(), "write_accounts_k is now in flight")
+  // Now `auth.cancel` / new `auth.begin` arrives while write is in flight!
+  login_gen[0] = 3L
+  match deferred_wk[0] {
+    Some(wk) => wk(Ok(()))
+    None => panic("missing deferred_wk")
+  }
+  let _ = rt.run_ready()
+  debug_assert(!installed_b[0] && rolled_back[0], "superseded in-flight write must not install and must CAS-rollback disk")
+  let after_rb = match parse_stored_accounts_strict(disk_doc[0]) {
+    Some(xs) => xs
+    None => panic("disk_doc valid after rollback")
+  }
+  debug_assert(after_rb.length() == 1 && after_rb[0].sub == "u-sib", "rollback removed u-new and preserved sibling u-sib")
+
+  // (c) Stale rollback MUST NOT clobber a newer login for `u-new` with a different session ULID!
+  let cand_newer = views::StoredAccount::{
+    sub: "u-new", email: "new@still.fail", name: "New", picture: "", access: "anew2", refresh: "rnew2", access_expires: 1900000000L,
+  }
+  let newer_ok : Array[Bool] = [false]
+  let _ = rt.fork(fn(fk : (effect::Exit[Unit]) -> Unit) -> Unit {
+    coord.upsert_account_cas_k(
+      fn(rk : (HostStorageRead) -> Unit) -> Unit { rk(HostStorageRead::Found(disk_doc[0])) },
+      fn(doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit {
+        disk_doc[0] = doc
+        wk(Ok(()))
+      },
+      cand_newer,
+      "01ARZ3NDEKTSV4RRFFQ69G5FB2",
+      fn(r : Result[(Array[views::StoredAccount], Map[String, String]), String]) -> Unit {
+        match r {
+          Ok(_) => { newer_ok[0] = true }
+          Err(_) => ()
+        }
+        fk(effect::Exit::Succeeded(()))
+      },
+    )
+  })
+  let _ = rt.run_ready()
+  debug_assert(newer_ok[0], "newer login persisted")
+  let stale_rb : Array[Bool] = [true]
+  let _ = rt.fork(fn(fk : (effect::Exit[Unit]) -> Unit) -> Unit {
+    coord.rollback_account_cas_k(
+      fn(rk : (HostStorageRead) -> Unit) -> Unit { rk(HostStorageRead::Found(disk_doc[0])) },
+      fn(doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit {
+        disk_doc[0] = doc
+        wk(Ok(()))
+      },
+      "u-new",
+      "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+      "rnew1",
+      fn(rb : Result[Bool, String]) -> Unit {
+        match rb {
+          Ok(v) => { stale_rb[0] = v }
+          Err(_) => ()
+        }
+        fk(effect::Exit::Succeeded(()))
+      },
+    )
+  })
+  let _ = rt.run_ready()
+  debug_assert(!stale_rb[0], "stale rollback must NOT touch newer session")
+  let after_stale = match parse_stored_accounts_strict(disk_doc[0]) {
+    Some(xs) => xs
+    None => panic("disk_doc valid after stale rollback")
+  }
+  debug_assert(after_stale.length() == 2, "newer login preserved alongside sibling")
+
+  // 2. Item 3: Staged `switch_account_db(..., emit_auth_boundary=false)` into DB with persisted `pending_purges`
+  //    executes full DDL cleanup & advances internal gens while emitting ZERO `on_boundary` callbacks and ZERO wire frames!
+  let (_, mem_init) = make_sim_db(rt)
+  let (_, db_pend) = make_sim_db(rt)
+  let pcore = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, mem_init, core_offline_transport(), fn() -> Unit {})
+  pcore.membership.set_unauthenticated(true)
+  // Seed `db_pend` with persisted `pending_purges` for `ULID_WS2` plus a workspace row for `ULID_WS2` and `ULID_WS1`:
+  mt_put_workspace(db_pend, ULID_WS1, "{\"id\":\"" + ULID_WS1 + "\",\"name\":\"Keep WS\",\"role\":\"owner\"}")
+  mt_put_workspace(db_pend, ULID_WS2, "{\"id\":\"" + ULID_WS2 + "\",\"name\":\"Pending Purge WS\",\"role\":\"member\"}")
+  let _ = store::put_meta(db_pend, "membership:account_sub", "u-alice")
+  let _ = store::put_meta(
+    db_pend,
+    "membership:pending_purges",
+    "{\"u-alice\":{\"" + ULID_WS2 + "\":{\"op_gen\":5,\"stations\":[\"" + ULID_WS2 + "/st-2\"]}}}",
+  )
+  let boundary_count : Array[Int] = [0]
+  let wire_count : Array[Int] = [0]
+  let _ = pcore.auth.on_boundary(fn(_ev : AuthBoundaryEvent) -> Unit {
+    boundary_count[0] = boundary_count[0] + 1
+  })
+  pcore.set_wire_sink(fn(_j : String, _b : Option[Bytes]) -> Unit {
+    wire_count[0] = wire_count[0] + 1
+  })
+  let gen_before = pcore.auth.workspace_auth_gen(ULID_WS2)
+  match pcore.switch_account_db(db_pend, "u-alice", emit_auth_boundary=false) {
+    Ok(_) => ()
+    Err(e) => panic("staged switch_account_db failed: " + e)
+  }
+  debug_assert(boundary_count[0] == 0 && wire_count[0] == 0, "0 auth/sub frames emitted during staged DB install with pending_purges")
+  debug_assert(!pcore.membership.has_pending_purge(ULID_WS2), "pending_purge for WS2 was executed and cleared")
+  debug_assert(pcore.auth.workspace_auth_gen(ULID_WS2) > gen_before, "internal authGen advanced silently during staged drop")
+  let _ = pcore.auth.bump_all()
+  debug_assert(boundary_count[0] == 1, "exactly 1 consistent boundary emitted by final bump_all")
+
+  // 3. Item 4: `notify` account isolation + workspace/muted filtering on revocation, 401 with sibling, and switch to Bob!
+  let (_, db_n1) = make_sim_db(rt)
+  let (_, mem_n) = make_sim_db(rt)
+  let (_, db_n2) = make_sim_db(rt)
+  let ncore = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, db_n1, core_offline_transport(), fn() -> Unit {})
+  let _ = ncore.set_db_account_sub("u-alice")
+  ncore.set_viewer("alice@still.fail", sub="u-alice", role="owner")
+  ncore.auth_store.register_account(views::StoredAccount::{
+    sub: "u-alice", email: "alice@still.fail", name: "Alice", picture: "", access: "a1", refresh: "r1", access_expires: 1900000000L,
+  })
+  ncore.auth_store.register_account(views::StoredAccount::{
+    sub: "u-bob", email: "bob@still.fail", name: "Bob", picture: "", access: "a2", refresh: "r2", access_expires: 1900000000L,
+  })
+  ncore.account_sessions.set("u-alice", "s-a")
+  ncore.account_sessions.set("u-bob", "s-b")
+  let _ = ncore.commit_cloud_me(
+    mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "Alice Secret WS1", "owner"), (ULID_WS2, "Alice Secret WS2", "owner")]),
+    req_seq=1L,
+  )
+  let _ = mt_expect_ok_json(
+    mt_call(ncore, 30L, "notify.set", base_codec::json_obj([
+      ("muted", base_codec::json_arr([base_codec::json_str(ULID_WS1), base_codec::json_str(ULID_WS2)])),
+    ])),
+    "alice notify.set muted=[WS1, WS2]",
+  )
+  // Revoking WS2 MUST immediately hide WS2 from BOTH `notify.workspaces` AND `notify.muted`!
+  let _ = ncore.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "Alice Secret WS1", "owner")]), req_seq=2L)
+  let n_after_rev = base_codec::json_stringify(mt_expect_val_json(mt_sub(ncore, 31L, "notify", []), "notify after WS2 revoke"))
+  debug_assert(n_after_rev.contains("Alice Secret WS1") && !n_after_rev.contains("Alice Secret WS2") && !n_after_rev.contains(ULID_WS2), "revoked WS2 filtered from both notify.workspaces and notify.muted")
+  // Alice 401 invalidation WITH sibling Bob remaining + switch back to `:memory:` -> `notify` returns 0 workspaces and 0 muted!
+  let _ = ncore.invalidate_session("u-alice", expected_session=Some("s-a"), expected_refresh=Some("r1"), persist_accounts=false)
+  ncore.switch_to_unauthenticated_db(mem_n)
+  let n_after_401 = base_codec::json_stringify(mt_expect_val_json(mt_sub(ncore, 32L, "notify", []), "notify after 401"))
+  debug_assert(n_after_401.contains("\"workspaces\":[]") && n_after_401.contains("\"muted\":[]") && !n_after_401.contains("Alice Secret WS1") && !n_after_401.contains(ULID_WS1), "notify empty after active-account 401 even with sibling")
+  // Same-process login as Bob (whose DB has NO `notify` doc): MUST NOT inherit Alice's `notify_muted`!
+  match ncore.switch_account_db(db_n2, "u-bob") {
+    Ok(_) => ()
+    Err(e) => panic("same-process switch to Bob failed: " + e)
+  }
+  let n_bob = base_codec::json_stringify(mt_expect_val_json(mt_sub(ncore, 33L, "notify", []), "bob notify"))
+  debug_assert(n_bob.contains("\"muted\":[]") && !n_bob.contains(ULID_WS1), "Bob inherits 0 muted workspaces from Alice")
+
+  // 4. Item 6: Outbound `FrameOutbox` per-station delivery gate drops revoked-workspace frames queued before revocation!
+  let (_, db_ob) = make_sim_db(rt)
+  let obcore = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, db_ob, core_offline_transport(), fn() -> Unit {})
+  let _ = obcore.set_db_account_sub("u-alice")
+  let _ = obcore.commit_cloud_me(
+    mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner"), (ULID_WS2, "W2", "owner")]),
+    req_seq=1L,
+  )
+  let _ = obcore.membership.bind_station_checked(ULID_WS1, "st-1")
+  let _ = obcore.membership.bind_station_checked(ULID_WS2, "st-2")
+  obcore.outbox.tell(CoreEvent::EntryAdded(
+    ULID_WS1 + "/st-1",
+    10,
+    store::Entry::{
+      n: 1, kind: "message", author_kind: "person", author: "alice",
+      text: "TOP_SECRET_WSA_PLAINTEXT", notice: None, files: 0, letter: false,
+    },
+    None,
+  ))
+  obcore.outbox.tell(CoreEvent::EntryAdded(
+    ULID_WS2 + "/st-2",
+    20,
+    store::Entry::{
+      n: 2, kind: "message", author_kind: "person", author: "alice",
+      text: "ALLOWED_WSB_PLAINTEXT", notice: None, files: 0, letter: false,
+    },
+    None,
+  ))
+  // BEFORE draining `outbox`, Cloud `/v1/me` revokes `ULID_WS1` while keeping `ULID_WS2`!
+  let _ = obcore.commit_cloud_me(
+    mt_make_me("u-alice", "alice@still.fail", [(ULID_WS2, "W2", "owner")]),
+    req_seq=2L,
+  )
+  let drained = obcore.drain_frame()
+  let mut saw_revoked = false
+  let mut saw_allowed = false
+  for i in 0..<drained.length() {
+    match drained[i] {
+      CoreEvent::EntryAdded(st, _, ent, _) => {
+        if st.contains(ULID_WS1) || ent.text.contains("TOP_SECRET_WSA_PLAINTEXT") {
+          saw_revoked = true
+        }
+        if st == ULID_WS2 + "/st-2" && ent.text == "ALLOWED_WSB_PLAINTEXT" {
+          saw_allowed = true
+        }
+      }
+      _ => ()
+    }
+  }
+  debug_assert(!saw_revoked && saw_allowed, "drain_frame MUST drop revoked-workspace frames and deliver only authorized frames")
+}
+
+// ── Test 12 (R5 Primitives A, B, C): restore_prev rollback, active-account [0] & active_sub workspace grouping,
+//    same-turn revoke+rejoin outbox purge + ws_auth_gen stamp gate, and unified notify billed=false default ──
+
+test "Slice 2B-1 R5: restore_prev rollback, active account ordering/grouping, same-turn revoke+rejoin outbox gate, notify billed=false" {
+  let rt = effect::Runtime::new()
+
+  // 1. Primitive A (`restore_prev` rollback preserves original same-sub tuple on disk):
+  let coord = AccountRefreshCoordinator::new()
+  let orig_alice = views::StoredAccount::{
+    sub: "u-alice", email: "alice@still.fail", name: "Alice", picture: "", access: "acc-old", refresh: "ref-old", access_expires: 1900000000L,
+  }
+  let bob = views::StoredAccount::{
+    sub: "u-bob", email: "bob@still.fail", name: "Bob", picture: "", access: "acc-bob", refresh: "ref-bob", access_expires: 1900000000L,
+  }
+  let s_init : Map[String, String] = Map::new()
+  s_init.set("u-alice", "01ARZ3NDEKTSV4RRFFQ69G5FA1")
+  s_init.set("u-bob", "01ARZ3NDEKTSV4RRFFQ69G5FB1")
+  let disk_doc : Array[base_codec::Json] = [serialize_stored_accounts([bob, orig_alice], sessions=Some(s_init))]
+
+  // Re-login of `u-alice` places `u-alice` at index 0 (`[u-alice, u-bob]`):
+  let new_alice = views::StoredAccount::{
+    sub: "u-alice", email: "alice@still.fail", name: "Alice", picture: "", access: "acc-new", refresh: "ref-new", access_expires: 1900000000L,
+  }
+  let up_ok : Array[Bool] = [false]
+  let _ = rt.fork(fn(fk : (effect::Exit[Unit]) -> Unit) -> Unit {
+    coord.upsert_account_cas_k(
+      fn(rk : (HostStorageRead) -> Unit) -> Unit { rk(HostStorageRead::Found(disk_doc[0])) },
+      fn(doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit {
+        disk_doc[0] = doc
+        wk(Ok(()))
+      },
+      new_alice,
+      "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+      fn(r : Result[(Array[views::StoredAccount], Map[String, String]), String]) -> Unit {
+        match r {
+          Ok((list, _)) => {
+            up_ok[0] = list.length() == 2 && list[0].sub == "u-alice" && list[1].sub == "u-bob"
+          }
+          Err(_) => ()
+        }
+        fk(effect::Exit::Succeeded(()))
+      },
+    )
+  })
+  let _ = rt.run_ready()
+  debug_assert(up_ok[0], "upsert_account_cas_k MUST place newly signed-in active account at index 0")
+
+  // Rollback with `restore_prev=Some((orig_alice, old_sid))` MUST restore original `ref-old` instead of deleting `u-alice`!
+  let rb_ok : Array[Bool] = [false]
+  let _ = rt.fork(fn(fk : (effect::Exit[Unit]) -> Unit) -> Unit {
+    coord.rollback_account_cas_k(
+      fn(rk : (HostStorageRead) -> Unit) -> Unit { rk(HostStorageRead::Found(disk_doc[0])) },
+      fn(doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit {
+        disk_doc[0] = doc
+        wk(Ok(()))
+      },
+      "u-alice",
+      "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+      "ref-new",
+      fn(r : Result[Bool, String]) -> Unit {
+        match r {
+          Ok(v) => { rb_ok[0] = v }
+          Err(_) => ()
+        }
+        fk(effect::Exit::Succeeded(()))
+      },
+      restore_prev=Some((orig_alice, "01ARZ3NDEKTSV4RRFFQ69G5FA1")),
+    )
+  })
+  let _ = rt.run_ready()
+  debug_assert(rb_ok[0], "rollback with restore_prev succeeded")
+  let restored_list = match parse_stored_accounts_strict(disk_doc[0]) {
+    Some(xs) => xs
+    None => panic("valid disk_doc after restore_prev")
+  }
+  let restored_sids = parse_stored_account_sessions(disk_doc[0])
+  debug_assert(restored_list.length() == 2 && restored_list[0].sub == "u-alice" && restored_list[0].refresh == "ref-old", "restore_prev preserved u-alice with original ref-old")
+  let restored_sid = match restored_sids.get("u-alice") { Some(s) => s; None => "" }
+  debug_assert(restored_sid == "01ARZ3NDEKTSV4RRFFQ69G5FA1", "restore_prev restored original session id")
+
+  // 2. Primitive B: `workspaces` topic groups workspaces under active bound `db_account_sub` (even if `accounts[0]` is a sibling!):
+  let (_, db_grp) = make_sim_db(rt)
+  let gcore = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, db_grp, core_offline_transport(), fn() -> Unit {})
+  let _ = gcore.set_db_account_sub("u-alice")
+  gcore.set_viewer("alice@still.fail", sub="u-alice", role="owner")
+  // Register Bob FIRST (index 0) and Alice SECOND (index 1) to prove `project_workspaces` keys on `active_sub`, NOT blind `accounts[0]`!
+  gcore.auth_store.register_account(bob)
+  gcore.auth_store.register_account(orig_alice)
+  let _ = gcore.commit_cloud_me(
+    mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "Alice Private WS", "owner")]),
+    req_seq=1L,
+  )
+  let ws_grouped = mt_expect_val_json(mt_sub(gcore, 80L, "workspaces", []), "workspaces grouped by active_sub")
+  match ws_grouped {
+    base_codec::Json::Arr(grps) => {
+      debug_assert(grps.length() == 2, "two account groups")
+      let bob_s = base_codec::json_stringify(grps[0])
+      let alice_s = base_codec::json_stringify(grps[1])
+      debug_assert(bob_s.contains("u-bob") && !bob_s.contains("Alice Private WS"), "Bob group must have 0 Alice workspaces")
+      debug_assert(alice_s.contains("u-alice") && alice_s.contains("Alice Private WS"), "Alice group must own Alice workspaces")
+    }
+    _ => panic("workspaces topic must return array")
+  }
+
+  // 3. Primitive C (Codex P1-5): Same-turn enqueue -> revoke WS1 -> rejoin WS1 -> drain_frame MUST emit 0 pre-purge frames!
+  let (_, db_rj) = make_sim_db(rt)
+  let rcore = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, db_rj, core_offline_transport(), fn() -> Unit {})
+  // Verify Codex P2-1 default `notify_kinds.billed == false` both on fresh init AND after `clear_account_scoped_runtime_state()`!
+  debug_assert(!rcore.notify_kinds.billed, "ClientCore::new default notify_kinds.billed must be false")
+  rcore.notify_kinds = views::NotifyKindsInput::{ wait: true, failed: true, done: "away", message: true, billed: true }
+  rcore.clear_account_scoped_runtime_state()
+  debug_assert(!rcore.notify_kinds.billed, "clear_account_scoped_runtime_state must reset notify_kinds.billed to false")
+
+  let _ = rcore.set_db_account_sub("u-alice")
+  let _ = rcore.commit_cloud_me(
+    mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner"), (ULID_WS2, "W2", "owner")]),
+    req_seq=1L,
+  )
+  let _ = rcore.membership.bind_station_checked(ULID_WS1, "st-1")
+  let _ = rcore.membership.bind_station_checked(ULID_WS2, "st-2")
+  rcore.outbox.tell(CoreEvent::EntryAdded(
+    ULID_WS1 + "/st-1",
+    10,
+    store::Entry::{
+      n: 1, kind: "message", author_kind: "person", author: "alice",
+      text: "PRE_PURGE_SECRET_TEXT", notice: None, files: 0, letter: false,
+    },
+    None,
+  ))
+  // Same turn: revoke WS1 then immediately rejoin WS1 BEFORE draining outbox!
+  let _ = rcore.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS2, "W2", "owner")]), req_seq=2L)
+  debug_assert(rcore.outbox.waiting() == 0, "drop_workspace immediately evicted WS1 frames from outbox")
+  let _ = rcore.commit_cloud_me(
+    mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner"), (ULID_WS2, "W2", "owner")]),
+    req_seq=3L,
+  )
+  let drained1 = rcore.drain_frame()
+  for i in 0..<drained1.length() {
+    match drained1[i] {
+      CoreEvent::EntryAdded(_, _, ent, _) => debug_assert(!ent.text.contains("PRE_PURGE_SECRET_TEXT"), "0 pre-purge frames after same-turn rejoin")
+      _ => ()
+    }
+  }
+  // Depth-in-defense (R6 Item 2):
+  // (a) Normal lock/role `auth.bump_workspace(ULID_WS1)` (WITHOUT purge!) MUST NOT drop already-queued
+  //     `EntryAdded` or `ConnectionChanged(Connected)` frames!
+  rcore.outbox.tell(CoreEvent::ConnectionChanged(ULID_WS1 + "/st-1", ConnectionState::Connected))
+  rcore.outbox.tell(CoreEvent::EntryAdded(
+    ULID_WS1 + "/st-1",
+    11,
+    store::Entry::{
+      n: 2, kind: "message", author_kind: "person", author: "alice",
+      text: "SURVIVES_NORMAL_LOCK_AUTH_BUMP", notice: None, files: 0, letter: false,
+    },
+    None,
+  ))
+  let _ = rcore.auth.bump_workspace(ULID_WS1)
+  let drained_normal = rcore.drain_frame()
+  debug_assert(drained_normal.length() == 2, "normal lock authGen bump MUST NOT drop queued EntryAdded or Connected frames")
+
+  // (b) Explicit workspace-scoped `LockUpdated(WS2)` / `LockRejected(WS2)` queued while `self.workspace == WS1`
+  //     MUST be evicted by `WS2` revocation and NEVER delivered by `drain_frame`!
+  rcore.outbox.tell(CoreEvent::LockUpdated(ULID_WS2, "head-ws2", 1000.0, 1))
+  rcore.outbox.tell(CoreEvent::LockRejected(ULID_WS2, "secret-ws2-lock-reason"))
+  rcore.outbox.tell(CoreEvent::EntryAdded(
+    ULID_WS1 + "/st-1",
+    12,
+    store::Entry::{
+      n: 3, kind: "message", author_kind: "person", author: "alice",
+      text: "WS1_SURVIVES_WS2_REVOKE", notice: None, files: 0, letter: false,
+    },
+    None,
+  ))
+  let _ = rcore.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner")]), req_seq=4L)
+  let drained_ws2_rev = rcore.drain_frame()
+  let mut saw_ws2_lock = false
+  let mut saw_ws1_ok = false
+  for i in 0..<drained_ws2_rev.length() {
+    match drained_ws2_rev[i] {
+      CoreEvent::LockUpdated(ws, _, _, _) => if ws == ULID_WS2 { saw_ws2_lock = true }
+      CoreEvent::LockRejected(ws, _) => if ws == ULID_WS2 { saw_ws2_lock = true }
+      CoreEvent::EntryAdded(_, _, ent, _) => if ent.text == "WS1_SURVIVES_WS2_REVOKE" { saw_ws1_ok = true }
+      _ => ()
+    }
+  }
+  debug_assert(!saw_ws2_lock && saw_ws1_ok, "revoking WS2 evicts WS2 LockUpdated/LockRejected while keeping WS1 frames")
+
+  // (c) Depth-in-defense: bumping `workspace_purge_gen(ULID_WS1)` rejects pre-purge frames even without `retain_where`,
+  //     while fresh frames enqueued AFTER purge/rejoin deliver normally!
+  rcore.outbox.tell(CoreEvent::EntryAdded(
+    ULID_WS1 + "/st-1",
+    13,
+    store::Entry::{
+      n: 4, kind: "message", author_kind: "person", author: "alice",
+      text: "STALE_PURGE_GEN_TEXT", notice: None, files: 0, letter: false,
+    },
+    None,
+  ))
+  let _ = rcore.membership.bump_workspace_purge_gen(ULID_WS1)
+  debug_assert(rcore.drain_frame().length() == 0, "workspace_purge_gen mismatch rejects stale pre-purge frame")
+  rcore.outbox.tell(CoreEvent::EntryAdded(
+    ULID_WS1 + "/st-1",
+    14,
+    store::Entry::{
+      n: 5, kind: "message", author_kind: "person", author: "alice",
+      text: "FRESH_POST_REJOIN_TEXT", notice: None, files: 0, letter: false,
+    },
+    None,
+  ))
+  let drained3 = rcore.drain_frame()
+  debug_assert(drained3.length() == 1, "fresh post-rejoin frame delivered cleanly")
+}
+
+// ── Test 13 (R11): Single-owner refresh persistence discipline, 401 fail-closed gate, member role default, and multi-WS Ed25519 lock recovery ──
+
+test "Slice 2B-1 R11: 200 write-error preserves R1, 401 write-error closes gate, sibling preserved, member role default, and Ed25519 lock recovery" {
+  let rt = effect::Runtime::new()
+
+  // 1. 200 rotation whose disk write fails (`ENOSPC`): returns `Transient` AND memory stays on `R1`
+  //    (NEVER advances memory to un-persisted `R2`!).
+  let acct_a = views::StoredAccount::{
+    sub: "u-a", email: "a@still.fail", name: "Alice", picture: "",
+    access: "acc-R1", refresh: "R1", access_expires: 100L,
+  }
+  let sids_a : Map[String, String] = Map::new()
+  sids_a.set("u-a", "sid-1")
+  let disk_a : Array[base_codec::Json] = [serialize_stored_accounts([acct_a], sessions=Some(sids_a))]
+  let mem_ref_a : Array[String] = ["R1"]
+  let adopt_calls_a : Array[Int] = [0]
+  let outcome_a : Array[String] = [""]
+  let coord_a = AccountRefreshCoordinator::new()
+  let host_a = AccountRefreshHost::{
+    read_accounts_k: fn(rk : (HostStorageRead) -> Unit) -> Unit { rk(HostStorageRead::Found(disk_a[0])) },
+    write_accounts_k: fn(_doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit { wk(Err("enospc")) },
+    do_refresh_http_k: fn(_rtok : String, _now : Int64, hk : (effect::Exit[Result[RefreshedTokens, RefreshTokenError]]) -> Unit) -> Unit {
+      hk(effect::Exit::Succeeded(Ok(RefreshedTokens::{
+        access: "acc-R2", refresh: "R2", access_expires: 999999L, name: None,
+      })))
+    },
+    get_mem_tuple: fn(_sub : String) -> Option[(String, String)] { Some(("sid-1", mem_ref_a[0])) },
+    on_adopt_or_update: fn(u, _sid, _all, _ss) -> Unit {
+      adopt_calls_a[0] += 1
+      mem_ref_a[0] = u.refresh
+    },
+    on_invalidated: fn(_sub, _sid, _ref, _confirmed) -> Unit {},
+    now_ms: fn() -> Int64 { 200000L },
+  }
+  let _ = rt.fork(fn(fk : (effect::Exit[Unit]) -> Unit) -> Unit {
+    coord_a.refresh_k(host_a, "u-a", "sid-1", "R1", fn(out : AccountRefreshOutcome) -> Unit {
+      match out {
+        AccountRefreshOutcome::Transient(m) => { outcome_a[0] = m }
+        _ => { outcome_a[0] = "unexpected" }
+      }
+      fk(effect::Exit::Succeeded(()))
+    })
+  })
+  let _ = rt.run_ready()
+  debug_assert(outcome_a[0].contains("enospc"), "200 write failure must return Transient(enospc)")
+  debug_assert(adopt_calls_a[0] == 0 && mem_ref_a[0] == "R1", "200 write failure MUST NOT advance memory to un-persisted R2")
+
+  // 2. 401 invalidation whose disk write fails: STILL invokes `on_invalidated` with `None`
+  //    (signaling disk state unknown / `removed=false` so runtime records rejected_tuple & preserves siblings!).
+  let acct_b = views::StoredAccount::{
+    sub: "u-b", email: "b@still.fail", name: "Bob", picture: "",
+    access: "acc-b", refresh: "ref-b", access_expires: 999999L,
+  }
+  let sids_b : Map[String, String] = Map::new()
+  sids_b.set("u-a", "sid-1")
+  sids_b.set("u-b", "sid-b")
+  let disk_b : Array[base_codec::Json] = [serialize_stored_accounts([acct_a, acct_b], sessions=Some(sids_b))]
+  let fail_write_b : Array[Bool] = [true]
+  let inval_fired_b : Array[Bool] = [false]
+  let inval_rem_b : Array[Int] = [-1]
+  let removed_flag_b : Array[Bool] = [true]
+  let coord_b = AccountRefreshCoordinator::new()
+  let host_b = AccountRefreshHost::{
+    read_accounts_k: fn(rk : (HostStorageRead) -> Unit) -> Unit { rk(HostStorageRead::Found(disk_b[0])) },
+    write_accounts_k: fn(doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit {
+      if fail_write_b[0] {
+        wk(Err("disk_readonly"))
+      } else {
+        disk_b[0] = doc
+        wk(Ok(()))
+      }
+    },
+    do_refresh_http_k: fn(_rtok : String, _now : Int64, hk : (effect::Exit[Result[RefreshedTokens, RefreshTokenError]]) -> Unit) -> Unit {
+      hk(effect::Exit::Succeeded(Err(RefreshTokenError::InvalidSession(401, "invalid_grant"))))
+    },
+    get_mem_tuple: fn(_sub : String) -> Option[(String, String)] { Some(("sid-1", "R1")) },
+    on_adopt_or_update: fn(_u, _sid, _all, _ss) -> Unit {},
+    on_invalidated: fn(_sub, _sid, _ref, confirmed) -> Unit {
+      inval_fired_b[0] = true
+      match confirmed {
+        Some((rem, _)) => { inval_rem_b[0] = rem.length() }
+        None => { inval_rem_b[0] = -2 }
+      }
+    },
+    now_ms: fn() -> Int64 { 200000L },
+  }
+  let _ = rt.fork(fn(fk : (effect::Exit[Unit]) -> Unit) -> Unit {
+    coord_b.refresh_k(host_b, "u-a", "sid-1", "R1", fn(out : AccountRefreshOutcome) -> Unit {
+      match out {
+        AccountRefreshOutcome::InvalidSession(code, _, removed) => {
+          debug_assert(code == 401, "401 status preserved")
+          removed_flag_b[0] = removed
+        }
+        _ => panic("expected InvalidSession on 401")
+      }
+      fk(effect::Exit::Succeeded(()))
+    })
+  })
+  let _ = rt.run_ready()
+  debug_assert(inval_fired_b[0] && inval_rem_b[0] == -2 && !removed_flag_b[0], "401 write failure MUST invoke on_invalidated(None) with removed=false")
+
+  // 3. 401 invalidation with writable disk: removes `u-a`, preserves sibling `u-b`, and returns `removed=true`.
+  fail_write_b[0] = false
+  inval_fired_b[0] = false
+  inval_rem_b[0] = -1
+  let _ = rt.fork(fn(fk : (effect::Exit[Unit]) -> Unit) -> Unit {
+    coord_b.refresh_k(host_b, "u-a", "sid-1", "R1", fn(out : AccountRefreshOutcome) -> Unit {
+      match out {
+        AccountRefreshOutcome::InvalidSession(401, _, removed) => { removed_flag_b[0] = removed }
+        _ => panic("expected InvalidSession(401, _, true)")
+      }
+      fk(effect::Exit::Succeeded(()))
+    })
+  })
+  let _ = rt.run_ready()
+  debug_assert(inval_fired_b[0] && inval_rem_b[0] == 1 && removed_flag_b[0], "401 CAS removes u-a and preserves sibling u-b")
+  let disk_after_b = match parse_stored_accounts_strict(disk_b[0]) {
+    Some(xs) => xs
+    None => panic("valid disk after 401 CAS")
+  }
+  debug_assert(disk_after_b.length() == 1 && disk_after_b[0].sub == "u-b", "only sibling u-b remains on disk")
+
+  // 4. `ClientCore::switch_account_db` fresh OAuth DB defaults `viewer_role == "member"` (NEVER `"owner"`!),
+  //    verified admin DB restores `"admin"`, and `commit_cloud_workspace` updates `viewer_role`!
+  let (_, mem_base) = make_sim_db(rt)
+  let (_, fresh_oauth_db) = make_sim_db(rt)
+  let (_, verified_admin_db) = make_sim_db(rt)
+  mt_put_workspace(verified_admin_db, ULID_WS1, "{\"id\":\"" + ULID_WS1 + "\",\"name\":\"Admin WS\",\"role\":\"admin\"}")
+  let r11_core = ClientCore::new("ws-default", "st-local", rt, mem_base, core_offline_transport(), fn() -> Unit {})
+  r11_core.membership.set_unauthenticated(true)
+  match r11_core.switch_account_db(fresh_oauth_db, "u-fresh") {
+    Ok(_) => ()
+    Err(e) => panic("switch_account_db fresh failed: " + e)
+  }
+  debug_assert(r11_core.viewer_role() == "member", "fresh OAuth login MUST default viewer_role to member (NEVER owner!)")
+  let (_, mem_base2) = make_sim_db(rt)
+  r11_core.switch_to_unauthenticated_db(mem_base2)
+  match r11_core.switch_account_db(verified_admin_db, "u-admin") {
+    Ok(_) => ()
+    Err(e) => panic("switch_account_db admin failed: " + e)
+  }
+  r11_core.switch_workspace(ULID_WS1)
+  debug_assert(r11_core.viewer_role() == "admin", "verified workspace DB restores viewer_role == admin")
+  match r11_core.commit_cloud_workspace(mt_make_ws(ULID_WS1, "Owner WS", "owner", ["st-1"]), req_seq=1L) {
+    Ok(true) => ()
+    _ => panic("commit_cloud_workspace owner upgrade failed")
+  }
+  debug_assert(r11_core.viewer_role() == "owner", "commit_cloud_workspace updates viewer_role to owner")
+
+  // 5. Multi-workspace Ed25519 lock root + station frame delivery recovery across `switch_to_unauthenticated_db` -> `switch_account_db`!
+  let (_, ws_db) = make_sim_db(rt)
+  let (_, unauth_db) = make_sim_db(rt)
+  let mcore = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, ws_db, core_offline_transport(), fn() -> Unit {})
+  let _ = mcore.set_db_account_sub("u-multi")
+  let _ = mcore.commit_cloud_me(
+    mt_make_me("u-multi", "m@still.fail", [(ULID_WS1, "W1", "owner"), (ULID_WS2, "W2", "owner")]),
+    req_seq=1L,
+  )
+  mcore.switch_workspace(ULID_WS2)
+  let _ = mcore.membership.bind_station_checked(ULID_WS2, "st-2")
+  let ws2_seed = make_seed(88)
+  let ws2_key = ed25519_key_id(ws2_seed)
+  let ws2_gen_unsigned = form::Json::Obj([
+    ("v", form::Json::Num(1.0)),
+    ("ws", form::Json::Str(ULID_WS2)),
+    ("seq", form::Json::Num(0.0)),
+    ("prev", form::Json::Null),
+    ("at", form::Json::Num(1700000000.0)),
+    ("kind", form::Json::Str("genesis")),
+    (
+      "body",
+      form::Json::Obj([
+        ("owner", form::Json::Str("u-multi")),
+        ("origins", form::Json::Arr([form::Json::Str("https://app.still.fail")])),
+        ("rp_id", form::Json::Str("still.fail")),
+        ("cloud_keys", form::Json::Obj([])),
+        (
+          "members",
+          form::Json::Arr([
+            form::Json::Obj([
+              ("sub", form::Json::Str("u-multi")),
+              ("email", form::Json::Str("m@still.fail")),
+              ("role", form::Json::Str("owner")),
+            ]),
+          ]),
+        ),
+        (
+          "devices",
+          form::Json::Arr([
+            form::Json::Obj([
+              ("id", form::Json::Str(hex_64("8"))),
+              ("sub", form::Json::Str("u-multi")),
+              ("kind", form::Json::Str("app")),
+              ("label", form::Json::Str("Mac")),
+              ("sign_key", form::Json::Str(ws2_key)),
+            ]),
+          ]),
+        ),
+        ("passkeys", form::Json::Arr([])),
+        ("stations", form::Json::Arr([])),
+        ("gateways", form::Json::Arr([])),
+      ]),
+    ),
+  ])
+  let ws2_gen = match sign_lock_entry(ws2_seed, ws2_gen_unsigned) {
+    Ok(e) => e
+    Err(why) => panic("sign ws2 genesis failed: " + why)
+  }
+  let ws2_root = match lock::entry_hash(ws2_gen, native_lock_crypto()) {
+    Ok(h) => h
+    Err(_) => panic("ws2 entry_hash failed")
+  }
+  match mcore.apply_lock_chain([ws2_gen], ws2_root) {
+    Ok(_) => ()
+    Err(e) => panic("apply_lock_chain ws2 failed: " + e)
+  }
+
+  // Unmount to UnauthMemory, then re-login mounts `ws_db`, restores `ULID_WS2`, pinned lock root (`locked:true`),
+  // rejects forged root `G_evil`, and delivers frames!
+  mcore.switch_to_unauthenticated_db(unauth_db)
+  debug_assert(mcore.workspace == "ws-default" && mcore.lock_root.is_none(), "unauth switch resets workspace & lock_root")
+  match mcore.switch_account_db(ws_db, "u-multi") {
+    Ok(_) => ()
+    Err(e) => panic("same-sub re-login switch_account_db failed: " + e)
+  }
+  mcore.switch_workspace(ULID_WS2)
+  let _ = mcore.membership.bind_station_checked(ULID_WS2, "st-2")
+  debug_assert(mcore.workspace == ULID_WS2, "restored prior active workspace ULID_WS2")
+  let ws2_ls = base_codec::json_stringify(mt_expect_ok_json(mt_call(mcore, 91L, "lock.status", base_codec::json_obj([])), "ws2 lock.status"))
+  debug_assert(ws2_ls.contains("\"locked\":true") && ws2_ls.contains(ws2_root), "WS2 pinned lock root restored with locked:true")
+  mcore.pin_lock_root("genesis_evil_forged_root_9999")
+  let drained_lock = mcore.drain_frame()
+  let mut saw_lock_rejected = false
+  for i in 0..<drained_lock.length() {
+    match drained_lock[i] {
+      CoreEvent::LockRejected(ws, _) => if ws == ULID_WS2 { saw_lock_rejected = true }
+      _ => ()
+    }
+  }
+  debug_assert(saw_lock_rejected, "forged G_evil MUST be rejected after re-login recovery")
+  mcore.attach_station_transport(ULID_WS2 + "/st-2", core_offline_transport(), workspace=ULID_WS2)
+  mcore.outbox.tell(CoreEvent::EntryAdded(
+    ULID_WS2 + "/st-2",
+    55,
+    store::Entry::{
+      n: 1, kind: "message", author_kind: "person", author: "m",
+      text: "WS2_POST_RELOGIN_DELIVERED", notice: None, files: 0, letter: false,
+    },
+    None,
+  ))
+  let drained_ws2 = mcore.drain_frame()
+  let mut saw_ws2_frame = false
+  for i in 0..<drained_ws2.length() {
+    match drained_ws2[i] {
+      CoreEvent::EntryAdded(_, _, ent, _) => if ent.text == "WS2_POST_RELOGIN_DELIVERED" { saw_ws2_frame = true }
+      _ => ()
+    }
+  }
+  debug_assert(saw_ws2_frame, "station transport & frame delivery restored on ULID_WS2 after re-login")
+}
+
+// ── Test 14 (R12/R14): Inactive sibling 401 ReadError preservation,
+//    unbound `:memory:` account.switch rejection, and default station rebind across account switches ──
+
+test "Slice 2B-1 R12: inactive 401 ReadError preserves active sibling, unbound account.switch rejected, and default station rebind" {
+  let rt = effect::Runtime::new()
+
+  // 1. P1-2: Active Alice + inactive sibling Bob -> Bob gets 401 while disk returns `ReadError` (and corrupt JSON):
+  //    `on_invalidated` MUST receive `None` (NEVER `Some([])`!), keeping Alice's active DB & read gate 100% intact!
+  let (_, alice_db) = make_sim_db(rt)
+  let acore = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-alice", rt, alice_db, core_offline_transport(), fn() -> Unit {})
+  let _ = acore.set_db_account_sub("u-alice")
+  let _ = acore.commit_cloud_me(mt_make_me("u-alice", "alice@still.fail", [(ULID_WS1, "W1", "owner")]), req_seq=1L)
+  let _ = acore.membership.bind_station_checked(ULID_WS1, "st-alice")
+  let alice_a = views::StoredAccount::{
+    sub: "u-alice", email: "alice@still.fail", name: "Alice", picture: "",
+    access: "acc-alice", refresh: "ref-alice", access_expires: 999999L,
+  }
+  let bob_a = views::StoredAccount::{
+    sub: "u-bob", email: "bob@still.fail", name: "Bob", picture: "",
+    access: "acc-bob", refresh: "ref-bob", access_expires: 100L,
+  }
+  acore.auth_store.register_account(alice_a)
+  acore.auth_store.register_account(bob_a)
+  acore.account_sessions.set("u-alice", "sid-alice")
+  acore.account_sessions.set("u-bob", "sid-bob")
+
+  let coord_sib = AccountRefreshCoordinator::new()
+  let mut phase_sib = 0
+  let mut got_none_confirmed = false
+  let host_sib = AccountRefreshHost::{
+    read_accounts_k: fn(rk : (HostStorageRead) -> Unit) -> Unit {
+      phase_sib += 1
+      if phase_sib == 1 {
+        let ss : Map[String, String] = Map::new()
+        ss.set("u-alice", "sid-alice")
+        ss.set("u-bob", "sid-bob")
+        rk(HostStorageRead::Found(serialize_stored_accounts([alice_a, bob_a], sessions=Some(ss))))
+      } else {
+        rk(HostStorageRead::ReadError("disk_eio"))
+      }
+    },
+    write_accounts_k: fn(_doc : base_codec::Json, wk : (Result[Unit, String]) -> Unit) -> Unit { wk(Ok(())) },
+    do_refresh_http_k: fn(_rtok : String, _now : Int64, hk : (effect::Exit[Result[RefreshedTokens, RefreshTokenError]]) -> Unit) -> Unit {
+      hk(effect::Exit::Succeeded(Err(RefreshTokenError::InvalidSession(401, "invalid_grant"))))
+    },
+    get_mem_tuple: fn(sub : String) -> Option[(String, String)] {
+      if sub == "u-bob" { Some(("sid-bob", "ref-bob")) } else { Some(("sid-alice", "ref-alice")) }
+    },
+    on_adopt_or_update: fn(_u, _s, _all, _ss) -> Unit {},
+    on_invalidated: fn(inv_sub, inv_sid, inv_ref, confirmed_opt) -> Unit {
+      match confirmed_opt {
+        None => {
+          got_none_confirmed = true
+          // Mirror runtime `None` branch: invalidate only `inv_sub`, keep active Alice intact!
+          let _ = acore.invalidate_session(inv_sub, expected_session=Some(inv_sid), expected_refresh=Some(inv_ref), persist_accounts=false)
+        }
+        Some(_) => panic("401 ReadError MUST pass None to on_invalidated (never empty list)")
+      }
+    },
+    now_ms: fn() -> Int64 { 200000L },
+  }
+  let _ = rt.fork(fn(fk : (effect::Exit[Unit]) -> Unit) -> Unit {
+    coord_sib.refresh_k(host_sib, "u-bob", "sid-bob", "ref-bob", fn(out : AccountRefreshOutcome) -> Unit {
+      match out {
+        AccountRefreshOutcome::InvalidSession(401, _, false) => ()
+        _ => panic("expected InvalidSession(401, _, false) on ReadError")
+      }
+      fk(effect::Exit::Succeeded(()))
+    })
+  })
+  let _ = rt.run_ready()
+  debug_assert(got_none_confirmed, "inactive Bob 401 ReadError delivered None confirmed snapshot")
+  debug_assert(!acore.membership.is_unauthenticated() && !acore.membership.is_session_invalidated(), "active Alice MUST stay authenticated & valid")
+  debug_assert(acore.can_read_workspace(ULID_WS1), "active Alice workspace read gate MUST stay open")
+  debug_assert(acore.auth_store.accounts.length() == 1 && acore.auth_store.accounts[0].sub == "u-alice", "only inactive Bob removed; Alice preserved")
+
+  // 3. P1-3 + P1-4: Alice 401 switches to unbound `:memory:` (`db_account_sub == None`, resets default station to `"st-local"`),
+  //    while sibling Bob remains in `auth_store.accounts`:
+  //    - `account.switch("u-bob")` MUST return `account_sub_mismatch` and NEVER bind `:memory:` or open read gate!
+  //    - `core.station`, `md_store.station`, `local_outbox.station`, `events.station`, `sync.station` ALL reset to `"st-local"`!
+  //    - Subsequent `switch_account_db(bob_db, "u-bob", ...)` binds Bob cleanly with ZERO `"st-alice"` residue!
+  let (_, mem_db_r12) = make_sim_db(rt)
+  let (_, bob_db_r12) = make_sim_db(rt)
+  acore.switch_to_unauthenticated_db(mem_db_r12)
+  acore.auth_store.register_account(bob_a)
+  debug_assert(acore.db_account_sub.is_none() && acore.membership.is_unauthenticated(), "unbound :memory: after 401")
+  debug_assert(acore.station == "st-local" && acore.md_store.station == "st-local" && acore.local_outbox.station == "st-local" && acore.events.station == "st-local" && acore.sync.station == "st-local", "switch_to_unauthenticated_db MUST rebind ALL default station consumers to st-local")
+  mt_expect_err_code(
+    mt_call(acore, 301L, "account.switch", base_codec::json_obj([("account", base_codec::json_str("u-bob"))])),
+    "account_sub_mismatch",
+    "account.switch on unbound :memory: MUST return account_sub_mismatch",
+  )
+  debug_assert(acore.db_account_sub.is_none(), "rejected account.switch MUST NOT bind :memory: to u-bob")
+  debug_assert(acore.membership.is_unauthenticated(), "rejected account.switch MUST NOT open read gate")
+  match acore.switch_account_db(bob_db_r12, "u-bob", target_workspace=Some("ws-default"), target_station=Some("st-local")) {
+    Ok(_) => ()
+    Err(e) => panic("real Bob switch_account_db after rejected account.switch failed: " + e)
+  }
+  debug_assert(mt_opt_str_is(acore.db_account_sub, "u-bob"), "real Bob DB bound cleanly")
+  debug_assert(acore.station == "st-local" && acore.events.station == "st-local" && acore.sync.station == "st-local" && acore.md_store.station == "st-local" && acore.local_outbox.station == "st-local", "Bob login MUST NOT leak Alice's st-alice")
+}
+
+// ── Test 15 (R13/R14): Verified login rebind_default_station restores pinned Ed25519 lock root ──
+
+test "Slice 2B-1 R13: rebind_default_station hydrates persisted Ed25519 lock root and rejects forged lock" {
+  let rt = effect::Runtime::new()
+
+  // 1. Codex P1-1: Pre-locked non-default workspace `ULID_WS1` -> 401 unauth `:memory:` (`ws-default`) ->
+  //    verified login calls `switch_account_db(locked_db, "u-lock")` (on `ws-default`) THEN
+  //    `rebind_default_station(ULID_WS1 + "/st-1", ULID_WS1)`:
+  //    MUST hydrate `ULID_WS1`'s pinned Ed25519 lock root (`locked:true`) and reject forged `G_evil`!
+  let (_, locked_db) = make_sim_db(rt)
+  let (_, mem_db) = make_sim_db(rt)
+  let setup_core = ClientCore::new(ULID_WS1, ULID_WS1 + "/st-1", rt, locked_db, core_offline_transport(), fn() -> Unit {})
+  let _ = setup_core.set_db_account_sub("u-lock")
+  let _ = setup_core.commit_cloud_me(mt_make_me("u-lock", "lock@still.fail", [(ULID_WS1, "Locked WS", "owner")]), req_seq=1L)
+  let _ = setup_core.membership.bind_station_checked(ULID_WS1, "st-1")
+  let seed = make_seed(93)
+  let key = ed25519_key_id(seed)
+  let gen_unsigned = form::Json::Obj([
+    ("v", form::Json::Num(1.0)),
+    ("ws", form::Json::Str(ULID_WS1)),
+    ("seq", form::Json::Num(0.0)),
+    ("prev", form::Json::Null),
+    ("at", form::Json::Num(1700000000.0)),
+    ("kind", form::Json::Str("genesis")),
+    (
+      "body",
+      form::Json::Obj([
+        ("owner", form::Json::Str("u-lock")),
+        ("origins", form::Json::Arr([form::Json::Str("https://app.still.fail")])),
+        ("rp_id", form::Json::Str("still.fail")),
+        ("cloud_keys", form::Json::Obj([])),
+        (
+          "members",
+          form::Json::Arr([
+            form::Json::Obj([
+              ("sub", form::Json::Str("u-lock")),
+              ("email", form::Json::Str("lock@still.fail")),
+              ("role", form::Json::Str("owner")),
+            ]),
+          ]),
+        ),
+        (
+          "devices",
+          form::Json::Arr([
+            form::Json::Obj([
+              ("id", form::Json::Str(hex_64("9"))),
+              ("sub", form::Json::Str("u-lock")),
+              ("kind", form::Json::Str("app")),
+              ("label", form::Json::Str("Mac")),
+              ("sign_key", form::Json::Str(key)),
+            ]),
+          ]),
+        ),
+        ("passkeys", form::Json::Arr([])),
+        ("stations", form::Json::Arr([])),
+        ("gateways", form::Json::Arr([])),
+      ]),
+    ),
+  ])
+  let gen_signed = match sign_lock_entry(seed, gen_unsigned) {
+    Ok(e) => e
+    Err(why) => panic("sign genesis failed: " + why)
+  }
+  let genesis_good = match lock::entry_hash(gen_signed, native_lock_crypto()) {
+    Ok(h) => h
+    Err(_) => panic("entry_hash failed")
+  }
+  match setup_core.apply_lock_chain([gen_signed], genesis_good) {
+    Ok(_) => ()
+    Err(e) => panic("apply_lock_chain failed: " + e)
+  }
+
+  // Exact `finish_verified_auth_complete_k` sequence: unauth `:memory:` -> `switch_account_db` -> `rebind_default_station`:
+  setup_core.switch_to_unauthenticated_db(mem_db)
+  debug_assert(setup_core.workspace == "ws-default" && setup_core.lock_root.is_none(), "unauth reset to ws-default")
+  match setup_core.switch_account_db(locked_db, "u-lock", emit_auth_boundary=false) {
+    Ok(_) => ()
+    Err(e) => panic("switch_account_db failed: " + e)
+  }
+  setup_core.rebind_default_station(ULID_WS1 + "/st-1", ULID_WS1)
+  debug_assert(setup_core.workspace == ULID_WS1 && setup_core.station == ULID_WS1 + "/st-1", "rebound to ULID_WS1/st-1")
+  match setup_core.lock_root {
+    Some(r) => debug_assert(r == genesis_good, "rebind_default_station MUST hydrate persisted lock root G_good")
+    None => panic("P1-1 regression: rebind_default_station left lock_root None!")
+  }
+  let ls = base_codec::json_stringify(mt_expect_ok_json(mt_call(setup_core, 501L, "lock.status", base_codec::json_obj([])), "lock.status"))
+  debug_assert(ls.contains("\"locked\":true") && ls.contains(genesis_good), "lock.status reports locked:true + G_good")
+  // Forged lock root MUST be rejected!
+  setup_core.pin_lock_root("genesis_forged_evil_r13")
+  let evs = setup_core.drain_frame()
+  let mut rejected_forged = false
+  for i in 0..<evs.length() {
+    match evs[i] {
+      CoreEvent::LockRejected(ws, _) => if ws == ULID_WS1 { rejected_forged = true }
+      _ => ()
+    }
+  }
+  debug_assert(rejected_forged, "forged lock root MUST be rejected after verified login rebind")
+  match setup_core.lock_root {
+    Some(r) => debug_assert(r == genesis_good, "pinned root stays G_good after forged attempt")
+    None => panic("lock_root cleared")
+  }
+}
