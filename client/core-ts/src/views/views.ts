@@ -225,18 +225,26 @@ export function stationOn(row: J, words: J): J {
   return out;
 }
 
+function stationStateMap(chats: J): Map<string, J> | null {
+  const stations = arr(get(chats, "stations"));
+  if (!stations.some((w) => get(w, "offline") !== undefined || get(w, "reconnecting") !== undefined)) return null;
+  const words = new Map(stations.map((s) => [str(get(s, "station")) ?? "", s]));
+  for (const w of words.values()) if (get(w, "offline") !== undefined || get(w, "reconnecting") !== undefined) return words;
+  return null;
+}
+
 /// The list with each row as its station's state makes it (stationOn): for what lists its rows elsewhere (a search).
 function stationsOn(chats: J): J {
-  const words = new Map(arr(get(chats, "stations")).map((s) => [str(get(s, "station")) ?? "", s]));
-  if (![...words.values()].some((w) => get(w, "offline") !== undefined || get(w, "reconnecting") !== undefined)) return chats;
+  const words = stationStateMap(chats);
+  if (words === null) return chats;
   return { ...chats, days: arr(get(chats, "days")).map((d) => ({ ...d, items: arr(get(d, "items")).map((row) => stationOn(row, words.get(str(get(row, "station")) ?? ""))) })) };
 }
 
 /// What a search found among a list's rows (refs.search's `items`), each as its station's state makes it (stationOn): as
 /// stationsOn would have made them, the rows it did not find left as they are.
 function foundOn(chats: J, found: J): J {
-  const words = new Map(arr(get(chats, "stations")).map((s) => [str(get(s, "station")) ?? "", s]));
-  if (![...words.values()].some((w) => get(w, "offline") !== undefined || get(w, "reconnecting") !== undefined)) return found;
+  const words = stationStateMap(chats);
+  if (words === null) return found;
   return { ...found, items: arr(get(found, "items")).map((row) => stationOn(row, words.get(str(get(row, "station")) ?? ""))) };
 }
 
@@ -763,7 +771,12 @@ export function lettersByChat(letters: { message: J; way: "in" | "out"; title: s
     const letter = { ...l.message, way: l.way };
     // (by when written: letters from before their own log are entries, numbered among the chat's, those of it in it)
     const at = u64(l.message.createdAt) ?? 0;
-    chats.set(key, was === undefined ? { title: l.title, link: l.link, letters: [letter], last: at } : { ...was, letters: [...was.letters, letter], last: Math.max(was.last, at) });
+    if (was === undefined) {
+      chats.set(key, { title: l.title, link: l.link, letters: [letter], last: at });
+    } else {
+      was.letters.push(letter);
+      if (at > was.last) was.last = at;
+    }
   }
   return [...chats.values()].sort((a, b) => b.last - a.last).map(({ title, link, letters }) => {
     const last = letters.at(-1)!;
