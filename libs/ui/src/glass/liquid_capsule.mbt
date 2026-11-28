@@ -143,8 +143,8 @@ pub fn liquid_capsule_decorate(
   }
   let trig_opt : PillTriggerScope? = if trigger {
     let fx_sig : @signals.Signal[((Double, Double)?, Int)] = @signals.signal((None, 0))
-    let morph_glass : Ref[(() -> @paint.Glass?)?] = Ref(None)
-    let morph_shadow : Ref[(() -> (Double, Double, Int64))?] = Ref(None)
+    let morph_glass : @signals.Signal[(() -> @paint.Glass?)?] = @signals.signal_by(None, same=fn(_, _) { false })
+    let morph_shadow : @signals.Signal[(() -> (Double, Double, Int64))?] = @signals.signal_by(None, same=fn(_, _) { false })
     let press_way = @motion.NodeWay::new(0.0)
     let children : Array[@view.View] = []
     let trig_scope : PillTriggerScope = {
@@ -177,12 +177,12 @@ pub fn liquid_capsule_decorate(
         Some(trig) => {
           let (_, ly) = trig.fx.get()
           if ly != 0 {
-            let g = match trig.morph_glass.val {
+            let g = match trig.morph_glass.get() {
               Some(mg) => mg()
               None => if ly < 0 { None } else { Some(resolve_base_glass(None)) }
             }
             let s = if with_shadow {
-              match trig.morph_shadow.val {
+              match trig.morph_shadow.get() {
                 Some(ms) => ms()
                 None => if ly < 0 { shadow_none } else { resolve_shadow() }
               }
@@ -195,7 +195,7 @@ pub fn liquid_capsule_decorate(
         None => ()
       }
       let spot = if interactive && v.pressed() && !v.glass_solid() {
-        let (_, _, w, h) = v.placed_window_now()
+        let (_, _, w, h) = v.placed_now()
         if w > 0.0 && h > 0.0 {
           Some((w / 2.0, h / 2.0))
         } else {
@@ -311,7 +311,7 @@ pub fn liquid_press_glass_decorate(
   b
   .glass(By(fn() {
     let spot = if !b.glass_solid() && ih.pressed(b) > 0.001 {
-      let (_, _, bw, bh) = b.placed_window_now()
+      let (_, _, bw, bh) = b.placed_now()
       if bw > 0.0 && bh > 0.0 {
         Some(ih.spot(b, bw, bh))
       } else {

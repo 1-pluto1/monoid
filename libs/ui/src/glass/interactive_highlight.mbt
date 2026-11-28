@@ -1,6 +1,6 @@
 // Ported from Kyant0/AndroidLiquidGlass (Apache-2.0): catalog/utils/InteractiveHighlight.kt. Where a finger is on a
 // piece of glass and how far it is pressed: its press by a soft spring (0.5, 300), the finger's way from where it went
-// down snapped to it as it drags and sent back by the same spring as it lets go. What it lights is mbui's liquid
+// down snapped to it as it drags and sent back by the same spring as it lets go. What it lights is the UI runtime's liquid
 // glass spot (`Glass::liquid` `spot`), and what it stretches is the glass's size and place (`stretch`).
 
 ///|
@@ -50,7 +50,7 @@ pub fn InteractiveHighlight::attach(self : InteractiveHighlight, n : @view.View)
 fn InteractiveHighlight::at(self : InteractiveHighlight) -> @view.View {
   match self.node.val {
     Some(n) => n
-    None => @halt.saying("sf/glass: an InteractiveHighlight pressed before it was attached to its node")
+    None => @halt.saying("glass: an InteractiveHighlight pressed before it was attached to its node")
   }
 }
 

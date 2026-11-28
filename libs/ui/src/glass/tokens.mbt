@@ -3,7 +3,7 @@
 // Colours are 0xRRGGBBAA; a Compose `Color(0xFFrrggbb).copy(a)` is rrggbb at a × 255.
 
 ///|
-/// Light or dark as the app says (None: as mbui's window is, its theme's `dark`).
+/// Light or dark as the app says (None: as the UI window is, its theme's `dark`).
 // kept across runs: said by the app as it starts and as the person changes it
 let dark_said : @signals.Signal[Bool?] = @signals.signal(None)
 
@@ -99,7 +99,7 @@ pub let black : Int64 = 0x000000FFL
 pub let clear : Int64 = 0x00000000L
 
 ///|
-/// Backdrop's Shadow.Default (Shadow.kt): radius 24, its offset a sixth of that down, black at 10%; drawn as mbui's
+/// Backdrop's Shadow.Default (Shadow.kt): radius 24, its offset a sixth of that down, black at 10%; drawn as ui's
 /// shadow by its deviation, half the radius.
 pub let shadow_default : (Double, Double, Int64) = (12.0, 4.0, 0x0000001AL)
 
@@ -123,7 +123,7 @@ pub fn seg_lens_shadow(_press : Double) -> (Double, Double, Int64) {
   shadow_none
 }
 
-// Sizes (dp, mbui's points).
+// Sizes (dp, ui points).
 
 ///|
 /// LiquidToggle: its track 63 × 28, its thumb 37 × 24, 2 in; held 59.2 × 38.4pt (1.60× uniform, matching iOS 27).
@@ -158,7 +158,7 @@ pub let slider_thumb_held_scale : Double = 38.0 / 24.0
 /// LiquidSlider: its track 6 high.
 pub let slider_track_h : Double = 6.0
 
-// Type (sp, mbui's points).
+// Type (sp, ui points).
 
 ///|
 /// Words `size` high at `weight`, on one line unless `wrap` (at most `lines` of them where `lines` > 0).
@@ -183,7 +183,7 @@ pub let type_body : Double = 16.0
 pub let weight_medium : Int = 500
 
 ///|
-/// mbui's theme in the liquid glass look (for tests and standalone previews).
+/// The UI theme in the liquid glass look (for tests and standalone previews).
 pub fn ui_theme() -> @ui.Theme {
   let d = is_dark()
   let c = colors()

@@ -4,9 +4,9 @@
 // white and blur of 8 receding as its lens comes up, 10 deep bending by up to 14, the colours split, its Ambient
 // highlight and its InnerShadow of 4), grows by half again and is squeezed as it goes by how fast (velocity / 10). The
 // thumb is dragged by as much as the finger moves; a tap on the track sends it there as a hand would (pressed, sent,
-// let go). Its keys and a screen reader's steps are mbui's headless slider's.
+// let go). Its keys and a screen reader's steps are the UI runtime's headless slider's.
 //
-// The catalog's lens also sees the track scaled under it (a combined backdrop): mbui's glass sees the track as it is.
+// The catalog's lens also sees the track scaled under it (a combined backdrop): the UI runtime's glass sees the track as it is.
 
 ///|
 /// The thumb's glass, held `p` (Native iOS 27.0 clear droplet loupe: paraxial bevel refraction, pinchWeight == 0).

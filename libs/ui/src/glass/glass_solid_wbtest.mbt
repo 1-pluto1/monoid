@@ -225,3 +225,63 @@ test "liquid_tab_bar_surface_decorate draws hairline solid border in Solid mode 
   }
   set_dark(None)
 }
+
+///|
+test "morph_glass.set on layer 7 updates rendered glass immediately without touching fx" {
+  let pill_trig : Ref[PillTriggerScope?] = Ref(None)
+  let cap_trig : Ref[PillTriggerScope?] = Ref(None)
+  let t = glass_case(false, false, fn(page) {
+    liquid_pill_group_node(page, height=36.0, pad=2.0, fn(g) {
+      g.box(fn(c) {
+        c.width(Is(Some(32.0))).height(Is(Some(32.0))) |> ignore
+        pill_trig.val = c.lent(liquid_pill_trigger_lent)
+      })
+      |> ignore
+    })
+    |> ignore
+    page.box(fn(cap) {
+      cap.width(Is(Some(80.0))).height(Is(Some(36.0))) |> ignore
+      liquid_capsule_decorate(cap, tone=Floating, radius=Some(18.0), trigger=true) |> ignore
+      cap.box(fn(c) {
+        c.width(Is(Some(32.0))).height(Is(Some(32.0))) |> ignore
+        cap_trig.val = c.lent(liquid_pill_trigger_lent)
+      })
+      |> ignore
+    })
+    |> ignore
+  })
+  t.draw()
+  assert_eq(t.drawn_glass().length(), 2, msg="initial pill group + trigger capsule must draw 2 glass instances")
+  guard pill_trig.val is Some(pt) else { @halt.saying("missing pill_group PillTriggerScope") }
+  guard cap_trig.val is Some(ct) else { @halt.saying("missing liquid_capsule PillTriggerScope") }
+
+  // Enter layer 7 with morph_glass suppressing glass on both triggers.
+  pt.morph_glass.set(Some(fn() { None }))
+  ct.morph_glass.set(Some(fn() { None }))
+  pt.fx.set((None, 7))
+  ct.fx.set((None, 7))
+  t.draw()
+  assert_eq(t.drawn_glass().length(), 0, msg="layer 7 with morph_glass -> None must draw 0 glass")
+
+  // Replace morph_glass on layer 7 WITHOUT touching fx: rendered glass must update immediately.
+  pt.morph_glass.set(Some(fn() { Some(liquid_floating_glass()) }))
+  t.draw()
+  assert_eq(t.drawn_glass().length(), 1, msg="pill_group morph_glass.set on layer 7 must update without touching fx")
+
+  ct.morph_glass.set(Some(fn() { Some(liquid_floating_glass()) }))
+  t.draw()
+  assert_eq(t.drawn_glass().length(), 2, msg="liquid_capsule morph_glass.set on layer 7 must update without touching fx")
+
+  // Replace morph_glass back to None-returning callback on layer 7 without touching fx.
+  pt.morph_glass.set(Some(fn() { None }))
+  ct.morph_glass.set(Some(fn() { None }))
+  t.draw()
+  assert_eq(t.drawn_glass().length(), 0, msg="replacing morph_glass with None callback on layer 7 must clear glass immediately")
+
+  // Clear morph_glass to None on layer 7 without touching fx: falls back to base glass.
+  pt.morph_glass.set(None)
+  ct.morph_glass.set(None)
+  t.draw()
+  assert_eq(t.drawn_glass().length(), 2, msg="clearing morph_glass to None on layer 7 must restore base glass")
+  set_dark(None)
+}

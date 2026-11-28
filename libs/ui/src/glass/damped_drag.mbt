@@ -1,7 +1,7 @@
 // Ported from Kyant0/AndroidLiquidGlass (Apache-2.0): catalog/utils/DampedDragAnimation.kt. A value dragged along a
 // range and the glass that follows it: the value by a stiff spring (1, 1000), how fast it goes by a soft one (0.5, 300),
 // how far it is held (1, 1000) and how large it is drawn across and down (0.6 and 0.7, 250), each a closed-form way of
-// mbui's (@motion.NodeWay), set off from the moment of its cause and drawn where it is at the moment it is drawn: no
+// the UI runtime's (@motion.NodeWay), set off from the moment of its cause and drawn where it is at the moment it is drawn: no
 // frame loop, so a run is the same at any frame rate.
 //
 // Kotlin's coroutines become moments on the node's timeline: `release` lets go once the value is within 2.5% of its
@@ -41,6 +41,7 @@ pub struct DampedDrag {
   priv active_driver : Ref[@view.View?]
   priv gest_owner : Ref[@view.View?]
   priv gest_seq : @signals.Signal[Int]
+  priv host_seq : @signals.Signal[Int]
   priv last : Ref[(Double, Double)?]
   priv letting_go : Ref[(() -> Unit)?]
   priv stilling : Ref[(() -> Unit)?]
@@ -76,6 +77,7 @@ pub fn DampedDrag::new(
     active_driver: Ref(None),
     gest_owner: Ref(None),
     gest_seq: @signals.signal(0),
+    host_seq: @signals.signal(0),
     last: Ref(None),
     letting_go: Ref(None),
     stilling: Ref(None),
@@ -101,6 +103,7 @@ pub fn DampedDrag::attach(self : DampedDrag, n : @view.View) -> Unit {
   self.last.val = None
   self.clear_gest_owner()
   self.node.val = Some(n)
+  self.host_seq.set(self.host_seq.untracked() + 1)
   if had_release {
     if n.alive() {
       let (wf, rel) = self.last_release.val
@@ -125,8 +128,15 @@ fn DampedDrag::attach_if_needed(self : DampedDrag, n : @view.View) -> Unit {
 ///|
 /// Claim active gesture ownership for `owner` so unrelated hosts sharing this drag never cancel its lens.
 pub fn DampedDrag::claim_gesture(self : DampedDrag, owner : @view.View) -> Unit {
+  let same_owner = match self.gest_owner.val {
+    Some(cur) => physical_equal(cur, owner)
+    None => false
+  }
   self.active_driver.val = Some(owner)
   self.gest_owner.val = Some(owner)
+  if !same_owner {
+    self.host_seq.set(self.host_seq.untracked() + 1)
+  }
 }
 
 ///|
@@ -141,6 +151,7 @@ pub fn DampedDrag::gesture_owned_by(self : DampedDrag, owner : @view.View) -> Bo
 ///|
 /// Whether `owner` owns this drag's lens display (active gesture owner, or attached host when no gesture claimed).
 fn DampedDrag::lens_owned_by(self : DampedDrag, owner : @view.View) -> Bool {
+  let _ = self.host_seq.get()
   match self.gest_owner.val {
     Some(cur) => physical_equal(cur, owner)
     None => self.same_host(Some(owner))
@@ -162,6 +173,7 @@ fn DampedDrag::clear_gest_owner(self : DampedDrag) -> Unit {
   if self.gest_owner.val is Some(_) {
     self.gest_owner.val = None
     self.gest_seq.set(self.gest_seq.untracked() + 1)
+    self.host_seq.set(self.host_seq.untracked() + 1)
   }
 }
 
@@ -208,6 +220,7 @@ fn DampedDrag::relinquish_host(self : DampedDrag, owner : @view.View) -> Unit {
   }
   if changed {
     self.gest_seq.set(self.gest_seq.untracked() + 1)
+    self.host_seq.set(self.host_seq.untracked() + 1)
   }
 }
 
@@ -263,7 +276,7 @@ pub fn DampedDrag::set_bounds(self : DampedDrag, lo~ : Double, hi~ : Double) -> 
 fn DampedDrag::at(self : DampedDrag) -> @view.View {
   match self.node.val {
     Some(n) => n
-    None => @halt.saying("sf/glass: a DampedDrag moved before it was attached to its node")
+    None => @halt.saying("glass: a DampedDrag moved before it was attached to its node")
   }
 }
 

@@ -290,34 +290,38 @@ pub fn anchored_popover_bridge(
         (t, closing, pill_morph_eval(pm, px_win, py_win, mw, mh, closing, t))
       }
       // Attach trigger pill live morph glass/shadow callbacks & private SDF layer (0 cold-start bindings).
-      trig.morph_glass.val = Some(fn() {
-        let (t, closing, f) = eval_trig()
-        if !closing {
-          if f.open_anchor_scale <= 0.15 {
-            None
+      trig.morph_glass.set(
+        Some(fn() {
+          let (t, closing, f) = eval_trig()
+          if !closing {
+            if f.open_anchor_scale <= 0.15 {
+              None
+            } else {
+              let stage = 0.5 * @glass.lm_smoothstep(0.0, 0.06, t)
+              Some(glass_menu_morph(stage, layer=pill_layer, break_gap=32.0))
+            }
+          } else if f.platter_active {
+            if f.blob_a_emerge <= 0.001 {
+              None
+            } else {
+              let stage = 0.5 * @glass.lm_smoothstep(0.0, 0.12, f.raw_value)
+              Some(glass_menu_morph(stage, layer=pill_layer, break_gap=24.0))
+            }
           } else {
-            let stage = 0.5 * @glass.lm_smoothstep(0.0, 0.06, t)
-            Some(glass_menu_morph(stage, layer=pill_layer, break_gap=32.0))
+            Some((pm.rest_glass)())
           }
-        } else if f.platter_active {
-          if f.blob_a_emerge <= 0.001 {
-            None
+        }),
+      )
+      trig.morph_shadow.set(
+        Some(fn() {
+          let (_, closing, f) = eval_trig()
+          if closing && !f.platter_active {
+            glass_control_shadow()
           } else {
-            let stage = 0.5 * @glass.lm_smoothstep(0.0, 0.12, f.raw_value)
-            Some(glass_menu_morph(stage, layer=pill_layer, break_gap=24.0))
+            (0.0, 0.0, 0L)
           }
-        } else {
-          Some((pm.rest_glass)())
-        }
-      })
-      trig.morph_shadow.val = Some(fn() {
-        let (_, closing, f) = eval_trig()
-        if closing && !f.platter_active {
-          glass_control_shadow()
-        } else {
-          (0.0, 0.0, 0L)
-        }
-      })
+        }),
+      )
       let (sp0, _) = trig.fx.get()
       trig.fx.set((sp0, pill_layer))
       let prev_owner = @signals.set_owner(None)
@@ -501,8 +505,8 @@ pub fn anchored_popover_bridge(
         }
         let (sp, ly) = trig.fx.get()
         if ly == pill_layer || ly < 0 {
-          trig.morph_glass.val = None
-          trig.morph_shadow.val = None
+          trig.morph_glass.set(None)
+          trig.morph_shadow.set(None)
           trig.fx.set((sp, 0))
         }
         if trig.pill.alive() {

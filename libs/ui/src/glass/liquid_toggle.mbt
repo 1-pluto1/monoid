@@ -4,9 +4,9 @@
 // recede as its lens comes up (5 deep, bending by up to 10, the colours split), its Ambient highlight and its
 // InnerShadow (4) with it, and it grows by half again (springs of 0.6 and 0.7 across and down), squeezed as it goes by
 // how fast (DampedDragAnimation's velocity / 50). A tap turns it; a drag past half its way turns it there; Space and
-// Enter, and a screen reader's Activate, turn it as mbui's headless switch does.
+// Enter, and a screen reader's Activate, turn it as the UI runtime's headless switch does.
 //
-// The catalog's lens also sees the track itself scaled under it (a combined backdrop): mbui's glass sees what is drawn
+// The catalog's lens also sees the track itself scaled under it (a combined backdrop): the UI runtime's glass sees what is drawn
 // under it, the track as it is.
 
 ///|

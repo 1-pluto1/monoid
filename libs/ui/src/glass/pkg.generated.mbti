@@ -3,7 +3,6 @@ package "ui/glass"
 
 import {
   "moonbitlang/core/debug",
-  "moonbitlang/core/ref",
   "ui/headless",
   "ui/motion",
   "ui/paint",
@@ -395,8 +394,8 @@ pub(all) struct PillTriggerScope {
   pill : @view.View
   fx : @signals.Signal[((Double, Double)?, Int32)]
   press_way : @motion.NodeWay
-  morph_glass : @ref.Ref[(() -> @paint.Glass?)?]
-  morph_shadow : @ref.Ref[(() -> (Double, Double, Int64))?]
+  morph_glass : @signals.Signal[(() -> @paint.Glass?)?]
+  morph_shadow : @signals.Signal[(() -> (Double, Double, Int64))?]
   mut morph_owner : Int32
   mut morph_cancel : (() -> Unit)?
   mut children : Array[@view.View]

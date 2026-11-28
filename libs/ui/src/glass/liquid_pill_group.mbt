@@ -31,8 +31,8 @@ pub(all) struct PillTriggerScope {
   pill : @view.View
   fx : @signals.Signal[((Double, Double)?, Int)]
   press_way : @motion.NodeWay
-  morph_glass : Ref[(() -> @paint.Glass?)?]
-  morph_shadow : Ref[(() -> (Double, Double, Int64))?]
+  morph_glass : @signals.Signal[(() -> @paint.Glass?)?]
+  morph_shadow : @signals.Signal[(() -> (Double, Double, Int64))?]
   mut morph_owner : Int
   mut morph_cancel : (() -> Unit)?
   // (mut: emptied by a fresh array once the last child leaves, letting go of what its slots held)
@@ -164,8 +164,8 @@ pub fn liquid_pill_group_node(
       None => pad
     }
     let fx_sig : @signals.Signal[((Double, Double)?, Int)] = @signals.signal((None, 0))
-    let morph_glass : Ref[(() -> @paint.Glass?)?] = Ref(None)
-    let morph_shadow : Ref[(() -> (Double, Double, Int64))?] = Ref(None)
+    let morph_glass : @signals.Signal[(() -> @paint.Glass?)?] = @signals.signal_by(None, same=fn(_, _) { false })
+    let morph_shadow : @signals.Signal[(() -> (Double, Double, Int64))?] = @signals.signal_by(None, same=fn(_, _) { false })
     let children : Array[@view.View] = []
     let press_way = @motion.NodeWay::new(0.0)
     let scope : PillPressScope = { pill: g, fx: fx_sig, press_way, count: 0 }
@@ -259,7 +259,7 @@ pub fn liquid_pill_group_node(
     .glass(By(fn() {
       let (sp, ly) = fx_sig.get()
       if ly != 0 {
-        match morph_glass.val {
+        match morph_glass.get() {
           Some(f) => f()
           None => if ly < 0 { None } else { Some(make_glass(sp, ly)) }
         }
@@ -281,7 +281,7 @@ pub fn liquid_pill_group_node(
     .shadow(By(fn() {
       let ly = fx_sig.get().1
       if ly != 0 {
-        match morph_shadow.val {
+        match morph_shadow.get() {
           Some(f) => f()
           None => if ly < 0 { shadow_none } else { rest_shadow() }
         }
