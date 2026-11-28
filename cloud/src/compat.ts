@@ -28,6 +28,12 @@ export function header(from: Request | Headers, name: string): string | null {
   return (from instanceof Headers ? from : from.headers).get(`x-${PREFIX}-${name}`);
 }
 
+/** What a station's `x-stillfail-version` is shown as in a refusal's span and line: printable ASCII, 40 at most. */
+export function shownVersion(version: string | null): string | null {
+  const shown = (version ?? "").replace(/[^\x20-\x7e]/g, "").slice(0, 40).trim();
+  return shown === "" ? null : shown;
+}
+
 /** The ways a signed station message may read: `stillfail-<tag>:<origin>:<rest>` for each origin (and each of
  *  `former`'s prefixes). */
 export function signedMessages(tag: string, origins: string[], rest: string, former: readonly string[] = []): string[] {

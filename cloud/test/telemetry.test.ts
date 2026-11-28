@@ -515,7 +515,7 @@ test("a socket's opening refused or slow is a trace of its own (a refusal a WARN
     const [plain] = await upgrades(1);
     assert.equal(plain.kind, 2);
     assert.equal(plain.parentSpanId, undefined);
-    assert.deepEqual(plain.at, { "http.route": "/v1/events", "http.response.status_code": 426, "stillfail.ws.ok": false, "stillfail.sampled_reason": "rejected" });
+    assert.deepEqual(plain.at, { "stillfail.ws.reason": "websocket_required", "http.route": "/v1/events", "http.response.status_code": 426, "stillfail.ws.ok": false, "stillfail.sampled_reason": "rejected" });
 
     // A station's opening signed wrong: 401.
     const station = await key();
@@ -523,7 +523,7 @@ test("a socket's opening refused or slow is a trace of its own (a refusal a WARN
     const forged = await station.sign(`stillfail-station-connect-v1:${h.origin}:${station.id}:${ts - 1}`);
     assert.equal((await h.fetch("/v1/stations/connect", { headers: { upgrade: "websocket", "x-stillfail-station": station.id, "x-stillfail-ts": String(ts), "x-stillfail-signature": forged } })).status, 401);
     const refused = (await upgrades(2))[1]!;
-    assert.deepEqual(refused.at, { "http.route": "/v1/stations/connect", "http.response.status_code": 401, "stillfail.ws.ok": false, "stillfail.sampled_reason": "rejected" });
+    assert.deepEqual(refused.at, { "stillfail.ws.reason": "invalid_signature", "stillfail.station": station.id.slice(0, 12), "http.route": "/v1/stations/connect", "http.response.status_code": 401, "stillfail.ws.ok": false, "stillfail.sampled_reason": "rejected" });
     const lines = await google.until((got) => (ownLines(got, "websocket upgrade rejected").length >= 2 ? ownLines(got, "websocket upgrade rejected") : undefined));
     assert.deepEqual(lines.map((l) => [l.severityText, l.at["log.target"], l.at["log.path"], l.at["log.status"]]).sort(), [["WARN", "ws", "/v1/events", 426], ["WARN", "ws", "/v1/stations/connect", 401]]);
 
@@ -550,6 +550,123 @@ test("a socket's opening refused or slow is a trace of its own (a refusal a WARN
     await h.close();
   }
 });
+
+/**
+ * Each refusal of a socket's opening, one at a time: its answer (never with the span's notes), its span's notes and its
+ * WARN line's fields of them.
+ */
+async function refusals(h: Harness, google: ReturnType<typeof fakeGoogle>) {
+  let n = 0;
+  return async (path: string, headers: Record<string, string>, status: number, on: "main" | "beta" = "main") => {
+    const answer = await (on === "beta" ? h.fetchBeta : h.fetch)(path, { headers });
+    assert.equal(answer.status, status);
+    assert.equal(answer.headers.get("x-stillfail-span"), null, "the notes never go out");
+    const body = await answer.text();
+    n++;
+    const span = (await google.until((got) => (ownSpans(got, "cloud.ws.upgrade").length >= n ? ownSpans(got, "cloud.ws.upgrade") : undefined)))[n - 1]!;
+    const line = (await google.until((got) => (ownLines(got, "websocket upgrade rejected").length >= n ? ownLines(got, "websocket upgrade rejected") : undefined)))[n - 1]!;
+    assert.equal(span.at["http.route"], path);
+    assert.equal(span.at["http.response.status_code"], status);
+    assert.equal(span.at["stillfail.sampled_reason"], "rejected");
+    const notes = Object.fromEntries(Object.entries(span.at).filter(([k]) => k !== "http.route" && k !== "http.response.status_code" && k !== "stillfail.ws.ok" && k !== "stillfail.sampled_reason"));
+    const fields = Object.fromEntries(Object.entries(line.at).filter(([k]) => !["log.target", "log.path", "log.status", "log.ms"].includes(k)));
+    assert.equal(line.at["log.status"], status);
+    return { notes, fields, body };
+  };
+}
+
+test("a station's opening refused says why (which check, its clock's skew, which station and version), never its key or signature", async () => {
+  const google = fakeGoogle();
+  const h = await harness({ telemetry: google.answer });
+  try {
+    const refused = await refusals(h, google);
+    const station = await key();
+    const short = station.id.slice(0, 12);
+    const ts = h.now();
+    const signedAt = async (at: number) => station.sign(`stillfail-station-connect-v1:${h.origin}:${station.id}:${at}`);
+    const up = { upgrade: "websocket" };
+    // A version is shown printable and short: 50 characters are 40.
+    const version = "0.9.1-" + "x".repeat(44);
+
+    assert.deepEqual((await refused("/v1/stations/connect", {}, 426)).notes, { "stillfail.ws.reason": "websocket_required" });
+
+    const missing = await refused("/v1/stations/connect", { ...up, "x-stillfail-ts": String(ts), "x-stillfail-version": "0.9.1" }, 400);
+    assert.deepEqual(missing.notes, { "stillfail.ws.reason": "missing_station", "stillfail.version": "0.9.1" });
+    assert.deepEqual(missing.fields, { "log.reason": "missing_station", "log.version": "0.9.1" });
+    assert.deepEqual(JSON.parse(missing.body), { error: "invalid_request" });
+
+    assert.deepEqual((await refused("/v1/stations/connect", { ...up, "x-stillfail-station": "not-a-key", "x-stillfail-ts": String(ts) }, 400)).notes, { "stillfail.ws.reason": "bad_station" });
+
+    // No timestamp is missing, not 0 (which would be a skew of the whole epoch).
+    const noTs = await refused("/v1/stations/connect", { ...up, "x-stillfail-station": station.id, "x-stillfail-signature": await signedAt(0) }, 400);
+    assert.deepEqual(noTs.notes, { "stillfail.ws.reason": "missing_ts", "stillfail.station": short });
+    assert.deepEqual((await refused("/v1/stations/connect", { ...up, "x-stillfail-station": station.id, "x-stillfail-ts": " " }, 400)).notes, { "stillfail.ws.reason": "missing_ts", "stillfail.station": short });
+    assert.deepEqual((await refused("/v1/stations/connect", { ...up, "x-stillfail-station": station.id, "x-stillfail-ts": "12.5" }, 400)).notes, { "stillfail.ws.reason": "bad_ts", "stillfail.station": short });
+
+    // Its clock 1000 s behind, signed right for it: the skew, the station and its version.
+    const skewed = await refused("/v1/stations/connect", { ...up, "x-stillfail-station": station.id, "x-stillfail-ts": String(ts - 1000), "x-stillfail-signature": await signedAt(ts - 1000), "x-stillfail-version": version }, 400);
+    assert.deepEqual(skewed.notes, { "stillfail.ws.reason": "clock_skew", "stillfail.ws.skew_sec": -1000, "stillfail.station": short, "stillfail.version": version.slice(0, 40) });
+    assert.deepEqual(skewed.fields, { "log.reason": "clock_skew", "log.skewSec": -1000, "log.station": short, "log.version": version.slice(0, 40) });
+    assert.equal((await refused("/v1/stations/connect", { ...up, "x-stillfail-station": station.id, "x-stillfail-ts": String(ts + 301), "x-stillfail-signature": await signedAt(ts + 301) }, 400)).notes["stillfail.ws.skew_sec"], 301);
+
+    const forged = await signedAt(ts - 1);
+    const bad = await refused("/v1/stations/connect", { ...up, "x-stillfail-station": station.id, "x-stillfail-ts": String(ts), "x-stillfail-signature": forged, "x-stillfail-version": "0.9.1" }, 401);
+    assert.deepEqual(bad.notes, { "stillfail.ws.reason": "invalid_signature", "stillfail.station": short, "stillfail.version": "0.9.1" });
+    assert.deepEqual(bad.fields, { "log.reason": "invalid_signature", "log.station": short, "log.version": "0.9.1" });
+
+    // Signed right but on no workspace's list: its object's answer (whose headers may not change) noted and sent on as it was.
+    const gone = await refused("/v1/stations/connect", { ...up, "x-stillfail-station": station.id, "x-stillfail-ts": String(ts), "x-stillfail-signature": await signedAt(ts), "x-stillfail-version": "0.9.1" }, 404);
+    assert.deepEqual(gone.notes, { "stillfail.ws.reason": "station_removed", "stillfail.station": short, "stillfail.version": "0.9.1" });
+    assert.deepEqual(gone.fields, { "log.reason": "station_removed", "log.station": short, "log.version": "0.9.1" });
+    assert.deepEqual(JSON.parse(gone.body), { error: "station_removed" });
+
+    const all = JSON.stringify(google.got.map((g) => g.body));
+    for (const secret of [station.id, forged, "not-a-key"]) assert.ok(!all.includes(secret));
+  } finally {
+    await h.close();
+  }
+});
+
+test("notes go on an answer whose headers may not change, its status, headers and body kept", async () => {
+  const h = await harness();
+  try {
+    const got = (await (await h.fetch("/__test/noted", { method: "POST" })).json()) as any;
+    assert.deepEqual(got.refusing, { status: 404, notes: JSON.stringify({ why: "test" }), kept: "yes", body: "held" });
+    assert.deepEqual({ ...got.station, body: JSON.parse(got.station.body) }, { status: 404, notes: JSON.stringify({ why: "test" }), kept: null, body: { error: "station_removed" } });
+  } finally {
+    await h.close();
+  }
+});
+
+for (const where of ["objects", "primary"] as const) {
+  test(`${where}: an events socket's opening refused says why, never with its token or whose it is`, async () => {
+    const google = fakeGoogle();
+    const h = await harness({ telemetry: google.answer });
+    try {
+      if (where === "primary") assert.equal((await h.fetch("/__test/sockets", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ where: "primary" }) })).status, 200);
+      const refused = await refusals(h, google);
+      const bob = await h.login("bob");
+      const signedOut = await h.login("carol");
+      assert.equal((await h.fetch("/v1/auth/logout", { method: "POST", headers: { authorization: `Bearer ${signedOut.refresh_token}`, "content-type": "application/json" }, body: JSON.stringify({ all: false }) })).status, 200);
+      const offer = (token: string) => ({ upgrade: "websocket", "sec-websocket-protocol": `stillfail-events, stillfail-token.${token}` });
+
+      assert.deepEqual((await refused("/v1/events", {}, 426)).notes, { "stillfail.ws.reason": "websocket_required" });
+      assert.deepEqual((await refused("/v1/events", { upgrade: "websocket", "sec-websocket-protocol": "stillfail-events" }, 401)).fields, { "log.reason": "missing_token" });
+      assert.deepEqual((await refused("/v1/events", offer("nonsense"), 401)).notes, { "stillfail.ws.reason": "invalid_token" });
+      const notBeta = await refused("/v1/events", offer(bob.access_token), 403, "beta");
+      assert.deepEqual(notBeta.notes, { "stillfail.ws.reason": "not_beta" });
+      assert.equal(JSON.parse(notBeta.body).error, "not_beta");
+      const ended = await refused("/v1/events", offer(signedOut.access_token), 401);
+      assert.deepEqual(ended.notes, { "stillfail.ws.reason": "session_denied" });
+      assert.deepEqual(ended.fields, { "log.reason": "session_denied" });
+
+      const all = JSON.stringify(google.got.map((g) => g.body));
+      for (const secret of [bob.access_token, signedOut.access_token, bob.subject, signedOut.subject, "bob@example.test", "carol@example.test"]) assert.ok(!all.includes(secret));
+    } finally {
+      await h.close();
+    }
+  });
+}
 
 test("telemetry's own calls refused, failing or slow are never a trace or a line through it", async () => {
   const google = fakeGoogle(500);

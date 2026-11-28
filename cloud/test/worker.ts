@@ -4,6 +4,7 @@ import { probeLines, relaySamples, seedConsole, SEED_RELAYS } from "./console-se
 import { clock, signToken, nowSeconds, reply, readJson } from "../src/auth";
 import { sockets, type Delivery } from "../src/directory";
 import { forgetEdgeChangelog } from "../src/changelog";
+import { NOTES_HEADER, noted } from "../src/tracing";
 import type { Env } from "../src/env";
 import type { MailMessage } from "../src/mail";
 export { LoginLimiter };
@@ -689,6 +690,14 @@ export default {
       const { where } = (await readJson(request)) as { where: "objects" | "primary" };
       socketsAt(where);
       return reply({ where });
+    }
+    if (path === "/__test/noted") {
+      // `noted` on answers whose headers may not change: a Durable Object's, and one whose headers refuse as Cloudflare's do.
+      const read = async (answer: Response) => ({ status: answer.status, notes: answer.headers.get(NOTES_HEADER), kept: answer.headers.get("x-kept"), body: await answer.text() });
+      const refusing = new Response("held", { status: 404, headers: { "x-kept": "yes" } });
+      Object.defineProperty(refusing.headers, "set", { value: () => { throw new TypeError("Can't modify immutable headers."); } });
+      const station = await env.STATIONS.getByName("0".repeat(64)).fetch(new Request("https://station/connect", { headers: { upgrade: "websocket", "x-stillfail-station": "0".repeat(64) } }));
+      return reply({ refusing: await read(noted(refusing, { why: "test" })), station: await read(noted(station, { why: "test" })) });
     }
     if (path === "/__test/later") {
       // This Worker's clock (and its objects'), put forward by `seconds`; the relay's Worker keeps its own.

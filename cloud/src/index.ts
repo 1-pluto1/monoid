@@ -46,6 +46,8 @@ const SLOW_CRON_MS = 10_000;
 
 /** The sockets the cloud keeps (a device's events, a station's presence): their openings are watched (`observe`). */
 const SOCKETS = new Set(["/v1/events", "/v1/stations/connect"]);
+/** A socket's refusal's WARN line's fields, by the note of its span each is (api.ts). */
+const WHY_REFUSED = { reason: "stillfail.ws.reason", skewSec: "stillfail.ws.skew_sec", station: "stillfail.station", version: "stillfail.version" } as const;
 
 // The admin's console has a host of its own, ADMIN_ORIGIN: its /v1/ calls come here too — the calls its client core
 // makes to sign in and stay signed in (the core talks to the page's origin), and the console's API; nothing else. A
@@ -146,9 +148,13 @@ function observe(env: Env, ctx: ExecutionContext, request: Request, path: string
     const ok = status === 101;
     if (parent?.sampled) ctx.waitUntil(recordCall(env, parent, request, response, started, ended, notes));
     else if (!ok || ms >= SLOW_WS_MS) {
-      ctx.waitUntil(recordRootSpan(env, "cloud.ws.upgrade", started, ended, { "http.route": path, "http.response.status_code": status, "stillfail.ws.ok": ok, "stillfail.sampled_reason": ok ? "slow" : status >= 500 ? "5xx" : "rejected" }, status >= 500, 2));
+      ctx.waitUntil(recordRootSpan(env, "cloud.ws.upgrade", started, ended, { ...notes, "http.route": path, "http.response.status_code": status, "stillfail.ws.ok": ok, "stillfail.sampled_reason": ok ? "slow" : status >= 500 ? "5xx" : "rejected" }, status >= 500, 2));
     }
-    if (status >= 400 && status < 500) ctx.waitUntil(cloudLogToTelemetry(env, "WARN", "ws", "websocket upgrade rejected", { path, status, ms }));
+    if (status >= 400 && status < 500) {
+      // Why (api.ts): which check refused it, by how far a station's clock was off, which station and version it was.
+      const why = Object.fromEntries(Object.entries(WHY_REFUSED).flatMap(([field, note]) => (notes[note] === undefined ? [] : [[field, notes[note]!]])));
+      ctx.waitUntil(cloudLogToTelemetry(env, "WARN", "ws", "websocket upgrade rejected", { path, status, ms, ...why }));
+    }
     return;
   }
   if (parent?.sampled) {

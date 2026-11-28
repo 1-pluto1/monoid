@@ -7,7 +7,7 @@
 import { consoleAdmin, isAdmin } from "./admin";
 import { revokeAppleToken, unsealAppleToken } from "./apple";
 import { bearerToken, clock, denied, digest, limited, readJson, reply, verifyToken, type Claims } from "./auth";
-import { adminOrigins, betaOrigin, header, publicOrigins, signedMessages } from "./compat";
+import { adminOrigins, betaOrigin, header, publicOrigins, shownVersion, signedMessages } from "./compat";
 import { guestOf, guests } from "./guests";
 import { productOf } from "../../client/i18n/brand.ts";
 import type { Live } from "./account";
@@ -27,7 +27,7 @@ import { relays } from "./relays";
 import { unavailable, Unavailable } from "./releases";
 import { receiveLoad, relaysLoad } from "./relay-load";
 import { receiveIncidents, receiveReleased, serveStatus } from "./status";
-import { onceMore, receiveLogs, receiveTraces, telemetryUnreached } from "./tracing";
+import { noted, onceMore, receiveLogs, receiveTraces, telemetryUnreached, type SpanNotes } from "./tracing";
 import { ICON_URL_CHARS, keptIcon, serveIcon } from "./icons";
 import { servePicture } from "./pictures";
 
@@ -144,6 +144,16 @@ async function account(token: string | null, env: Env, request: Request): Promis
 
 const isUpgrade = (request: Request) => request.headers.get("upgrade")?.toLowerCase() === "websocket";
 
+/** Why an events socket whose token verified was refused otherwise than for the test channel (403), by its status. */
+const EVENTS_REFUSED: Record<number, string> = { 401: "session_denied", 429: "rate_limited" };
+
+/** An events socket on the Directory (`DIRECTORY_SOCKETS=primary`): its session checked here, as any call's. */
+async function primaryEvents(request: Request, env: Env, claims: Claims, protocol: string): Promise<Response> {
+  const live = await liveOf(request, env, claims);
+  if (live !== true) return live === "limited" ? limited() : live === "not_beta" ? notBetaReply(env, request) : denied();
+  return env.DIRECTORY.getByName("primary").fetch(new Request("https://directory/events", { headers: { upgrade: "websocket", "x-stillfail-sub": claims.sub, "x-stillfail-sid": claims.sid, "x-stillfail-protocol": protocol } }));
+}
+
 /**
  * The access token of an events socket, and the subprotocol the answer
  * selects. Browsers cannot set headers on a WebSocket, so it comes as a second
@@ -223,19 +233,31 @@ export async function api(request: Request, env: Env, url: URL): Promise<Respons
   // "stillfail-station-connect-v1:<origin>:<station>:<ts>", and
   // x-stillfail-version. (The origin is any of the cloud's.)
   if (path === "/v1/stations/connect" && method === "GET") {
-    if (!isUpgrade(request)) return reply({ error: "websocket_required" }, 426);
+    // Why an opening was refused rides on the answer for its span and WARN line (index.ts `observe`): what the
+    // station sent, never its signature, and of its key only enough to tell one station's retries apart.
+    if (!isUpgrade(request)) return noted(reply({ error: "websocket_required" }, 426), { "stillfail.ws.reason": "websocket_required" });
     const station = header(request, "station");
     const signature = header(request, "signature") ?? "";
-    const ts = Number(header(request, "ts"));
-    if (!validKeyHex(station) || !Number.isSafeInteger(ts) || Math.abs(ts - clock.now() / 1000) > 300) return reply({ error: "invalid_request" }, 400);
-    if (!(await verifyAnySignature(station, signature, signedMessages("station-connect-v1", publicOrigins(env), `${station}:${ts}`)))) return reply({ error: "invalid_signature" }, 401);
+    // (a missing header is no timestamp, never `Number(null)`'s 0)
+    const tsRaw = header(request, "ts");
+    const ts = tsRaw === null || tsRaw.trim() === "" ? Number.NaN : Number(tsRaw);
+    const version = header(request, "version");
+    const said = shownVersion(version);
+    const by = (reason: string, more: SpanNotes = {}): SpanNotes => ({ "stillfail.ws.reason": reason, ...more, ...(said ? { "stillfail.version": said } : {}) });
+    if (!validKeyHex(station)) return noted(reply({ error: "invalid_request" }, 400), by(station === null ? "missing_station" : "bad_station"));
+    const shortStation = { "stillfail.station": station.slice(0, 12) };
+    if (!Number.isSafeInteger(ts)) return noted(reply({ error: "invalid_request" }, 400), by(tsRaw === null || tsRaw.trim() === "" ? "missing_ts" : "bad_ts", shortStation));
+    const skew = ts - clock.now() / 1000;
+    if (Math.abs(skew) > 300) return noted(reply({ error: "invalid_request" }, 400), by("clock_skew", { "stillfail.ws.skew_sec": Math.round(skew), ...shortStation }));
+    if (!(await verifyAnySignature(station, signature, signedMessages("station-connect-v1", publicOrigins(env), `${station}:${ts}`)))) return noted(reply({ error: "invalid_signature" }, 401), by("invalid_signature", shortStation));
     const headers = new Headers({ upgrade: "websocket", "x-stillfail-station": station });
     // On a guest's origin (guests.ts): its state frames name that origin, so the station stays on it.
     if (guestOf(env, env.PUBLIC_ORIGIN)) headers.set("x-stillfail-origin", env.PUBLIC_ORIGIN);
-    const version = header(request, "version");
     if (version) headers.set("x-stillfail-version", version.slice(0, 40));
-    if (sockets.where(env) === "primary") return env.DIRECTORY.getByName("primary").fetch(new Request("https://directory/stations/connect", { headers }));
-    return env.STATIONS.getByName(station).fetch(new Request("https://station/connect", { headers }));
+    const answer = sockets.where(env) === "primary"
+      ? await env.DIRECTORY.getByName("primary").fetch(new Request("https://directory/stations/connect", { headers }))
+      : await env.STATIONS.getByName(station).fetch(new Request("https://station/connect", { headers }));
+    return answer.status === 404 ? noted(answer, by("station_removed", shortStation)) : answer;
   }
 
   // Spans from a signed-in client, or from a station signing them with its key (tracing.ts).
@@ -291,20 +313,19 @@ export async function api(request: Request, env: Env, url: URL): Promise<Respons
   }
 
   if (path === "/v1/events" && method === "GET") {
-    if (!isUpgrade(request)) return reply({ error: "websocket_required" }, 426);
+    // Why an opening was refused, for its span and WARN line (index.ts `observe`): never the token or whose it is.
+    if (!isUpgrade(request)) return noted(reply({ error: "websocket_required" }, 426), { "stillfail.ws.reason": "websocket_required" });
     const socket = socketToken(request);
-    if (sockets.where(env) === "primary") {
-      const claims = await account(socket?.token ?? null, env, request);
-      if (claims instanceof Response) return claims;
-      if (!socket) return denied();
-      return env.DIRECTORY.getByName("primary").fetch(new Request("https://directory/events", { headers: { upgrade: "websocket", "x-stillfail-sub": claims.sub, "x-stillfail-sid": claims.sid, "x-stillfail-protocol": socket.protocol } }));
-    }
-    // On the account's object, which checks the session itself (and, on the test channel, that it is let in).
-    const claims = socket ? await verifyToken(env, socket.token, "access") : null;
-    if (!claims || !socket) return denied();
-    const headers = { upgrade: "websocket", "x-stillfail-sub": claims.sub, "x-stillfail-sid": claims.sid, "x-stillfail-protocol": socket.protocol, ...(onTestChannel.has(request) ? { "x-stillfail-channel": "beta" } : {}) };
-    const answer = await env.ACCOUNTS.getByName(claims.sub).fetch(new Request("https://account/events", { headers }));
-    return answer.status === 403 ? notBetaReply(env, request) : answer;
+    if (!socket) return noted(denied(), { "stillfail.ws.reason": "missing_token" });
+    const claims = await verifyToken(env, socket.token, "access");
+    if (!claims) return noted(denied(), { "stillfail.ws.reason": "invalid_token" });
+    const answer = sockets.where(env) === "primary"
+      ? await primaryEvents(request, env, claims, socket.protocol)
+      // On the account's object, which checks the session itself (and, on the test channel, that it is let in).
+      : await env.ACCOUNTS.getByName(claims.sub).fetch(new Request("https://account/events", { headers: { upgrade: "websocket", "x-stillfail-sub": claims.sub, "x-stillfail-sid": claims.sid, "x-stillfail-protocol": socket.protocol, ...(onTestChannel.has(request) ? { "x-stillfail-channel": "beta" } : {}) } }));
+    if (answer.status === 403) return noted(notBetaReply(env, request), { "stillfail.ws.reason": "not_beta" });
+    const reason = EVENTS_REFUSED[answer.status];
+    return reason ? noted(answer, { "stillfail.ws.reason": reason }) : answer;
   }
 
   // ── the pictures put up as icons: to anyone with the address (icons.ts) ──

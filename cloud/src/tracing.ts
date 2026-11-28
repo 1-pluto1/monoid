@@ -39,10 +39,19 @@ export function parseTraceparent(header: string | null): TraceParent | null {
 export const NOTES_HEADER = "x-stillfail-span";
 export type SpanNotes = Record<string, string | number>;
 
-/** The answer with `notes` for its span. */
+/**
+ * The answer with `notes` for its span. One whose headers may not change (what a Durable Object's or any `fetch`
+ * answered) is answered anew with them, its body and socket the same.
+ */
 export function noted(response: Response, notes: SpanNotes): Response {
-  response.headers.set(NOTES_HEADER, JSON.stringify(notes));
-  return response;
+  try {
+    response.headers.set(NOTES_HEADER, JSON.stringify(notes));
+    return response;
+  } catch {
+    const headers = new Headers(response.headers);
+    headers.set(NOTES_HEADER, JSON.stringify(notes));
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers, webSocket: response.webSocket });
+  }
 }
 
 /** The answer without its notes, and the notes (none if it has none or they do not read). */
