@@ -1423,7 +1423,10 @@ export class Data {
   /// Whether a station's overview is shown with what is being done to it here (a profile's models being saved, a
   /// sign-in's step): `shared` gives it so, made anew, not as it is held.
   #overlaid(station: string): boolean {
-    return [...this.#modelEdits.keys(), ...this.#loginSteps.keys()].some((k) => k.startsWith(station + SEP));
+    const prefix = station + SEP;
+    for (const k of this.#modelEdits.keys()) if (k.startsWith(prefix)) return true;
+    for (const k of this.#loginSteps.keys()) if (k.startsWith(prefix)) return true;
+    return false;
   }
 
   #rawOverview(topic: Topic): unknown {
@@ -2011,14 +2014,25 @@ export class Data {
     return this.#chatRead(read, p).flatMap(([, rows]) => rows);
   }
 
+  #groupByDb<T>(items: readonly T[], stationOf: (item: T) => string): Map<AccountDb, T[]> {
+    const by = new Map<AccountDb, T[]>();
+    for (const item of items) {
+      const db = this.of(stationOf(item));
+      if (!db) continue;
+      const bucket = by.get(db);
+      if (bucket) bucket.push(item);
+      else by.set(db, [item]);
+    }
+    return by;
+  }
+
+  #stationsByDb(stations: readonly string[]): Map<AccountDb, string[]> {
+    return this.#groupByDb(stations, (s) => s);
+  }
+
   /// The records of rows a read found (their `record`), each told by its own key: read as chatFound reads them.
   chatRecords(found: ChatFound[]): void {
-    const by = new Map<AccountDb, ChatFound[]>();
-    for (const f of found) {
-      const db = this.of(f.station);
-      if (db) by.set(db, [...(by.get(db) ?? []), f]);
-    }
-    for (const [db, of] of by) this.#records(db, of);
+    for (const [db, of] of this.#groupByDb(found, (f) => f.station)) this.#records(db, of);
   }
 
   #records(db: AccountDb, found: ChatFound[]): void {
@@ -2033,11 +2047,7 @@ export class Data {
       const db = this.of(p.station);
       return db === undefined ? [] : [[db, this.#chatRows(db, read, p, topics)]];
     }
-    const by = new Map<AccountDb, string[]>();
-    for (const s of p.stations) {
-      const db = this.of(s);
-      if (db) by.set(db, [...(by.get(db) ?? []), s]);
-    }
+    const by = this.#stationsByDb(p.stations);
     // (each database's answer kept by the keys of its own stations: another's written tells it nothing; one with no
     // key of its own kept by them all, never by none)
     return [...by].map(([db, stations]) => {
@@ -2252,13 +2262,7 @@ export class Data {
 
   /// The rows of these stations a list shows first, across their databases (`mine`: of the viewer's own alone).
   chatHead(stations: string[], limit: number, mine = false): [string, any][] {
-    const by = new Map<AccountDb, string[]>();
-    for (const s of stations) {
-      const db = this.of(s);
-      if (!db) continue;
-      by.set(db, [...(by.get(db) ?? []), s]);
-    }
-    return [...by].flatMap(([db, list]) => db.chatHead(list, limit, mine));
+    return [...this.#stationsByDb(stations)].flatMap(([db, list]) => db.chatHead(list, limit, mine));
   }
 
   /// What the chat list reads of a station's overview (account.ts overviewPart): read in a computed, it is made again
@@ -2375,10 +2379,13 @@ export class Data {
   keptMany<V>(d: Kept<V>, owners: readonly Owner[], keys: readonly string[]): (V | undefined)[] {
     const out: (V | undefined)[] = owners.map(() => undefined);
     const by = new Map<AccountDb, number[]>();
-    owners.forEach((o, i) => {
-      const db = this.of(o[0]);
-      if (db) by.set(db, [...(by.get(db) ?? []), i]);
-    });
+    for (let i = 0; i < owners.length; i++) {
+      const db = this.of(owners[i]![0]);
+      if (!db) continue;
+      const bucket = by.get(db);
+      if (bucket) bucket.push(i);
+      else by.set(db, [i]);
+    }
     for (const [db, at] of by) db.kept.many(d, at.map((i) => owners[i]), at.map((i) => keys[i])).forEach((v, j) => (out[at[j]] = v));
     return out;
   }
@@ -2391,13 +2398,7 @@ export class Data {
   /// The rows of these stations a list shows first, each its row kept beside it under its station's key (`keys`), else
   /// its record (account.ts listHead), across their databases.
   listHead(stations: string[], limit: number, mine: boolean, keys: Map<string, string>): HeadRow[] {
-    const by = new Map<AccountDb, string[]>();
-    for (const s of stations) {
-      const db = this.of(s);
-      if (!db) continue;
-      by.set(db, [...(by.get(db) ?? []), s]);
-    }
-    return [...by].flatMap(([db, list]) => db.listHead(list, limit, mine, keys));
+    return [...this.#stationsByDb(stations)].flatMap(([db, list]) => db.listHead(list, limit, mine, keys));
   }
 
   /// Whether this core can read a station's overview as kept beside it (db/kept.ts KEPT.overviewFit): undefined, none held; null,
@@ -2411,12 +2412,9 @@ export class Data {
 
   /// How many sidebar rows these stations have.
   chatCount(stations: string[]): number {
-    const by = new Map<AccountDb, string[]>();
-    for (const s of stations) {
-      const db = this.of(s);
-      if (db) by.set(db, [...(by.get(db) ?? []), s]);
-    }
-    return [...by].reduce((n, [db, list]) => n + db.chatCount(list), 0);
+    let total = 0;
+    for (const [db, list] of this.#stationsByDb(stations)) total += db.chatCount(list);
+    return total;
   }
 
   /// The rows of these stations that ask something of their person or have something unread.
@@ -2427,7 +2425,9 @@ export class Data {
       this.#readQuery(readTopic(CHAT_READS.marked.name, [s]));
       const db = this.of(s);
       if (!db) continue;
-      by.set(db, [...(by.get(db) ?? []), s]);
+      const bucket = by.get(db);
+      if (bucket) bucket.push(s);
+      else by.set(db, [s]);
     }
     return [...by].flatMap(([db, list]) => db.marked(list));
   }
@@ -2457,11 +2457,7 @@ export class Data {
 
   #said(stations: string[], terms: string[], limit: number, of: (db: AccountDb, stations: string[]) => ReturnType<AccountDb["findSaid"]> | null): ReturnType<AccountDb["findSaid"]> | null {
     for (const station of stations) this.#readQuery({ topic: "$said", station });
-    const by = new Map<AccountDb, string[]>();
-    for (const s of stations) {
-      const db = this.of(s);
-      if (db) by.set(db, [...(by.get(db) ?? []), s]);
-    }
+    const by = this.#stationsByDb(stations);
     const found: ReturnType<AccountDb["findSaid"]> = [];
     for (const [db, list] of by) {
       const one = of(db, list);

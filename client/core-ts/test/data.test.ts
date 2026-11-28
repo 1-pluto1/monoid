@@ -2228,3 +2228,37 @@ test("db_used_caches_pragma_reads_across_repeated_over_budget_checks_and_invalid
     assert.deepEqual(afterWritePragmas, ["PRAGMA page_count", "PRAGMA freelist_count"]);
   } finally { runner.shutdown(); }
 });
+
+test("multi_db_station_grouping_and_overlay_detection_work_across_accounts", async () => {
+  const { host, runner } = fresh({ s1: ["w1"], s2: ["w2"] });
+  const data = new Data(host, runner, {
+    owner: (ws) => (ws === "w1" ? "s1" : ws === "w2" ? "s2" : null),
+    derive: { tone: (r) => (r.unread === true && r.mine === true ? "done" : null), asks: () => false, state: () => null, watched: () => false },
+  });
+  await run(data.open(["s1", "s2"]));
+  try {
+    const stations = ["w1/a", "w1/b", "w2/a", "w2/b", "missing/z"];
+    for (const [i, st] of stations.slice(0, 4).entries()) {
+      data.set(rows(st), [
+        { id: `c${i}-1`, thread: i + 1, title: `Chat ${st}`, lastActiveAt: 100 + i, unread: i % 2 === 0, mine: true },
+        { id: `c${i}-2`, thread: i + 10, title: `Chat ${st} second`, lastActiveAt: 200 + i, unread: false, mine: true },
+      ]);
+      data.set(overview(st), { profiles: [{ id: "p1", models: ["m1", "m2"], named: ["m1", "m2"] }] });
+      data.putItems("entry", st, String(i + 1), [[1, { n: 1, kind: "message", text: `needle in ${st}`, at: 500 + i }]]);
+    }
+    await run(data.written);
+
+    assert.equal(data.chatCount(stations), 8);
+    assert.equal(data.chatHead(stations, 10).length, 8);
+    assert.equal(data.listHead(stations, 10, false, new Map()).length, 8);
+    assert.deepEqual(data.marked(stations).map(([st, r]) => `${st}:${r.id}`).sort(), ["w1/a:c0-1", "w2/a:c2-1"]);
+    assert.deepEqual(data.findSaid(stations, ["needle"], 10).map((f) => f.station), ["w2/b", "w2/a", "w1/b", "w1/a"]);
+
+    assert.equal(data.beginModels("w1/a", "p1", ["m1"]), true);
+    assert.deepEqual((data.shown(overview("w1/a")) as J).profiles[0].models, ["m1"]);
+    assert.deepEqual((data.shown(overview("w1/b")) as J).profiles[0].models, ["m1", "m2"]);
+    assert.deepEqual((data.shown(overview("w2/a")) as J).profiles[0].models, ["m1", "m2"]);
+    data.endModels("w1/a", "p1");
+    assert.deepEqual((data.shown(overview("w1/a")) as J).profiles[0].models, ["m1", "m2"]);
+  } finally { runner.shutdown(); }
+});
