@@ -159,7 +159,7 @@ export class Fill {
         // (given way or after the others: paused alike, a person can start it)
         : t("core-logic.keeping.paused", { percent, total });
       const where = call === null ? {} : call.kind === "stationFilePart" ? { key: call.key } : { root: call.root, path: call.path };
-      const name = call === null ? f.id : call.kind === "stationFilePart" ? call.name : (call.path.split("/").pop() ?? call.path);
+      const name = call === null ? f.id : call.kind === "stationFilePart" ? call.name : (call.path.split(/[/\\]/).filter(Boolean).pop() ?? call.path);
       const from = this.#from.get(f.id);
       const original = get(get(from, "file"), "name");
       const title = typeof original === "string" && original !== "" ? original : call?.kind === "stationFilePart" ? titleOf(name) : name;

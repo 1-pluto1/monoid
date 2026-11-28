@@ -126,6 +126,10 @@ test("it_says_the_call_it_runs_or_its_reply_or_where_the_turn_stands", () => {
   assert.equal(doing("mcp__stillfail__station_task", JSON.stringify({ station: willow, action: "get", key: "lint" }), { stations }), "查看 Willow 上的 lint");
   assert.equal(doing("mcp__stillfail__station_task", JSON.stringify({ station: willow, action: "list" })), "列出 另一台 station 上的任务");
   assert.equal(doing("mcp__stillfail__station_file", JSON.stringify({ station: willow, key: "k", direction: "download", path: "out/shot.png", local: "/w/shot.png" }), { stations }), "从 Willow 下载 shot.png");
+  assert.equal(doing("mcp__stillfail__station_file", JSON.stringify({ station: willow, key: "k", direction: "upload", path: "D:\\Work\\out\\shot.png", local: "C:\\w\\shot.png" }), { stations }), "上传 shot.png 到 Willow");
+  assert.equal(doing("mcp__stillfail__phone_send", JSON.stringify({ path: "C:\\Users\\alice\\apk\\app.apk" })), "发送文件到手机 app.apk");
+  assert.equal(doing("Read", JSON.stringify({ file_path: "D:\\Work\\src\\main.ts" })), "读取 main.ts");
+  assert.equal(doing("File D:\\Work\\src\\view.ts", "{}"), "读取 view.ts");
   assert.equal(doing("ToolSearch", '{"query":"select:mcp__stillfail__secret_list,mcp__stillfail__station_task","max_results":2}'), "加载工具 secret_list、station_task");
   assert.equal(told("ToolSearch", '{"query":"notebook jupyter"}'), null);
   assert.equal(epochMs("1970-01-02T00:00:01.500Z"), 86_401_500);

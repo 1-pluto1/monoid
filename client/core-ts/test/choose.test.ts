@@ -148,6 +148,10 @@ test("the_runtimes_a_chat_starts_on_are_offered_claude_codex_then_deepseek_harne
   assert.deepEqual([kept.where, kept.folder, kept.day, kept.when, kept.own], ["~/Documents/GitHub/still.fail", "still.fail", "今天", "3 小时前", false]);
   const old = machineMeta({ runtime: "codex", cwd: "/Users/me/.stillfail/sessions/ember/c-1/workspace", updatedAt: 9 * day + 13 * 3_600_000 + 5 * 60_000 }, 10 * day + 3_600_000);
   assert.deepEqual([old.folder, old.day, old.when, old.own], ["workspace", "昨天", "13:05", true]);
+  const win = machineMeta({ runtime: "codex", cwd: "D:\\Work\\monoid\\" }, 10 * day);
+  assert.deepEqual([win.folder, win.own], ["monoid", false]);
+  const winOwn = machineMeta({ runtime: "codex", cwd: "C:\\Users\\alice\\.stillfail\\sessions\\ember\\c-1\\workspace" }, 10 * day);
+  assert.deepEqual([winOwn.folder, winOwn.own], ["workspace", true]);
 });
 
 test("a models maker and series are the catalogs the station says, else known by its name", () => {
@@ -396,6 +400,10 @@ test("presetMeta builds summary, maker, runtime, and first folder metadata", () 
   const multi = presetMeta({ dirs: [], stations: ["st1", "st2"], instructions: "" }, names);
   assert.equal(multi.summary, "2 台 station");
   assert.equal(multi.maker, undefined);
+
+  const winDirs = presetMeta({ dirs: [{ path: "D:\\Work\\monoid\\" }, { path: "C:\\Code\\app" }], instructions: "" }, names);
+  assert.equal(winDirs.dirName, "monoid");
+  assert.equal(winDirs.summary, "monoid, app");
 });
 
 test("preset usage ranks frequently and recently used presets first while keeping createdAt order without history", () => {

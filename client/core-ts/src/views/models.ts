@@ -420,7 +420,7 @@ export function machineMeta(session: J, now: number, offsetMin = 0): J {
   }
   const at = typeof session.updatedAt === "number" ? session.updatedAt : null;
   const today = at !== null && format.localDay(at, offsetMin) === format.localDay(now, offsetMin);
-  const parts = cwd.split("/").filter((x) => x !== "");
+  const parts = cwd.split(/[/\\]/).filter((x) => x !== "");
   return {
     ...session,
     meta: [runtime, short, ago].filter((x) => x !== null).join(" · "),
@@ -428,7 +428,7 @@ export function machineMeta(session: J, now: number, offsetMin = 0): J {
     folder: short === "~" ? "~" : (parts[parts.length - 1] ?? short),
     day: at === null ? "" : format.dayLabel(at, now, offsetMin),
     when: at === null ? "" : today ? (ago ?? "") : format.clock(at, offsetMin),
-    own: cwd.includes("/.stillfail/"),
+    own: cwd.includes("/.stillfail/") || cwd.includes("\\.stillfail\\"),
   };
 }
 

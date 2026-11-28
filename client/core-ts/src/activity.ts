@@ -337,7 +337,7 @@ export function told(tool: string, input: string, known: Known = {}): string | n
     const station = known.stations?.get(id) ?? (id === "" || /^[0-9a-f]{16,}$/.test(id) ? t("core-logic.activity.remote.another") : id);
     const key = typeof a.key === "string" ? a.key : "";
     if (name === "station_file") {
-      const path = typeof a.path === "string" ? (a.path.split("/").pop() ?? a.path) : "";
+      const path = typeof a.path === "string" ? (a.path.split(/[/\\]/).filter(Boolean).pop() ?? a.path) : "";
       return t(`core-logic.activity.remote.${a.direction === "download" ? "download" : "upload"}`, { station, what: path || key });
     }
     if (a.action === "list") return t("core-logic.activity.remote.list", { station });
@@ -399,7 +399,7 @@ export function told(tool: string, input: string, known: Known = {}): string | n
   if (name === "secret_delete") return typeof a.item === "string" && a.item ? `申请删除密钥 ${a.item}` : "申请删除密钥";
   if (name === "secret_cancel") return "撤回密钥申请";
   if (name === "phone_use") return a.done === true ? "归还手机调试权限" : "请求手机调试权限";
-  if (name === "phone_send") return typeof a.path === "string" && a.path ? `发送文件到手机 ${a.path.split("/").pop() ?? a.path}` : "发送文件到手机";
+  if (name === "phone_send") return typeof a.path === "string" && a.path ? `发送文件到手机 ${a.path.split(/[/\\]/).filter(Boolean).pop() ?? a.path}` : "发送文件到手机";
   if (name === "adb_devices") return "查看已连接 Android 设备";
   if (name === "device_list") return "查看工作区设备列表";
   if (name === "permissions") return typeof a.request === "string" && a.request ? `请求系统权限 ${a.request}` : "查看系统权限";
@@ -544,12 +544,12 @@ export function doing(tool: string, input: string, known: Known = {}): string {
     const isPath = name === "file_path" || name === "target_file" || name === "path" || name === "Path" || name === "target_directory" || name === "DirectoryPath" || name === "SearchDirectory" || name === "SearchPath";
     const raw = isCmd ? summaryCommand(s) : isPath ? cleanPath(s) : s;
     const line = firstLine(raw);
-    target = kind === "read" || kind === "edit" ? (line.split("/").pop() ?? line) : line;
+    target = kind === "read" || kind === "edit" ? (line.split(/[/\\]/).filter(Boolean).pop() ?? line) : line;
     break;
   }
   if (!target && tool.startsWith("File ")) {
     const p = cleanPath(tool.slice(5).trim());
-    target = p.split("/").pop() ?? p;
+    target = p.split(/[/\\]/).filter(Boolean).pop() ?? p;
   } else if (!target && kind === "command" && !["Bash", "bash", "run_command", "run_terminal_command", "exec", "exec_command", "shell", "local_shell"].includes(toolName(tool))) {
     target = firstLine(summaryCommand(toolName(tool)));
   }

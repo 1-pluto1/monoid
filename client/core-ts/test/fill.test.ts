@@ -550,3 +550,15 @@ test("background fill preempted by scheduler backs off IDLE_MS and wakes immedia
   assert.equal(await r.whole(chatKeptId(ST, "k1", "urgent.mp4"), urgent.length), true, "fill.want must wake immediately during preemption backoff");
   t.core.close();
 });
+
+test("fill.shown extracts basenames from Windows backslash drive paths", async () => {
+  const film = bytesOf(6 * MB, 13);
+  const t = await started();
+  files(t.host, new Map(), new Set(), new Map([["nested\\clip.mp4", film]]));
+  const r = await rig(t);
+  await r.ask("drive.read", { station: ST, root: "D:\\Work", path: "nested\\clip.mp4", offset: 0, length: MB, keep: "played", size: film.length, mtime: 7 });
+  const [shown] = t.core.inner.fill.shown();
+  assert.equal(shown?.name, "clip.mp4");
+  assert.equal(shown?.title, "clip.mp4");
+  t.core.close();
+});

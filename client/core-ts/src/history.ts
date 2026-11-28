@@ -666,10 +666,10 @@ export function cleanReceivedMessageText(raw: string): string {
         .trim()
         .split("\n")
         .map((l) => {
-          const m = /^- \/.*? \((.+), \d+ bytes\)$/.exec(l.trim());
+          const m = /^- (?:\/|[A-Za-z]:\\).*? \((.+), \d+ bytes\)$/.exec(l.trim());
           if (m?.[1]) return m[1];
           const p = l.replace(/^- /, "").trim();
-          return p.split("/").pop() || p;
+          return p.split(/[/\\]/).filter(Boolean).pop() || p;
         })
         .filter(Boolean);
       return names.length > 0 ? `\n[附件: ${names.join(", ")}]` : "";
@@ -1401,7 +1401,7 @@ function group(timeline: J[], steps: Step[], rows: Row[], base: number, known: K
     return countOf(b) - countOf(a);
   });
   const fileBrief = (files: string[]): string => {
-    const names = Array.from(new Set(files.map((f) => f.split("/").pop() || f))).filter(Boolean);
+    const names = Array.from(new Set(files.map((f) => f.split(/[/\\]/).filter(Boolean).pop() || f))).filter(Boolean);
     if (names.length === 0) return "";
     if (names.length === 1) return `（${names[0]}）`;
     if (names.length === 2) return `（${names[0]}、${names[1]}）`;

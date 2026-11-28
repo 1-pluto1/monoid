@@ -125,7 +125,7 @@ export function presetMeta(
     else if (speed === "fast" || get(pm, "fast") === true) mParts.push("Fast");
     parts.push(mParts.join(" "));
   }
-  const dirBasename = (path: string): string => path.split("/").filter((x) => x !== "").pop() ?? path;
+  const dirBasename = (path: string): string => path.split(/[/\\]/).filter((x) => x !== "").pop() ?? path;
   const dirs = arr(get(p, "dirs"));
   if (dirs.length > 0) {
     const firstTwo = dirs.slice(0, 2).map((d) => dirBasename(text(get(d, "path")) ?? "")).filter((x) => x !== "");
@@ -1037,7 +1037,7 @@ export class Choose implements Owner {
         const repo = text(get(d, "repo"));
         const offered = arr(get(this.#env.store.get({ topic: "presets", station: text(get(d, "station")) ?? at }), "candidates"));
         const found = offered.find((o) => get(o, "path") === path || (repo !== null && get(o, "repo") === repo));
-        const name = text(get(found, "name")) ?? path.split("/").filter((x) => x !== "").pop() ?? path;
+        const name = text(get(found, "name")) ?? path.split(/[/\\]/).filter((x) => x !== "").pop() ?? path;
         const icon = text(get(found, "icon"));
         return { name, repo: repo ?? "", ...(icon !== null ? { icon } : {}) };
       });

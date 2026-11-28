@@ -996,3 +996,32 @@ test("codex_exec_wrappers_and_multi_runtime_tools_are_unwrapped_and_labeled", ()
   assert.equal(withLongMark.items[1].body.content.ends, "done");
   assert.ok(withLongMark.items[1].body.content.text.endsWith(`：${longDoneReason}`), "full mark reason must be preserved uncut");
 });
+
+test("windows backslash paths show basenames in history attachments and step summaries", () => {
+  const h = presentHistory(
+    {
+      timeline: [
+        {
+          kind: "user",
+          text:
+            '<message via="web" thread="CHAT/1" from="Ada (ada@x)" ts="1.0">\n' +
+            "看截图\n\n" +
+            "Attached files:\n" +
+            "- C:\\Users\\alice\\.stillfail\\uploads\\win-shot.png (win-shot.png, 1024 bytes)\n" +
+            "- D:\\Work\\notes\\todo.md\n" +
+            "</message>",
+        },
+        { kind: "tool_call", tool: "Read", callId: "r1", text: JSON.stringify({ file_path: "D:\\Work\\src\\app.ts" }) },
+        { kind: "tool_result", callId: "r1", ok: true, text: "ok" },
+        { kind: "tool_call", tool: "Read", callId: "r2", text: JSON.stringify({ file_path: "D:\\Work\\src\\main.ts" }) },
+        { kind: "tool_result", callId: "r2", ok: true, text: "ok" },
+      ],
+    },
+    cx([], [], []),
+  );
+  assert.equal(h.items[0].body.content.messages[0].text, "看截图\n[附件: win-shot.png, todo.md]");
+  const step = h.items[1].body.content;
+  assert.equal(step.rows[0].content.said, "D:\\Work\\src\\app.ts");
+  assert.ok(String(step.summary).includes("（app.ts、main.ts）"), `expected basenames in summary, got ${String(step.summary)}`);
+  assert.ok(!String(step.summary).includes("D:\\Work"), `expected no full Windows path in summary, got ${String(step.summary)}`);
+});
