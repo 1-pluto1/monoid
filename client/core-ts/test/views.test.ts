@@ -11,7 +11,7 @@ import { merge } from "../src/entries.ts";
 import { topicKey, type Topic } from "../src/protocol.ts";
 import { EVICT_AFTER_MS } from "../src/store.ts";
 import { attention, choices, models, quotaFor, runnableOn } from "../src/views/models.ts";
-import { OVERVIEW_FIT, answeredAt, betaOffered, blockedUnder, down, foldNotices, noticeOf, shownMessage, softwareNoticeTarget, stationOn } from "../src/views/views.ts";
+import { OVERVIEW_FIT, answeredAt, betaOffered, blockedUnder, down, foldNotices, lettersByChat, noticeOf, shownMessage, softwareNoticeTarget, stationOn } from "../src/views/views.ts";
 import { localDay } from "../src/views/usage.ts";
 import { decorate, installView, profile as presentProfile, softwareNoticeView } from "../src/present.ts";
 import { conformTy, forgetUnknownWords, unknownWords } from "../src/conform.ts";
@@ -4914,6 +4914,63 @@ test("a_chat_still_opens_when_its_agents_overview_profile_omits_name_or_sends_em
     assert.deepEqual(attention(ov, { profile: "p-label" }, 0), [{ kind: "account", text: "「Named via label」需要重新登录" }]);
   } finally {
     forgetUnknownWords();
+    t.store.runner.shutdown();
+  }
+});
+
+test("lettersByChat_groups_orders_and_preserves_frozen_inputs_and_chatSearch_applies_station_state_only_when_needed", async () => {
+  const letters: { message: J; way: "in" | "out"; title: string; link: string | null }[] = [];
+  for (let i = 1; i <= 60; i++) {
+    letters.push({
+      message: Object.freeze({ text: `peer-a-${i}`, createdAt: i * 10, by: Object.freeze({ name: "BotA" }) }),
+      way: i % 2 === 0 ? "out" : "in",
+      title: "Peer A",
+      link: "https://app.still.fail/w/ws/s/a/chats/1",
+    });
+  }
+  letters.push(
+    {
+      message: Object.freeze({ text: "newest-in", createdAt: 9999, by: Object.freeze({ name: "BotB" }) }),
+      way: "in",
+      title: "Peer B",
+      link: null,
+    },
+    {
+      message: Object.freeze({ text: "older-in", createdAt: 5, by: Object.freeze({ name: "BotC" }) }),
+      way: "in",
+      title: "Peer C",
+      link: "https://app.still.fail/w/ws/s/a/chats/3",
+    },
+  );
+  const grouped = lettersByChat(letters);
+  assert.deepEqual(grouped.map((g) => g.title), ["Peer B", "Peer A", "Peer C"]);
+  assert.equal(grouped[1]!.letters.length, 60);
+  assert.equal(grouped[1]!.letters[0].text, "peer-a-1");
+  assert.equal(grouped[1]!.letters[59].text, "peer-a-60");
+  assert.equal(grouped[1]!.letters[59].way, "out");
+  assert.equal(grouped[0]!.last, "newest-in");
+  assert.equal(grouped[0]!.lastActiveAt, 9999);
+
+  const t = setup();
+  const u = ui();
+  try {
+    const now = t.host.nowMs();
+    t.set(workspace(), { id: "ws", name: "WS", stations: [{ id: "a", name: "Alpha", online: true }, { id: "b", name: "Beta", online: true }] });
+    t.set(rows("ws/a"), [{ ...row("ka", now), title: "Alpha match", agents: [{ ...session("ka"), running: true }] }]);
+    t.set(rows("ws/b"), [{ ...row("kb", now - 10), title: "Beta match", agents: [{ ...session("kb"), running: true }] }]);
+    t.set(link("ws/a"), { state: "online" });
+    t.set(link("ws/b"), { state: "online" });
+    t.subscribe(1, { topic: "chatSearch", scope: "ws", query: "match", station: null, session: null, limit: 10 });
+    await t.read(u, 1);
+    assert.deepEqual(u.value.items.map((x: J) => [x.station, x.offline ?? false]), [["ws/a", false], ["ws/b", false]]);
+
+    t.set(workspace(), { id: "ws", name: "WS", stations: [{ id: "a", name: "Alpha", online: false }, { id: "b", name: "Beta", online: true }] });
+    t.set(link("ws/a"), { state: "offline" });
+    await t.read(u, 1);
+    const byStation = new Map<string, J>(u.value.items.map((x: J) => [x.station, x]));
+    assert.equal(byStation.get("ws/a")!.offline, "Alpha 离线");
+    assert.equal(byStation.get("ws/b")!.offline, undefined);
+  } finally {
     t.store.runner.shutdown();
   }
 });
