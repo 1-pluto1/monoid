@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { Effect } from "effect";
 import { Data } from "../src/data.ts";
 import { holdLanguage } from "../src/i18n.ts";
-import { draftAt, expand, KEPT, keep, link, mark, opened, OPENED_KEPT, openedIn, search, title } from "../src/refs.ts";
+import { draftAt, expand, KEPT, keep, link, mark, marked, opened, OPENED_KEPT, openedIn, search, title } from "../src/refs.ts";
 import { Runner } from "../src/runtime.ts";
 import { FakeHost } from "../src/testing.ts";
 
@@ -155,4 +155,34 @@ test("a_search_and_withOutside_match_multiple_words_in_any_order_and_across_fiel
     item("o3", "CLI Admin 共享", { outside: "乙", xshare: { to: ["ws"], write: false } }),
   ];
   assert.deepEqual(withOutside(local, outside, "admin cli", "ws", 8).map((i) => i.id), ["l1", "o3", "o1", "l2"]);
+});
+
+test("expand_and_marked_keep_latest_title_across_legacy_and_many_mark_lookups", () => {
+  const d = data();
+  d.put("chat_ref", "links", [
+    ["dup", "https://x/w/ws/s/st/chats/legacy-old"],
+    ["dup", "https://x/w/ws/s/st/chats/legacy-new"],
+    ["only-legacy", "https://x/w/ws/s/st/chats/legacy-only"],
+  ]);
+  const kept = Array.from({ length: KEPT }, (_, i) => [`t${i}`, `https://x/w/ws/s/st/chats/l${i}`] as [string, string]);
+  keep(d, kept);
+  mark(d, "https://x", "ws/st", "override-k", "t10");
+  mark(d, "https://x", "other/st", "other-k", "only-legacy");
+
+  assert.equal(expand(d, "ws/st", "@[dup]"), "[dup](https://x/w/ws/s/st/chats/legacy-new)");
+  assert.deepEqual(marked(d, "ws/st", "@[only-legacy]"), ["https://x/w/ws/s/st/chats/legacy-only"]);
+
+  const manyMarks = Array.from({ length: 60 }, (_, i) => `@[t${i % 30}]`).join(" ") + " @[dup] @[t10] @[missing]";
+  const expanded = expand(d, "ws/st", manyMarks);
+  assert.ok(expanded.includes("[t10](https://x/w/ws/s/st/chats/override-k)"));
+  assert.ok(expanded.includes("[dup](https://x/w/ws/s/st/chats/legacy-new)"));
+  assert.ok(expanded.endsWith("@[missing]"));
+  assert.deepEqual(
+    marked(d, "ws/st", "@[dup] @[t10] @[dup] @[only-legacy] @[missing]"),
+    [
+      "https://x/w/ws/s/st/chats/legacy-new",
+      "https://x/w/ws/s/st/chats/override-k",
+      "https://x/w/ws/s/st/chats/legacy-only",
+    ],
+  );
 });

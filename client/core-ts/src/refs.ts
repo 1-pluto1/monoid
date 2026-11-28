@@ -89,13 +89,29 @@ export function mark(data: Data, base: string, station: string, id: string, full
   return `@[${ti}]`;
 }
 
+function linksIndex(all: [string, string][]): (name: string) => string | undefined {
+  let byTitle: Map<string, string> | null = null;
+  let seen = 0;
+  return (name: string): string | undefined => {
+    if (byTitle) return byTitle.get(name);
+    if (seen++ === 0) {
+      for (let i = all.length - 1; i >= 0; i--) {
+        if (all[i]![0] === name) return all[i]![1];
+      }
+      return undefined;
+    }
+    byTitle = new Map(all);
+    return byTitle.get(name);
+  };
+}
+
 /// The chats a text written on `station` refers to by its marks, as links (each once, in order).
 export function marked(data: Data, station: string, text: string): string[] {
-  const all = links(data, ofAddress(station));
+  const find = linksIndex(links(data, ofAddress(station)));
   const out: string[] = [];
   for (const m of text.matchAll(REF_MARK)) {
-    const hit = [...all].reverse().find(([x]) => x === m[1]);
-    if (hit && !out.includes(hit[1])) out.push(hit[1]);
+    const hit = find(m[1]!);
+    if (hit !== undefined && !out.includes(hit)) out.push(hit);
   }
   return out;
 }
@@ -114,7 +130,7 @@ export function linkedChat(l: string): { station: string; id: string } | null {
 /// What is written in a chat on `station`, its marks made links to chats of its workspace.
 export function expand(data: Data, station: string, text: string): string {
   if (!text.includes("@[")) return text;
-  const all = links(data, ofAddress(station));
+  const find = linksIndex(links(data, ofAddress(station)));
   let out = "";
   let rest = text;
   for (;;) {
@@ -125,8 +141,8 @@ export function expand(data: Data, station: string, text: string): string {
     const m = after.search(/[\]\n]/);
     const found = m >= 0 && after[m] === "]" ? after.slice(0, m) : null;
     if (found !== null && found !== "" && Array.from(found).length <= MARK_MAX) {
-      const hit = [...all].reverse().find(([x]) => x === found);
-      out += hit ? `[${found}](${hit[1]})` : `@[${found}]`;
+      const hit = find(found);
+      out += hit !== undefined ? `[${found}](${hit})` : `@[${found}]`;
       rest = after.slice(found.length + 1);
     } else {
       out += "@[";
