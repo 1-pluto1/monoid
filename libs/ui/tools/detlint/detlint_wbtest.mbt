@@ -58,6 +58,164 @@ fn lines(fs : Array[Finding]) -> Array[Int] {
 }
 
 ///|
+test "each-tuple-key checks the key supplier" {
+  let source =
+    #|fn rows(v : @view.View) -> Unit {
+    #|  v.each(items, fn(x) { (x.a, x.b) }, row)
+    #|  v.each(items, at_once=true, fn(x) {
+    #|    ((x.a, pair(x.b, x.c), x.d))
+    #|  }, row)
+    #|  v.each(items, x => (x.a, x.b), row)
+    #|  @view.View::each(v, items, fn(x) { return (x.a, x.b) }, row)
+    #|  v.each_of(fn() { [(a, b)] }, row)
+    #|  v.list_reused(fn() { [(a, b)] }, row)
+    #|  v.scrolls_reused(scroll, fn() { [(a, b)] }, row)
+    #|  v.scrolls_window(scroll, fn() { [(a, b)] }, row)
+    #|  v.each(items, fn(x) { Key::{ a: x.a, b: x.b } }, row)
+    #|  v.each(items, fn(x) { key_of(x.a, x.b) }, row)
+    #|  v.each(items, fn(x) { (x.id) }, fn(_, x) { use((x.a, x.b)) })
+    #|  v.scrolls_window(scroll, fn() { [Key::{ a, b }] }, row, bar_clear=fn() { (0.0, 0.0) })
+    #|  rows.iter().each(fn(x) { use((x.a, x.b)) })
+    #|  v.each(items, fn(x) { (x.a, x.b) }, row) // det-ok(each-tuple-key): legacy key
+    #|  v.each(items, fn(x) {
+    #|    let b = x.b
+    #|    (x.a, b)
+    #|  }, row)
+    #|  v.each(items, fn(x) { pack((x.a, x.b)) }, row)
+    #|  let by_pair = v.keyed_by(items, fn(x) { (x.a, x.b) })
+    #|  let by_name = v.keyed_by(items, same=same_value, x => x.name)
+    #|  v.each(items, ((fn(x) { (x, 0) })), row)
+    #|  v.each(1, fn(n) { (n, n + 1) }, emit)
+    #|  Own::each(1, fn(n) { (n, n + 1) }, emit)
+    #|  own.each((1), fn(n) { (n, n + 1) }, emit)
+    #|  Own::each(own, items, fn(n) { (n, n + 1) }, emit)
+    #|  array.each(fn(x) { (x.a, x.b) })
+    #|  Array::each(array, fn(x) { (x.a, x.b) })
+    #|}
+    #|test "tuple keys" { v.each(items, fn(x) { (x.a, x.b) }, row) }
+  let files = [("src/app/rows.mbt", source), ("src/app/rows_wbtest.mbt", source)]
+  assert_eq(lines(found(files, "each-tuple-key", 10)), [2, 4, 6, 7, 9, 10, 11, 20, 23, 25])
+  assert_eq(
+    lint_sources(files, test_cfg()).filter(fn(f) {
+      f.rule == "each-tuple-key" && f.excused == Some("legacy key")
+    }).length(),
+    1,
+  )
+}
+
+///|
+test "iter-signal-read counts direct zero-argument reads" {
+  let source =
+    #|fn read() -> Unit {
+    #|  xs.iter().any(fn(x) { x == wanted.get() })
+    #|  xs.iter().all(fn(x) { x < @ui.window_zoom() })
+    #|  xs.iter().find_first(fn(x) { x == wanted.get() })
+    #|  xs.iter().filter(fn(x) { x == wanted.get() })
+    #|  xs.iter().filter_map(fn(x) { Some(wanted.get() + x) })
+    #|  xs.iter().map(fn(x) { wanted.get() + x })
+    #|  xs.iter().each(fn(x) { use(wanted.get() + x) })
+    #|  xs.search_by(x => x == wanted.get())
+    #|  xs.filter_map((x) => { Some(wanted.get() + x) })
+    #|  xs.iter().any(fn(i) { xs.get(i) == Array::get(xs, i) && map.get(i) is Some(_) })
+    #|  xs.iter().map(fn(x) { @other.get() + @other.window_zoom() + x })
+    #|  xs.iter().map(fn(x) { lazy(fn() { wanted.get() }) })
+    #|  xs.iter().map(fn(x) { lazy(y => wanted.get() + y) })
+    #|  xs.iter().any(fn(x) { ys.iter().any(fn(y) { x == y + wanted.get() }) })
+    #|  node.each(items, fn(_) { wanted.get() }, row)
+    #|  xs.iter().any(fn(x) {
+    #|    // det-ok(iter-signal-read): legacy read
+    #|    x == wanted.get()
+    #|  })
+    #|  xs.iter().any((fn(x) { x == wanted.get() }))
+    #|  xs.iter().filter(pred).any(fn(x) { x == wanted.get() })
+    #|  xs.iter().take(3).filter_map(to_item).map(transform).all(fn(x) { x < @ui.window_zoom() })
+    #|  xs.iter().collect().map(fn(x) { x + wanted.get() })
+    #|}
+    #|test "signal read" { xs.iter().any(fn(x) { x == wanted.get() }) }
+  let files = [("src/ui/read.mbt", source), ("src/ui/read_test.mbt", source)]
+  assert_eq(lines(found(files, "iter-signal-read", 13)), [2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 21, 22, 23])
+  assert_eq(
+    lint_sources(files, test_cfg()).filter(fn(f) {
+      f.rule == "iter-signal-read" && f.excused == Some("legacy read")
+    }).length(),
+    1,
+  )
+}
+
+///|
+test "each-tuple-key uses call shapes across receiver forms" {
+  let source =
+    #|type Panel = @view.View
+    #|typealias Sheet = Panel
+    #|#cfg(target="js")
+    #|pub
+    #|fn build(v : View, p : ExternalPanel) -> Unit {
+    #|  v.each(items, fn(x) { (x, x + 1) }, row)
+    #|  p.each(items, fn(x) { (x, x + 1) }, row)
+    #|  Sheet::each(v, items, fn(x) { (x, x + 1) }, row)
+    #|}
+    #|fn Own::make_view() -> @view.View { view }
+    #|fn make_own() -> Own { own }
+    #|fn draw(v : Own, make_own : () -> @view.View) -> Unit {
+    #|  let _ = fn(v : Own) { ignore(v) }
+    #|  { let v = get_view(); v.each(items, fn(x) { (x, x + 1) }, row) }
+    #|  if (maybe is Some(v)) {
+    #|    v.each(items, fn(x) { (x, x + 1) }, row)
+    #|  }
+    #|  for v = View(1), i = 0; i < 1; i = i + 1 {
+    #|    ignore(v)
+    #|  } nobreak {
+    #|    v.each(items, fn(x) { (x, x + 1) }, row)
+    #|  }
+    #|  Own::make_view().each(items, fn(x) { (x, x + 1) }, row)
+    #|  make_own().each(items, fn(x) { (x, x + 1) }, row)
+    #|  @other.make_view().each(items, fn(x) { (x, x + 1) }, row)
+    #|}
+  let files = [("src/app/rows.mbt", source)]
+  assert_eq(lines(found(files, "each-tuple-key", 9)), [6, 7, 8, 14, 16, 21, 23, 24, 25])
+}
+
+///|
+test "iter-signal-read follows parentheses around an iterator receiver" {
+  let source =
+    #|fn reads() -> Unit {
+    #|  (xs.iter()).any(fn(x) { x == wanted.get() })
+    #|  ((xs.iter()).filter(pred)).all(fn(x) { x < @ui.window_zoom() })
+    #|  (wrap(xs.iter())).any(fn(x) { x == wanted.get() })
+    #|  (xs.iter().collect()).map(fn(x) { x + wanted.get() })
+    #|}
+  let files = [("src/app/reads.mbt", source)]
+  assert_eq(lines(found(files, "iter-signal-read", 2)), [2, 3])
+}
+
+///|
+test "untyped-let-fn checks named parameters of local bindings" {
+  let source =
+    #|let top = fn(x) { x }
+    #|fn closures() -> Unit {
+    #|  let f = fn(x) { x > 0 }
+    #|  let g = fn(x : Int, y, _) { x + y }
+    #|  let mut h = fn(x, y) { x + y }
+    #|  let typed : (Int) -> Bool = fn(x) { x > 0 }
+    #|  let params_typed = fn(x : Map[String, Int], y : (Int, Int) -> Int) { use(x, y) }
+    #|  let ignore_one = fn(_) { () }
+    #|  let empty = fn() { () }
+    #|  use(fn(x) { x })
+    #|  // det-ok(untyped-let-fn): legacy closure
+    #|  let legacy = fn(x) { x }
+    #|}
+    #|test "inferred closure" { let f = fn(x) { x } }
+  let files = [("src/app/closures.mbt", source), ("src/app/closures_wbtest.mbt", source)]
+  assert_eq(lines(found(files, "untyped-let-fn", 3)), [3, 4, 5])
+  assert_eq(
+    lint_sources(files, test_cfg()).filter(fn(f) {
+      f.rule == "untyped-let-fn" && f.excused == Some("legacy closure")
+    }).length(),
+    1,
+  )
+}
+
+///|
 test "style outside" {
   // a look drawn to units of its own (an input method's keys, another product's, laid out to the window's width) is
   // not the theme's: no style rule counts it

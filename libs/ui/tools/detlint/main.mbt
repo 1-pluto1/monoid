@@ -423,6 +423,7 @@ fn lint_sources(files : Array[(String, String)], cfg : Config) -> Array[Finding]
   let moving_fields = motion_fields(mbts)
   for f in mbts {
     lint_mbt(f, cfg, findings, returns, readers, painted, moving_fields)
+    lint_compat(f, findings)
     lint_style(f, cfg, findings)
     lint_radius(f, cfg, findings)
     lint_style_text(f, findings)

@@ -363,6 +363,13 @@
       "src/controls/player_node.mbt": 1,
       "src/controls/player_parts.mbt": 1,
       "src/controls/tag_node.mbt": 3
+    },
+    "each-tuple-key": {},
+    "iter-signal-read": {},
+    "untyped-let-fn": {
+      "src/controls/md_core.mbt": 2,
+      "src/controls/tokens.mbt": 1,
+      "src/svg/filter_parse.mbt": 2
     }
   },
   "excused": {

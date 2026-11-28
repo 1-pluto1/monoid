@@ -129,7 +129,10 @@
       "src/cm/badge_node.mbt": 1,
       "src/cm/controls.mbt": 7
     },
-    "small-radius-token": {}
+    "small-radius-token": {},
+    "each-tuple-key": {},
+    "iter-signal-read": {},
+    "untyped-let-fn": {}
   },
   "excused": {
     "frame-request": {},

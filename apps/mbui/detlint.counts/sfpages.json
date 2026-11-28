@@ -60,6 +60,13 @@
       "src/sfpages/stations_now.mbt": 1,
       "src/sfpages/usage_node.mbt": 4,
       "src/sfpages/workspace_page.mbt": 1
+    },
+    "untyped-let-fn": {
+      "src/sfpages/notifications.mbt": 2,
+      "src/sfpages/screen.mbt": 1,
+      "src/sfpages/screen_bars_node.mbt": 4,
+      "src/sfpages/share_senren_covers.mbt": 1,
+      "src/sfpages/station_picker_node.mbt": 1
     }
   },
   "excused": {

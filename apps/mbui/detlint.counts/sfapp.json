@@ -35,6 +35,13 @@
       "src/sfapp/chat_bar_node.mbt": 3,
       "src/sfapp/home_node.mbt": 1,
       "src/sfapp/settings/station_add.mbt": 1
+    },
+    "untyped-let-fn": {
+      "src/sfapp/settings/lock_prompts.mbt": 1,
+      "src/sfapp/settings/move_fixture.mbt": 1,
+      "src/sfapp/settings/vault_ask.mbt": 1,
+      "src/sfapp/settings/vault_ask_node.mbt": 2,
+      "src/sfapp/settings/vault_prompts.mbt": 1
     }
   }
 }

@@ -5,6 +5,9 @@
     },
     "box-loose": {
       "src/stillfail/main.mbt": 2
+    },
+    "untyped-let-fn": {
+      "src/stillfail/main.mbt": 1
     }
   }
 }

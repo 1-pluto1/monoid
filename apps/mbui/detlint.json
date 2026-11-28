@@ -311,6 +311,9 @@
     "page-control-by-hand",
     "structure-box",
     "node-radius-literal",
-    "small-radius-token"
+    "small-radius-token",
+    "each-tuple-key",
+    "iter-signal-read",
+    "untyped-let-fn"
   ]
 }

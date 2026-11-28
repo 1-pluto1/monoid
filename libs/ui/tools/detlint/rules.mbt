@@ -15,10 +15,14 @@ let rule_names : Array[String] = [
   "each-lookup", "layout-drawn-while", "shader-int", "raw-hover-ground", "width-structure",
   "reused-untracked-key", "manual-fade-way", "page-at-moment", "along-row-at-once", "headless-on-drag",
   "page-headless", "page-control-by-hand", "structure-box", "node-radius-literal", "small-radius-token",
+  "each-tuple-key", "iter-signal-read", "untyped-let-fn",
 ]
 
 ///|
 let rule_words : Map[String, String] = {
+  "each-tuple-key": "View::each, View::keyed_by, or a virtual list takes a bare tuple as a key. Use a named struct with `#derive(Eq, Hash)` or a bijective String key. Pion has no MapKey or MbtHash for bare tuples",
+  "iter-signal-read": "an iterator callback calls zero-argument `.get()` or `@ui.window_zoom()`. Move the invariant read outside the callback and keep empty collections from subscribing, or use an explicit for loop",
+  "untyped-let-fn": "a local closure binding leaves a named parameter untyped. Add the parameter type, as in `let f = fn(x : String) { ... }`",
   "node-radius-literal": "a node's corner said by a bare number (`.radius(Is(8.0))`, a number in what its `.radius(By(…))` gives): a single-line control that takes presses is a capsule (`Is(1.0e6)`, half its height `side / 2.0`) or a panel's concentric row (`@sf.panel_in`, `@sf.row_corner`), a still card the theme's named corner; zero, a capsule's `>= 999.0` standing alone and one halving (`x / 2.0`, not `x / 2.0 / 2.0`) are let by, as are what decides (an `if`'s condition, a comparison, an index); a size that truly is its own says why on its line (det-ok). Counted so the ones left only fall",
   "small-radius-token": "a corner said by one of the theme's small ones (Sm, Base, Md, Lg: `radius=Lg` in @ui.style / @ui.patch / @ui.css, `radius=InnerOr(Md)`, `.corner(Lg)` on any theme): a single-line control that takes presses is a capsule (`Full`) or a panel's concentric row (`@sf.panel_in`, `@sf.row_corner`); a still tag, a badge or a bar says why on its line (det-ok). Counted so the ones left only fall",
   "structure-box": "a structure's callback (View::show, pick, switch_by: `fn(x) { x.box(…) }`) wraps its only child in a bare `x.box(…)` with no other statements on `x`: the structure already makes that box for you, so the extra box is redundant and hides row layout properties; put the properties and children directly on `x` (calling a part function like `words_node(x, …)` is fine)",

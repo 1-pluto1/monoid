@@ -20,6 +20,9 @@
       "src/sfbase/app_icon.mbt": 1,
       "src/sfbase/peek_cards_node.mbt": 2,
       "src/sfbase/viz_chart_node.mbt": 3
+    },
+    "iter-signal-read": {
+      "src/sfbase/drive_upload.mbt": 2
     }
   },
   "excused": {
