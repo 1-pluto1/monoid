@@ -51,6 +51,8 @@ function nodeOnlyInFinalParagraph(lines: readonly string[]): string[] {
   if (end === 0) return [];
   let start = end;
   while (start > 0 && lines[start - 1]!.trim() !== "") start--;
+  // A trailer block never occupies the subject (first non-empty) paragraph.
+  if (!lines.slice(0, start).some((l) => l.trim() !== "")) return [];
   const paragraph = lines.slice(start, end);
   // Every line in the final paragraph must be a git trailer, folded continuation line,
   // or a `git cherry-pick -x` provenance line (ignoring pure prose paragraphs or quoted lines).
@@ -85,7 +87,8 @@ export function nodeOnlyReasonsInMessage(message: string): string[] {
   if (direct.length > 0) return direct;
 
   // GitHub squash-merge commits end their subject with ` (#<pr>)`, separate each squashed commit with `* <subject>`,
-  // and optionally append `\n\n---------\n\nCo-authored-by: ...` after the trailers.
+  // and optionally append `Co-authored-by: ...` after a blank line (with `---------` on multi-commit squashes, or
+  // directly after a blank line on single-commit squashes when GitHub rewrites co-author trailers).
   const firstNonEmpty = lines.find((l) => l.trim() !== "") ?? "";
   if (!SQUASH_SUBJECT.test(firstNonEmpty.trim())) return [];
 
@@ -97,9 +100,7 @@ export function nodeOnlyReasonsInMessage(message: string): string[] {
   if (footer.length > 0 && footer.every((l) => /^Co-authored-by:[ \t]+\S/i.test(l))) {
     let sep = footerStart;
     while (sep > 0 && lines[sep - 1]!.trim() === "") sep--;
-    if (sep > 0 && GITHUB_COAUTHOR_SEP.test(lines[sep - 1]!.trim())) {
-      bodyEnd = sep - 1;
-    }
+    bodyEnd = sep > 0 && GITHUB_COAUTHOR_SEP.test(lines[sep - 1]!.trim()) ? sep - 1 : footerStart;
   }
 
   const body = lines.slice(0, bodyEnd);
