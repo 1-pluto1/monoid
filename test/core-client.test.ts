@@ -412,3 +412,64 @@ test("device-global topics, self-triggered write ok, missing-gen sensitive read,
   workers.last.replyRaw({ id: recoveredReq!.id, ok: { done: true }, conn: 7, authGen: 10 });
   assert.deepEqual(await recoveredWrite, { done: true });
 });
+
+test("suspended endWithPage client ignores pending retry timers and detaches AbortSignal listeners on settlement", async () => {
+  const workers = new FakeWorkers();
+  const scheduled: (() => void)[] = [];
+  const client = new CoreClient(workers.opener, {
+    schedule: (_ms, run) => { scheduled.push(run); },
+    endWithPage: true,
+  });
+  workers.last.handshake();
+  assert.equal(workers.opened.length, 1);
+
+  // Worker fails and schedules a retry, then page suspends before the timer fires.
+  workers.last.fail("gone");
+  assert.equal(scheduled.length, 1);
+  client.suspend();
+  scheduled.shift()!();
+  assert.equal(workers.opened.length, 1, "pending retry must not spawn a worker while suspended");
+
+  // Resuming spawns a fresh worker cleanly.
+  client.resume();
+  assert.equal(workers.opened.length, 2);
+
+  // A stale retry timer firing after resume must not clobber the active worker.
+  workers.last.fail("gone-again");
+  assert.equal(scheduled.length, 1);
+  client.suspend();
+  client.resume();
+  assert.equal(workers.opened.length, 3);
+  scheduled.shift()!();
+  assert.equal(workers.opened.length, 3, "stale retry timer must not replace an active channel");
+
+  // AbortSignal listeners are removed once calls resolve or reject.
+  workers.last.handshake();
+  const controller = new AbortController();
+  const signal = controller.signal;
+  let added = 0;
+  let removed = 0;
+  const origAdd = signal.addEventListener.bind(signal);
+  const origRemove = signal.removeEventListener.bind(signal);
+  signal.addEventListener = ((...args: Parameters<AbortSignal["addEventListener"]>) => {
+    if (args[0] === "abort") added++;
+    return origAdd(...args);
+  }) as AbortSignal["addEventListener"];
+  signal.removeEventListener = ((...args: Parameters<AbortSignal["removeEventListener"]>) => {
+    if (args[0] === "abort") removed++;
+    return origRemove(...args);
+  }) as AbortSignal["removeEventListener"];
+
+  const okCall = client.call("x", {}, undefined, signal);
+  const okReq = (workers.last.sent as { id?: number; call?: string }[]).findLast((m) => m.call === "x");
+  workers.last.reply({ id: okReq!.id, ok: 42 });
+  assert.equal(await okCall, 42);
+
+  const errCall = client.call("y", {}, undefined, signal);
+  const errReq = (workers.last.sent as { id?: number; call?: string }[]).findLast((m) => m.call === "y");
+  workers.last.reply({ id: errReq!.id, error: { code: "boom", message: "bad" } });
+  await assert.rejects(errCall, (e: unknown) => e instanceof CoreError && e.code === "boom");
+
+  assert.equal(added, 2);
+  assert.equal(removed, 2, "settled calls must remove their abort listeners");
+});

@@ -364,7 +364,10 @@ export class CoreClient {
       return Promise.reject(new CoreError({ code: "auth_stale", message: t("core-misc.auth.stale") }));
     }
     const promise = new Promise<T>((resolve, reject) => {
-      const pending: Pending = { resolve: answered(resolve), reject, onProgress };
+      let cleanup = () => {};
+      const settleResolve = (value: T) => { cleanup(); resolve(value); };
+      const settleReject = (error: unknown) => { cleanup(); reject(error); };
+      const pending: Pending = { resolve: answered(settleResolve), reject: settleReject, onProgress };
       this.#calls.set(id, pending);
       if (needsAuth && this.#authConn === 0) {
         this.#pendingAuthCalls.push(bytes === undefined ? { id, call: name, params } : { id, call: name, params, bytes });
@@ -382,24 +385,28 @@ export class CoreClient {
               : { id, call: name, params, bytes },
         );
       }
-      signal?.addEventListener("abort", () => {
-        if (!this.#calls.has(id)) return;
-        const queuedIdx = this.#pendingAuthCalls.findIndex((q) => q.id === id);
-        if (queuedIdx >= 0) {
-          this.#pendingAuthCalls.splice(queuedIdx, 1);
-          this.#calls.delete(id);
-          reject(new CoreError({ code: "cancelled", message: t("web-main.core.cancelled") }));
-          return;
-        }
-        // The core answers `cancelled`; with no worker to tell, it is so here and now.
-        if (this.#channel) {
-          this.#post({ id, cancel: true });
-        } else {
-          this.#calls.delete(id);
-          this.#queue = this.#queue.filter((m) => (m as { id?: number }).id !== id);
-          reject(new CoreError({ code: "cancelled", message: t("web-main.core.cancelled") }));
-        }
-      }, { once: true });
+      if (signal && this.#calls.has(id)) {
+        const onAbort = () => {
+          if (!this.#calls.has(id)) return;
+          const queuedIdx = this.#pendingAuthCalls.findIndex((q) => q.id === id);
+          if (queuedIdx >= 0) {
+            this.#pendingAuthCalls.splice(queuedIdx, 1);
+            this.#calls.delete(id);
+            settleReject(new CoreError({ code: "cancelled", message: t("web-main.core.cancelled") }));
+            return;
+          }
+          // The core answers `cancelled`; with no worker to tell, it is so here and now.
+          if (this.#channel) {
+            this.#post({ id, cancel: true });
+          } else {
+            this.#calls.delete(id);
+            this.#queue = this.#queue.filter((m) => (m as { id?: number }).id !== id);
+            settleReject(new CoreError({ code: "cancelled", message: t("web-main.core.cancelled") }));
+          }
+        };
+        cleanup = () => signal.removeEventListener("abort", onAbort);
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
     });
     const on = Object.fromEntries(Object.entries((params ?? {}) as Record<string, unknown>).filter(([k, v]) =>
       !/token|code|password|secret/i.test(k) && (typeof v === "string" || typeof v === "number" || typeof v === "boolean"))) as CallDetails["on"];
@@ -432,12 +439,13 @@ export class CoreClient {
 
   /** The page is going away (or into the back/forward cache): the worker drops this client, or ends (`endWithPage`). */
   suspend(): void {
-    if (!this.#channel) return;
-    this.#post({ bye: true });
-    if (!this.#endWithPage) return;
-    this.#channel.close();
-    this.#channel = null;
-    this.#left = true;
+    if (this.#channel) {
+      this.#post({ bye: true });
+      if (!this.#endWithPage) return;
+      this.#channel.close();
+      this.#channel = null;
+    }
+    if (this.#endWithPage) this.#left = true;
   }
 
   /**
@@ -514,7 +522,7 @@ export class CoreClient {
   }
 
   #connect(): void {
-    if (this.#closed) return;
+    if (this.#closed || this.#left || this.#channel) return;
     let channel: Channel | null = null;
     // Late news from a channel already replaced is ignored.
     const current = () => channel !== null && channel === this.#channel;
