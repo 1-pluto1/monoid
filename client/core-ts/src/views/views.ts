@@ -5528,7 +5528,9 @@ export class Views implements Owner {
     const runnable = runnableOn(overview, session, now);
     let account: J = runnable.find((p) => p.current === true) ?? null;
     if (account === null && isObject(profile)) {
-      account = { id: profile.id ?? null, name: profile.name ?? null, current: true, kind: get(profile.access, "kind") ?? null, runtime: profile.runtime ?? null, quota: quotaFor(profile.quota ?? null, str(get(session, "model")) ?? str(profile.model) ?? null) };
+      const id = str(profile.id) ?? "";
+      const runtime = str(profile.runtime);
+      account = { id, name: present.profileName(profile), current: true, kind: str(get(profile.access, "kind")), runtime: runtime !== null && runtime !== "" ? runtime : null, quota: quotaFor(profile.quota ?? null, str(get(session, "model")) ?? str(profile.model) ?? null) };
       if (typeof profile.providerMark === "string") account.mark = profile.providerMark;
       if (typeof profile.planText === "string" && profile.planText !== "") account.planText = profile.planText;
     }

@@ -65,7 +65,7 @@ export function attention(overview: J, session: J, now: number): J[] {
   if (p !== null && typeof p === "object") {
     const state = get(get(p, "check"), "state");
     if (state === "login" || state === "failed") {
-      const name = str(get(p, "name")) ?? "";
+      const name = present.profileName(p);
       out.push({ kind: "account", text: state === "login" ? t("core-views.attention.login", { name }) : t("core-views.attention.key_refused", { name }) });
     }
     const quota = quotaFor(get(p, "quota"), str(get(session, "model")) ?? str(get(p, "model")));
@@ -243,16 +243,17 @@ function profilesRunning(overview: J, runtime: string, m: string | null, current
 function profileLines(profiles: J[], runtime: string, m: string | null, current: string | null, now: number): J[] {
   return profiles.map((p) => {
     const id = str(get(p, "id")) ?? "";
+    const profileRuntime = str(get(p, "runtime"));
     const quota = quotaFor(get(p, "quota"), m ?? str(get(p, "model")));
     const spent = spentUntil(quota);
     const line: J = {
       id,
-      name: get(p, "name") ?? id,
+      name: present.profileName(p),
       current: id === current,
       spent: spent !== null ? spentView(spent, now) : null,
       efforts: profileEfforts(p, runtime, m),
-      kind: get(get(p, "access"), "kind") ?? null,
-      runtime: get(p, "runtime") ?? null,
+      kind: str(get(get(p, "access"), "kind")),
+      runtime: profileRuntime !== null && profileRuntime !== "" ? profileRuntime : null,
       quota: quota ?? null,
       quotaLine: quotaLine(quota),
     };

@@ -1016,10 +1016,23 @@ export function profilePlanText(p: J, quota = legacyCodexQuota(p)): string {
   return plan === undefined ? "" : planName(plan, str(get(p, "runtime")));
 }
 
+/// A profile's display name: `name` if it is a string, else non-empty `label`, else `id` (or `""`).
+export function profileName(p: J): string {
+  const name = str(get(p, "name"));
+  if (name !== undefined) return name;
+  const label = str(get(p, "label"));
+  if (label !== undefined && label !== "") return label;
+  return str(get(p, "id")) ?? "";
+}
+
 /// A profile with its last check in words, its models' makers and series, what it can do, and its trouble.
 export function profile(p: J): J {
   if (!isObject(p)) return p;
   const o: J = { ...p };
+  const id = str(o.id) ?? "";
+  if (typeof o.id !== "string") o.id = id;
+  if (typeof o.name !== "string") o.name = profileName(o);
+  if (o.runtime === "") o.runtime = null;
   if (isObject(o.quota)) o.quota = legacyCodexQuota(o);
   if (get(o.access, "kind") === "env" && typeof get(o.access, "provider") === "string") o.access = { ...o.access, kind: "api-provider" };
   const blocked = get(o.quota, "state") === "blocked";

@@ -14,7 +14,7 @@ import { attention, choices, models, quotaFor, runnableOn } from "../src/views/m
 import { OVERVIEW_FIT, answeredAt, betaOffered, blockedUnder, down, foldNotices, noticeOf, shownMessage, softwareNoticeTarget, stationOn } from "../src/views/views.ts";
 import { localDay } from "../src/views/usage.ts";
 import { decorate, installView, profile as presentProfile, softwareNoticeView } from "../src/present.ts";
-import { conformTy } from "../src/conform.ts";
+import { conformTy, forgetUnknownWords, unknownWords } from "../src/conform.ts";
 import { markdown } from "../src/markdown.ts";
 import { work, workSince } from "../src/work.ts";
 import { hostOf, link, overview, prefs, rows, sessions, setup, sorted, threads, ui, workspace, type Ui } from "./views-rig.ts";
@@ -4871,4 +4871,49 @@ test("a_chat_going_to_another_station_shuts_its_composer_saying_where_till_it_is
   t.set(overview("ws/a"), { ...overviewOf([], []), move: { offered: true, chats: [] } });
   await t.read(u, 1);
   assert.equal(u.value.moving, undefined, "there, or stayed");
+});
+
+test("a_chat_still_opens_when_its_agents_overview_profile_omits_name_or_sends_empty_runtime", async () => {
+  forgetUnknownWords();
+  const t = setup();
+  const u = ui();
+  try {
+    t.subscribe(1, chatTopic("ws/a", 7));
+    const now = t.host.nowMs();
+    t.set(sessions("ws/a"), [fullSession("k", { connect: "ember", profile: "p-agy", runtime: "agy", model: "gemini-4-neon" })]);
+    t.set(threads("ws/a"), [thread(7, ["k"], now)]);
+    t.set(pageOf("ws/a", 7), page(1, ["打开看看"], null));
+    t.set(overview("ws/a"), overviewOf([], [{ id: "p-agy", label: "Agy 1", runtime: "", models: [] }]));
+    await t.read(u, 1);
+    assert.equal(u.error, undefined, "profile with label instead of name conforms cleanly");
+    assert.equal(u.value.agents[0].account.id, "p-agy");
+    assert.equal(u.value.agents[0].account.name, "Agy 1");
+    assert.equal(u.value.agents[0].account.runtime, undefined);
+    assert.equal(u.value.agents[0].profile.name, "Agy 1");
+    assert.deepEqual(unknownWords("RuntimeKind"), [], "empty runtime string does not record an unknown RuntimeKind");
+
+    // Profile with neither name nor label falls back to its id.
+    t.set(overview("ws/a"), overviewOf([], [{ id: "p-agy", name: null, label: "", runtime: "", models: [] }]));
+    await t.read(u, 1);
+    assert.equal(u.error, undefined, "profile with null name and empty label falls back to id");
+    assert.equal(u.value.agents[0].account.name, "p-agy");
+    assert.equal(u.value.agents[0].profile.name, "p-agy");
+
+    // runnableOn and attention match the same name and empty-runtime guards.
+    const ov = {
+      profiles: [
+        { id: "p-label", label: "Named via label", runtime: "", runtimes: ["agy"], models: ["gemini-4-neon"], access: { kind: 42 }, check: { state: "login", detail: "d" } },
+        { id: "p-null", name: null, runtime: "", runtimes: ["agy"], models: ["gemini-4-neon"] },
+      ],
+    };
+    const list = runnableOn(ov, { runtime: "agy", profile: "p-label", model: "gemini-4-neon" }, 0);
+    assert.deepEqual(list.map((p: J) => [p.id, p.name, p.runtime, p.kind]), [
+      ["p-label", "Named via label", null, null],
+      ["p-null", "p-null", null, null],
+    ]);
+    assert.deepEqual(attention(ov, { profile: "p-label" }, 0), [{ kind: "account", text: "「Named via label」需要重新登录" }]);
+  } finally {
+    forgetUnknownWords();
+    t.store.runner.shutdown();
+  }
 });
