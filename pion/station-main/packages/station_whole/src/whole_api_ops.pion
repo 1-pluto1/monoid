@@ -42,6 +42,10 @@ pub struct WholeApiRuntimeHooks {
   pub mut on_mcp_reload : Option[(Option[String]) -> Unit]
   pub mut on_s3_test : Option[(station_replica::NormalizedS3Target) -> Result[Unit, String]]
   pub mut on_screens_browser_open : Option[(String, Option[String]) -> Result[String, station_api::ApiError]]
+  pub mut drive_for_ws : Option[(String) -> station_screens::Drive]
+  pub mut on_session_retry : Option[(String, Int64, Int64) -> Result[Unit, station_api::ApiError]]
+  pub mut on_session_compact : Option[(String) -> Result[Unit, station_api::ApiError]]
+  pub mut on_project_rename_merge : Option[(String, String, String, String, Option[String]) -> Result[base_codec::Json, station_api::ApiError]]
   pub mut read_only_handover_cell : Array[Bool]
 }
 
@@ -59,6 +63,10 @@ pub fn WholeApiRuntimeHooks::new() -> WholeApiRuntimeHooks {
     on_mcp_reload: None,
     on_s3_test: None,
     on_screens_browser_open: None,
+    drive_for_ws: None,
+    on_session_retry: None,
+    on_session_compact: None,
+    on_project_rename_merge: None,
     read_only_handover_cell: [true],
   }
 }
@@ -116,6 +124,7 @@ pub struct WholeApiRuntimePort {
   pub put_widget_state : (String, String, base_codec::Json, Int64) -> Result[Unit, station_api::ApiError]
   pub put_archive_policy : (Option[String], String, String, String, Int64) -> Result[Unit, station_api::ApiError]
   pub vault_plain : VaultPlainStorePort
+  pub readops : ReadOpsPort
 }
 
 pub fn WholeApiRuntimePort::in_memory() -> WholeApiRuntimePort {
@@ -229,6 +238,7 @@ pub fn WholeApiRuntimePort::in_memory() -> WholeApiRuntimePort {
       Ok(())
     },
     vault_plain: VaultPlainStorePort::in_memory(),
+    readops: ReadOpsPort::in_memory(),
   }
 }
 
@@ -236,6 +246,7 @@ pub fn WholeApiRuntimePort::production(
   whole_store : WholeStore,
   agents : WholeAgents,
   home_ws_str : String,
+  shared_transfers : station_screens::TransfersManager,
 ) -> WholeApiRuntimePort {
   WholeApiRuntimePort::{
     os_name: station_sys::os_name,
@@ -664,6 +675,7 @@ pub fn WholeApiRuntimePort::production(
       }
     },
     vault_plain: VaultPlainStorePort::production(whole_store),
+    readops: ReadOpsPort::production(whole_store, agents, home_ws_str, shared_transfers),
   }
 }
 
@@ -1445,18 +1457,15 @@ pub fn dispatch_extra_read_op(
   let fs = agents.jobs.fs
   let data_dir = agents.config.data_dir
 
-  if op == "memory" {
-    // Honest 501 until `readops_local` `{global, skills}` contract is wired end-to-end.
-    return Some(Err(err_not_implemented(op)))
+  match dispatch_wave17c3a_read_op(op, req, args, agents, seen_store, port) {
+    Some(r) => return Some(r)
+    None => ()
   }
   if op == "changed.chats" || op == "changed.sharedChats" || op == "changed.threads" {
     return Some((port.changed_threads)(req.viewer.workspace))
   }
   if op == "changed.sessions" {
     return Some((port.changed_sessions)(req.viewer.workspace))
-  }
-  if op == "resources" {
-    return Some(Err(err_not_implemented(op)))
   }
   if op == "job.log" {
     let id = match json_field_str(args, "id") {
@@ -1522,18 +1531,6 @@ pub fn dispatch_extra_read_op(
       }
     }
   }
-  if op == "usage" ||
-  op == "usage.calls" ||
-  op == "machineSessions" ||
-  op == "machineSession" ||
-  op == "session.timeline" ||
-  op == "session.files" ||
-  op == "session.parts" ||
-  op == "session.poster" ||
-  op == "session.peek" ||
-  op == "session.open" {
-    return Some(Err(err_not_implemented(op)))
-  }
   None
 }
 
@@ -1597,6 +1594,11 @@ pub fn dispatch_extra_call_op(
   }
   // 2. Updates routes
   match dispatch_updates_op(op, req, body, updates, cfg_opt, cfg_open_err, hooks, port, now_ms) {
+    Some(r) => return Some(r)
+    None => ()
+  }
+  // 2b. Wave 17C-3A routes (CRDT records, Projects, Hub retry/compact, Drive mkdir/transfers, Links, Feedback, Resources)
+  match dispatch_wave17c3a_call_op(op, req, params, body, agents, seen_store, drive, events, hooks, port, now_ms) {
     Some(r) => return Some(r)
     None => ()
   }
