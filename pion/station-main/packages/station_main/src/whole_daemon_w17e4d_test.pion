@@ -1,0 +1,510 @@
+// Wave 17E-4D (R2) pure-Pion unit tests for `whole_daemon_w17e4d.pion`:
+// - Disjoint `UPDATES_RESTORE_EVENT_BASE..END` ([15<<32, 16<<32)) and `MuxToken::Tagged` (5330..5339)
+// - `<app>/OVERRIDE` protection (`w17e4d_check_update_allowed`)
+// - Bundled installer pre-check (no exec bit required, no silent fallback to `install.en`)
+// - Handed archive path contract (`*/stillfail-handed.*/stillfail.tar.gz` & Windows `.zip`)
+// - Full inherited installer env (strips `STILLFAIL_ARCHIVE`/`STILLFAIL_INSTALLER_HANDED`, preserves `HOME`/`TMPDIR`)
+// - `updates.wait` runtime coordinator (`w17e4d_conditions_met`, `w17e4d_parse_release_included`, `w17e4d_should_settle_wait`)
+// - Rollback archive checksum cleanup (`w17e4d_finalize_staged_archive_with`)
+// - Restore staging commit: unconsumed `ready.json` protection, `.old` rollback on write failure, symlink rejection, and `RestoringView` JSON
+
+import "base_codec"
+import "crypto"
+import "station_cli"
+import "station_ops"
+
+test "wave17e4d: disjoint event_id range and MuxToken::Tagged range" {
+  if UPDATES_RESTORE_EVENT_BASE != 64424509440L || UPDATES_RESTORE_EVENT_END != 68719476736L {
+    panic("UPDATES_RESTORE_EVENT range mismatch")
+  }
+  if W17E4D_TOK_UPDATE_FEED_OPEN != 5330 || W17E4D_TOK_WAIT_FEED_READ != 5339 {
+    panic("W17E4D MuxToken::Tagged kinds must span 5330..5339")
+  }
+}
+
+test "wave17e4d: bundled installer pre-check, handed archive path, and full inherited env" {
+  let mfs = station_ops::MemFs::new()
+  // Non-executable `install.en.sh` (0644) is accepted because `/bin/sh` runs it; `zh` does NOT silently fall back to `en`!
+  let _ = mfs.put_text("/app/bin/install.en.sh", "#!/bin/sh\nexit 0\n", 420)
+  match w17e4d_bundled_installer_path(mfs.ops(), Some("/app"), "en", "/") {
+    Some(p) => if p != "/app/bin/install.en.sh" { panic("unexpected installer path: " + p) }
+    None => panic("non-executable install.en.sh should be found")
+  }
+  if w17e4d_bundled_installer_path(mfs.ops(), Some("/app"), "zh", "/").is_some() {
+    panic("missing install.zh.sh must NOT silently fall back to install.en.sh")
+  }
+
+  let (pdir, pfile) = w17e4d_handed_archive_paths("/tmp", "abcd1234", "/")
+  if pdir != "/tmp/stillfail-handed.abcd1234" || pfile != "/tmp/stillfail-handed.abcd1234/stillfail.tar.gz" {
+    panic("POSIX handed archive path mismatch: " + pfile)
+  }
+  let (wdir, wfile) = w17e4d_handed_archive_paths("C:\\Temp", "abcd1234", "\\")
+  if wdir != "C:\\Temp\\stillfail-handed-abcd1234" || wfile != "C:\\Temp\\stillfail-handed-abcd1234\\stillfail.zip" {
+    panic("Windows handed archive path mismatch: " + wfile)
+  }
+
+  let base_env = [
+    "HOME=/home/tester",
+    "TMPDIR=/var/tmp",
+    "STILLFAIL_ARCHIVE=/stale/archive.tar.gz",
+    "STILLFAIL_INSTALLER_HANDED=1",
+    "CUSTOM_LAUNCHER_VAR=keepme",
+  ]
+  let env_fwd = w17e4d_build_installer_env(base_env, "/data", "https://still.fail", "beta", "sha_a", "sha_n", "en", None)
+  let mut saw_home = false
+  let mut saw_custom = false
+  let mut saw_stale_arch = false
+  let mut saw_handed = false
+  for i in 0..<env_fwd.length() {
+    if env_fwd[i] == "HOME=/home/tester" { saw_home = true }
+    if env_fwd[i] == "CUSTOM_LAUNCHER_VAR=keepme" { saw_custom = true }
+    if env_fwd[i].starts_with("STILLFAIL_ARCHIVE=") { saw_stale_arch = true }
+    if env_fwd[i].starts_with("STILLFAIL_INSTALLER_HANDED=") { saw_handed = true }
+  }
+  if !saw_home || !saw_custom || saw_stale_arch || saw_handed {
+    panic("installer env failed inheritance or stale-var stripping")
+  }
+}
+
+test "wave17e4d: OVERRIDE protection and updates.wait conditions_met / reconcile settlement" {
+  let builds : Map[String, station_cli::ReleaseBuild] = Map::new()
+  builds.set("linux-x64", station_cli::ReleaseBuild::{
+    sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    size: 128L,
+    node_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    raw_sha256: None,
+    raw_size: None,
+  })
+  let rel = station_cli::SignedRelease::{
+    version: "0.1.501",
+    build: 501L,
+    commit: "abcdef1234567890",
+    node: "22.0.0",
+    builds: builds,
+    included: None,
+  }
+  let inc_j = match base_codec::json_parse("{\"build\":501,\"commit\":\"abcdef1234567890\",\"prs\":[9208],\"fixes\":[42],\"commits\":[\"1122334455\"]}") {
+    base_codec::JsonParseResult::Ok(j) => j
+    _ => panic("json")
+  }
+  let inc = match w17e4d_parse_release_included(inc_j) {
+    Some(v) => v
+    None => panic("parse_release_included failed")
+  }
+  let wait_ok = [station_cli::WaitCondition::Pr(9208L), station_cli::WaitCondition::Fix(42L), station_cli::WaitCondition::Version("0.1.500")]
+  if !w17e4d_conditions_met(wait_ok, rel, Some(inc)) {
+    panic("expected conditions_met true for PR 9208 + FB-42 + >=0.1.500")
+  }
+  let wait_miss = [station_cli::WaitCondition::Pr(9999L)]
+  if w17e4d_conditions_met(wait_miss, rel, Some(inc)) {
+    panic("expected conditions_met false for unmet PR 9999")
+  }
+  let when_ov = station_cli::AutoUpdateWhen::{ wait: wait_ok, restore_auto: true, for_override: true, set_at: Some(1L) }
+  if w17e4d_should_settle_wait(when_ov, Some("0.1.501"), true, Some(rel), Some(inc)) {
+    panic("must NOT settle forOverride wait while OVERRIDE is still present")
+  }
+  if !w17e4d_should_settle_wait(when_ov, Some("0.1.501"), false, Some(rel), Some(inc)) {
+    panic("MUST settle forOverride wait once OVERRIDE is gone")
+  }
+}
+
+test "wave17e4d: rollback archive checksum cleanup and restore staging unconsumed-ready/rollback guards" {
+  let payload = "fake-tar-gz-bytes".to_bytes()
+  let digest = crypto::sha256_hex(payload)
+  let removed : Array[String] = []
+  let renamed : Array[(String, String)] = []
+  let written : Array[(String, String, Int)] = []
+
+  // 1. Checksum mismatch deletes stage dir
+  match w17e4d_finalize_staged_archive_with(
+    "/tmp/stillfail-handed.bad",
+    "/tmp/stillfail-handed.bad/stillfail.tar.gz.part",
+    "/tmp/stillfail-handed.bad/stillfail.tar.gz",
+    payload.length().to_int64(),
+    payload.length().to_int64(),
+    digest,
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    fn(_p : String) -> Result[Unit, Int] { Ok(()) },
+    fn(a : String, b : String) -> Bool { renamed.push((a, b)); true },
+    fn(d : String) -> Unit { removed.push(d) },
+  ) {
+    Err(msg) => {
+      if !msg.contains("sha256 mismatch") || removed.length() != 1 {
+        panic("checksum mismatch did not clean up stage dir")
+      }
+    }
+    Ok(_) => panic("checksum mismatch must fail")
+  }
+
+  // 2. Unconsumed `ready.json` blocks overwriting committed restore and cleans new staging dir
+  match w17e4d_commit_restore_staging_with(
+    "/data",
+    "/",
+    "/data/restore/.staging-new",
+    "/data/restore/.old-1",
+    "st-lost",
+    "ws-1",
+    "g1",
+    "LostBox",
+    "s3:r2",
+    fn(_p : String) -> Bool { true },
+    fn(_p : String) -> Bool { true },
+    fn(_r : String, _rel : String) -> Result[Unit, String] { Ok(()) },
+    fn(a : String, b : String) -> Bool { renamed.push((a, b)); true },
+    fn(p : String, d : Bytes, m : Int) -> Bool { written.push((p, d.to_string(), m)); true },
+    fn(d : String) -> Unit { removed.push(d) },
+  ) {
+    Err(msg) => if !msg.contains("already ready") { panic("expected already ready refusal, got: " + msg) }
+    Ok(_) => panic("must refuse to overwrite unconsumed ready.json")
+  }
+
+  // 3. Valid commit moves aside stale copy, renames staging -> copy, writes 0600 ready.json, and removes stale backup
+  match w17e4d_commit_restore_staging_with(
+    "/data",
+    "/",
+    "/data/restore/.staging-ok",
+    "/data/restore/.old-2",
+    "st-lost",
+    "ws-1",
+    "g1",
+    "LostBox",
+    "s3:r2",
+    fn(_p : String) -> Bool { false },
+    fn(_p : String) -> Bool { true },
+    fn(_r : String, _rel : String) -> Result[Unit, String] { Ok(()) },
+    fn(a : String, b : String) -> Bool { renamed.push((a, b)); true },
+    fn(p : String, d : Bytes, m : Int) -> Bool { written.push((p, d.to_string(), m)); true },
+    fn(d : String) -> Unit { removed.push(d) },
+  ) {
+    Ok(rp) => {
+      if rp != "/data/restore/ready.json" || written.length() != 1 || written[0].2 != 384 {
+        panic("valid restore commit did not write 0600 ready.json")
+      }
+    }
+    Err(e) => panic("valid restore commit failed: " + e)
+  }
+
+  // 4. `RestoringView::to_json` matches Node `copies.restoring` schema
+  let rv = RestoringView::{
+    origin: "st-lost",
+    name: "LostBox",
+    workspace: "ws-1",
+    gen: "g1",
+    from_label: "s3:r2",
+    done: 2,
+    total: 5,
+    error: None,
+    reason: None,
+    restart: true,
+  }
+  let rvs = base_codec::json_stringify(rv.to_json())
+  if !rvs.contains("\"origin\":\"st-lost\"") || !rvs.contains("\"done\":2") || !rvs.contains("\"restart\":true") {
+    panic("RestoringView JSON mismatch: " + rvs)
+  }
+}
+
+test "wave17e4d: xshare.list result-envelope unwrap, whole replacement, refusal clear, retry, and inbound xshare RPCs" {
+  // 1. Existing state has an old borrowed chat from `st-host` AND an unrelated chat from `st-other`
+  let init_state = base_codec::json_obj([
+    ("borrowed", base_codec::json_obj([
+      ("ws-1/st-host/chat-old", base_codec::json_obj([
+        ("workspace", base_codec::json_str("ws-partner")),
+        ("station", base_codec::json_str("st-host")),
+        ("chat", base_codec::json_str("chat-old")),
+        ("as", base_codec::json_str("ws-1")),
+      ])),
+      ("ws-1/st-other/chat-keep", base_codec::json_obj([
+        ("workspace", base_codec::json_str("ws-other")),
+        ("station", base_codec::json_str("st-other")),
+        ("chat", base_codec::json_str("chat-keep")),
+        ("as", base_codec::json_str("ws-1")),
+      ])),
+    ])),
+    ("hosts", base_codec::json_obj([
+      ("ws-1/st-host", base_codec::json_obj([
+        ("workspace", base_codec::json_str("ws-partner")),
+        ("name", base_codec::json_str("Partner WS")),
+        ("stationName", base_codec::json_str("HostBox")),
+        ("as", base_codec::json_str("ws-1")),
+      ])),
+    ])),
+    ("guests", base_codec::json_obj([
+      ("ws-guest", base_codec::json_obj([
+        ("name", base_codec::json_str("Guest WS")),
+        ("stations", base_codec::json_obj([
+          ("st-guest-1", base_codec::json_str("GuestBox")),
+        ])),
+      ])),
+    ])),
+  ])
+
+  // 2. Peer RPC reply wrapped in `{"result": { fromName, chats }}` MUST unwrap & WHOLE-replace `st-host`'s borrowed entries
+  let wrapped_reply = base_codec::json_obj([
+    ("result", base_codec::json_obj([
+      ("from", base_codec::json_str("ws-partner")),
+      ("fromName", base_codec::json_str("Partner Workspace")),
+      ("chats", base_codec::json_arr([
+        base_codec::json_obj([
+          ("chat", base_codec::json_str("chat-new")),
+          ("title", base_codec::json_str("Shared Chat")),
+          ("link", base_codec::json_str("https://app.still.fail/o/ws-partner/st-host/chat-new")),
+          ("write", base_codec::json_bool(true)),
+          ("version", base_codec::json_int(3)),
+        ]),
+      ])),
+    ])),
+  ])
+  let (st_after_ok, has_b, retry_ok) = w17e4d_apply_xshare_list_reply(
+    init_state, "ws-1", "ws-1", "st-host", "ws-partner", Ok(wrapped_reply),
+  )
+  if !has_b || retry_ok {
+    panic("wrapped xshare.list reply should yield has_borrowed=true, should_retry=false")
+  }
+  let ok_s = base_codec::json_stringify(st_after_ok)
+  if ok_s.contains("chat-old") || !ok_s.contains("ws-1/st-host/chat-new") || !ok_s.contains("ws-1/st-other/chat-keep") {
+    panic("whole replacement failed: " + ok_s)
+  }
+
+  // 3. Refusal clears all borrowed entries of `st-host` without retrying, keeping `st-other`
+  let (st_after_ref, has_b_ref, retry_ref) = w17e4d_apply_xshare_list_reply(
+    st_after_ok, "ws-1", "ws-1", "st-host", "ws-partner", Err("this station shares no chat with your workspace"),
+  )
+  if has_b_ref || retry_ref {
+    panic("refusal must not schedule retry")
+  }
+  let ref_s = base_codec::json_stringify(st_after_ref)
+  if ref_s.contains("chat-new") || !ref_s.contains("ws-1/st-other/chat-keep") {
+    panic("refusal did not clear host borrowed entries cleanly: " + ref_s)
+  }
+
+  // 4. Transient offline error preserves borrowed entries and requests backoff retry
+  let (st_after_off, _, retry_off) = w17e4d_apply_xshare_list_reply(
+    st_after_ok, "ws-1", "ws-1", "st-host", "ws-partner", Err("peer offline"),
+  )
+  if !retry_off || !base_codec::json_stringify(st_after_off).contains("chat-new") {
+    panic("transient offline error must preserve borrowed entries and schedule retry")
+  }
+
+  // 5. Inbound `xshare.trusts` (inside), `xshare.list` & `xshare.roster` (outside)
+  match w17e4d_handle_xshare_peer_rpc_pure(
+    init_state, "st-inside", "ws-1", "ws-1",
+    base_codec::json_obj([("method", base_codec::json_str("xshare.trusts")), ("station", base_codec::json_str("st-host"))]),
+    false,
+  ) {
+    Ok((rep, _, _)) => if !base_codec::json_stringify(rep).contains("\"trusted\":true") { panic("xshare.trusts expected trusted=true") }
+    Err(e) => panic("xshare.trusts failed: " + e)
+  }
+  match w17e4d_handle_xshare_peer_rpc_pure(
+    init_state, "st-unknown", "ws-1", "ws-1",
+    base_codec::json_obj([("method", base_codec::json_str("xshare.list"))]),
+    true,
+  ) {
+    Ok(_) => panic("unknown outside peer must be refused on xshare.list")
+    Err(_) => ()
+  }
+  match w17e4d_handle_xshare_peer_rpc_pure(
+    init_state, "st-guest-1", "ws-1", "ws-1",
+    base_codec::json_obj([("method", base_codec::json_str("xshare.list")), ("as", base_codec::json_str("ws-guest"))]),
+    true,
+  ) {
+    Ok((rep, _, _)) => if !base_codec::json_stringify(rep).contains("\"chats\":[]") { panic("xshare.list reply mismatch") }
+    Err(e) => panic("known guest xshare.list failed: " + e)
+  }
+  match w17e4d_handle_xshare_peer_rpc_pure(
+    init_state, "st-guest-1", "ws-1", "ws-1",
+    base_codec::json_obj([
+      ("method", base_codec::json_str("xshare.roster")),
+      ("as", base_codec::json_str("ws-guest")),
+      ("stations", base_codec::json_arr([
+        base_codec::json_obj([("id", base_codec::json_str("st-guest-1")), ("name", base_codec::json_str("GuestBox"))]),
+        base_codec::json_obj([("id", base_codec::json_str("st-guest-2")), ("name", base_codec::json_str("GuestBox2"))]),
+      ])),
+    ]),
+    true,
+  ) {
+    Ok((_, Some(next_st), _)) => if !base_codec::json_stringify(next_st).contains("st-guest-2") { panic("xshare.roster did not update guests") }
+    _ => panic("valid xshare.roster must succeed and return updated state")
+  }
+
+  // 6. Host `xshare.list` enumerates real authorized hosted chats, `xshare.changed { chat, gone: true }` revokes without `from`, and outside `describe` is honest
+  let hosted_list = [
+    XshareHostedChatInfo::{
+      chat: "c-shared-1",
+      title: "Shared Design",
+      link: "https://app.still.fail/o/ws-1/st-self/c-shared-1",
+      write: true,
+      workspace: "ws-1",
+      shared_workspaces: ["ws-guest"],
+    },
+    XshareHostedChatInfo::{
+      chat: "c-private-2",
+      title: "Other Guest Only",
+      link: "https://app.still.fail/o/ws-1/st-self/c-private-2",
+      write: false,
+      workspace: "ws-1",
+      shared_workspaces: ["ws-other-guest"],
+    },
+  ]
+  match w17e4d_handle_xshare_peer_rpc_pure(
+    init_state, "st-guest-1", "ws-1", "ws-1",
+    base_codec::json_obj([("method", base_codec::json_str("xshare.list")), ("as", base_codec::json_str("ws-guest"))]),
+    true,
+    hosted_chats=hosted_list,
+    from_ws_name="Main WS",
+  ) {
+    Ok((rep, _, _)) => {
+      let rs = base_codec::json_stringify(rep)
+      if !rs.contains("c-shared-1") || rs.contains("c-private-2") || !rs.contains("\"fromName\":\"Main WS\"") {
+        panic("host xshare.list enumeration mismatch: " + rs)
+      }
+    }
+    Err(e) => panic("host xshare.list failed: " + e)
+  }
+  match w17e4d_handle_xshare_peer_rpc_pure(
+    init_state, "st-host", "ws-1", "ws-1",
+    base_codec::json_obj([
+      ("method", base_codec::json_str("xshare.changed")),
+      ("chat", base_codec::json_str("chat-old")),
+      ("gone", base_codec::json_bool(true)),
+    ]),
+    true,
+  ) {
+    Ok((rep, Some(next_st), None)) => {
+      let ns = base_codec::json_stringify(next_st)
+      if !base_codec::json_stringify(rep).contains("\"heard\":true") || ns.contains("chat-old") || !ns.contains("chat-keep") {
+        panic("xshare.changed gone revocation failed: " + ns)
+      }
+    }
+    _ => panic("xshare.changed {chat, gone:true} without from must remove borrowed entry and return updated state")
+  }
+  match w17e4d_handle_xshare_peer_rpc_pure(
+    init_state, "st-guest-1", "ws-1", "ws-1",
+    base_codec::json_obj([("method", base_codec::json_str("describe")), ("as", base_codec::json_str("ws-guest"))]),
+    true,
+  ) {
+    Ok((rep, _, _)) => {
+      let ds = base_codec::json_stringify(rep)
+      if !ds.contains("\"reads\":false") || !ds.contains("\"messages\":false") || !ds.contains("\"files\":false") {
+        panic("outside describe must honestly advertise false for unimplemented session routes: " + ds)
+      }
+    }
+    Err(e) => panic("outside describe failed: " + e)
+  }
+}
+
+test "wave17e4d: R4 history.json Node schema, rollback holdAuto guard, Windows atomic path, and snapshot base_url/digest binding" {
+  // 1. `history.json` 1:1 Node `{ v: 1, workspaces: { [ws]: [...] } }` preserves other workspaces & prior entries
+  let prior_node = "{\"v\":1,\"workspaces\":{\"ws-other\":[{\"id\":\"old-1\",\"kind\":\"backup\"}],\"ws-1\":[{\"id\":\"prev-1\",\"kind\":\"restore\"}]}}"
+  let new_entry = base_codec::json_obj([("id", base_codec::json_str("restore-2")), ("kind", base_codec::json_str("restore")), ("status", base_codec::json_str("error"))])
+  let merged = w17e4d_merge_restore_history_json(Some(prior_node), "ws-1", new_entry)
+  let ms = base_codec::json_stringify(merged)
+  if !ms.contains("\"v\":1") || !ms.contains("\"workspaces\":") || !ms.contains("\"old-1\"") || !ms.contains("\"prev-1\"") || !ms.contains("\"restore-2\"") {
+    panic("history.json merge failed: " + ms)
+  }
+
+  // 2. Rollback failure must NOT re-enable `autoUpdate` if user already cleared `autoUpdateAfter` via `updates.auto(false)`
+  let cfg_cleared = base_codec::json_obj([("autoUpdate", base_codec::json_bool(false))])
+  if w17e4d_restore_held_auto_json(cfg_cleared, "0.1.50000").is_some() {
+    panic("must NOT restore autoUpdate when user cleared autoUpdateAfter")
+  }
+  let cfg_matching = base_codec::json_obj([
+    ("autoUpdate", base_codec::json_bool(false)),
+    ("autoUpdateAfter", base_codec::json_str("0.1.50000")),
+  ])
+  match w17e4d_restore_held_auto_json(cfg_matching, "0.1.50000") {
+    Some(restored) => {
+      let rs = base_codec::json_stringify(restored)
+      if !rs.contains("\"autoUpdate\":true") || rs.contains("autoUpdateAfter") {
+        panic("matching rollback marker did not restore autoUpdate: " + rs)
+      }
+    }
+    None => panic("matching rollback marker must restore autoUpdate")
+  }
+
+  // 3. Platform separator handling: Windows `\` vs POSIX `/` (never misclassifies POSIX filename with literal `\`)
+  let win_head = "C:\\data\\restore\\.staging-ab12\\g1\\head.json"
+  let win_tmp = station_whole::rep_make_tmp_path(win_head, "deadbeef", station_whole::rep_platform_sep("win32"))
+  if win_tmp != "C:\\data\\restore\\.staging-ab12\\g1\\.head.json.sf-tmp-deadbeef" {
+    panic("Windows atomic temp path broken: " + win_tmp)
+  }
+  let posix_tmp = station_whole::rep_make_tmp_path("/data/restore/a\\b.json", "deadbeef", station_whole::rep_platform_sep("linux"))
+  if posix_tmp != "/data/restore/.a\\b.json.sf-tmp-deadbeef" {
+    panic("POSIX atomic temp path with literal backslash broken: " + posix_tmp)
+  }
+
+  // 4. Snapshot binding rejects mismatched `base_url`, `None` `base_url`, or mismatched `included` digest/file
+  let rel = station_cli::SignedRelease::{
+    version: "0.1.99999",
+    build: 99999L,
+    commit: "abcdef1",
+    node: "22.0.0",
+    builds: Map::new(),
+    included: Some(station_cli::ReleaseIncludedRef::{ file: "inc-99999.json", sha256: "aaaa", size: 10L }),
+  }
+  let cached_rel = Some(("beta", "https://feed-a.example", rel))
+  if w17e4d_match_bound_release(cached_rel, "beta", Some("https://feed-b.example")).is_some() {
+    panic("bound release must miss when base_url changed")
+  }
+  if w17e4d_match_bound_release(cached_rel, "beta", None).is_some() {
+    panic("bound release must miss when cur_base_url is None")
+  }
+  if w17e4d_match_bound_release(cached_rel, "beta", Some("https://feed-a.example")).is_none() {
+    panic("bound release must hit on exact (channel, base_url)")
+  }
+  let inc = ReleaseIncluded::{ build: 99999L, commit: "abcdef1", prs: [9200L], fixes: [], commits: [] }
+  let cached_inc_wrong_sha = Some(("beta", "https://feed-a.example", "0.1.99999", "inc-99999.json", "bbbb", inc))
+  if w17e4d_match_bound_included(cached_inc_wrong_sha, "beta", "https://feed-a.example", rel).is_some() {
+    panic("bound included must miss when digest changed")
+  }
+  let cached_inc_ok = Some(("beta", "https://feed-a.example", "0.1.99999", "inc-99999.json", "aaaa", inc))
+  if w17e4d_match_bound_included(cached_inc_ok, "beta", "https://feed-a.example", rel).is_none() {
+    panic("bound included must hit on exact (channel, base_url, version, file, sha256)")
+  }
+
+  // 5. XShare 6h idle expiry filter + `heard` sequence guard
+  let now_ms : Int64 = 100000000L
+  let fresh_used = now_ms - 1000L
+  let lapsed_used = now_ms - W17E4D_XSHARE_IDLE_MS
+  let shared_json = "[{\"workspace\":\"ws-live\",\"used\":" + fresh_used.to_string() + "},{\"workspace\":\"ws-lapsed\",\"used\":" + lapsed_used.to_string() + "},{\"workspace\":\"ws-fallback-at\",\"used\":0}]"
+  let live_ws = w17e4d_filter_live_shared_workspaces(shared_json, fresh_used, now_ms)
+  if live_ws.length() != 2 || live_ws[0] != "ws-live" || live_ws[1] != "ws-fallback-at" {
+    panic("6h xshare expiry filter mismatch")
+  }
+  if w17e4d_xshare_list_reply_stale(5L, 5L) || !w17e4d_xshare_list_reply_stale(5L, 6L) {
+    panic("xshare heard sequence guard mismatch")
+  }
+
+  // 6. R6: coalesced xshare re-query on stale reply, LocalKept pre-read budget guard, late feed (channel, base_url) guard
+  let inflight : Map[String, Bool] = Map::new()
+  let dirty : Map[String, (String, String, String)] = Map::new()
+  if !w17e4d_xshare_try_start_reconcile(inflight, dirty, "ws-1/st-h", "ws-1", "st-h", "ws-p") {
+    panic("first reconcile must start immediately")
+  }
+  if w17e4d_xshare_try_start_reconcile(inflight, dirty, "ws-1/st-h", "ws-1", "st-h", "ws-p") {
+    panic("concurrent reconcile for same host must coalesce into dirty flag")
+  }
+  match w17e4d_xshare_finish_reconcile(inflight, dirty, "ws-1/st-h", "ws-1", "st-h", "ws-p", true) {
+    Some((w, s, t)) if w == "ws-1" && s == "st-h" && t == "ws-p" => ()
+    _ => panic("stale/dirty reconcile completion must schedule exactly one follow-up re-query")
+  }
+  if w17e4d_xshare_finish_reconcile(inflight, dirty, "ws-1/st-h", "ws-1", "st-h", "ws-p", false).is_some() {
+    panic("clean non-stale completion with no dirty flag must not re-query")
+  }
+  // LocalKept budget guard: yield when tick already did work and next metadata exceeds 2 MiB budget
+  if !w17e4d_kept_should_yield_before_read(W17E4D_KEPT_TICK_BYTE_BUDGET - 1L, 1, 16384L) {
+    panic("must yield before reading 16 KiB metadata with only 1 byte budget left")
+  }
+  if w17e4d_kept_should_yield_before_read(0L, 0, 4194304L) {
+    panic("first item of tick must not yield forever (will chunk at 256 KiB)")
+  }
+  // Late feed reply guard requires exact (channel, base_url) match
+  if w17e4d_feed_reply_matches_current("beta", "https://feed-a.example", "beta", Some("https://feed-b.example")) {
+    panic("late feed from old base_url on same channel must be dropped")
+  }
+  if w17e4d_feed_reply_matches_current("beta", "https://feed-a.example", "beta", None) {
+    panic("late feed when cur_base is None must be dropped")
+  }
+  if !w17e4d_feed_reply_matches_current("beta", "https://feed-a.example", "beta", Some("https://feed-a.example")) {
+    panic("matching (channel, base_url) feed must be accepted")
+  }
+}

@@ -148,19 +148,31 @@ fn rep_remove_tree(path : String) -> Unit {
   }
 }
 
+/// Runtime platform path separator (`\` on `win32`, `/` on POSIX) so legal POSIX filenames
+/// containing literal `\` are never misidentified as Windows paths.
+pub fn rep_platform_sep(os_name : String) -> String {
+  if os_name == "win32" { "\\" } else { "/" }
+}
+
+/// Pure testable atomic temp-path builder using explicit platform separator (`/` or `\`).
+pub fn rep_make_tmp_path(dst_path : String, suffix : String, sep : String) -> String {
+  let parent = nodepath::dirname(sep, dst_path)
+  let base = nodepath::basename(sep, dst_path)
+  nodepath::join(sep, [parent, "." + base + ".sf-tmp-" + suffix])
+}
+
 fn rep_unique_tmp_path(dst_path : String) -> Result[String, String] {
   let suffix = match station_sys::random_hex(8) {
     Ok(h) => h
     Err(e) => return Err("random_hex failed: " + e)
   }
-  let parent = nodepath::dirname("/", dst_path)
-  let base = nodepath::basename("/", dst_path)
-  Ok(nodepath::join("/", [parent, "." + base + ".sf-tmp-" + suffix]))
+  Ok(rep_make_tmp_path(dst_path, suffix, rep_platform_sep(station_sys::os_name())))
 }
 
 /// Raw binary atomic file write over `station_sys` (`write_at` + `sync_file` + `rename`).
 pub fn rep_write_binary_atomic(dst_path : String, data : Bytes) -> Result[Unit, String] {
-  let parent = nodepath::dirname("/", dst_path)
+  let sep = rep_platform_sep(station_sys::os_name())
+  let parent = nodepath::dirname(sep, dst_path)
   if !station_sys::mkdir_p(parent) {
     return Err("mkdir_p failed for " + parent)
   }
