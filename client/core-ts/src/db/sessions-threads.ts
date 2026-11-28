@@ -410,13 +410,15 @@ export class SessionsThreadsStore {
   }
 
   /// Writes a thread's row (`listed` null: as it was), its membership and what shows it.
-  #putThreadRow(station: string, view: J, listed: number | null): void {
+  #putThreadRow(station: string, view: J, listed: number | null, preloaded?: SqlRow | null): void {
     const id = u64(view.id)!;
     const c = this.#threadCols(view);
-    const r = this.#env.sql.all("SELECT listed, json, last, read, unread FROM thread WHERE station = ? AND id = ?", [station, id])[0];
+    const r = preloaded !== undefined
+      ? (preloaded ?? undefined)
+      : this.#env.sql.all("SELECT listed, json, last, read, unread FROM thread WHERE station = ? AND id = ?", [station, id])[0];
     const isListed = listed ?? ((r?.[0] as number | undefined) ?? 0);
     if (r && r[0] === isListed && r[1] === c.json && r[2] === c.last && r[3] === c.read && r[4] === c.unread) return;
-    const before = r ? this.thread(station, id) : undefined;
+    const before = r ? (this.#env.cache.get(K("thread", station, id)) ?? parse(r[1])) : undefined;
     this.#env.run(
       "INSERT OR REPLACE INTO thread (station, id, listed, last, read, unread, sort_at, created_at, surface, first_member, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       [station, id, isListed, c.last, c.read, c.unread, c.sortAt, c.createdAt, c.surface, c.first, c.json],
@@ -461,23 +463,71 @@ export class SessionsThreadsStore {
   setThreads(station: string, list: J[], confirmed: number | null, changed?: ReadonlySet<string>): void {
     this.#env.write(() => {
       const seen = new Set<number>();
+      const items: [number, J][] = [];
       for (const view of list) {
         const id = u64(get(view, "id"));
         if (id === null || seen.has(id)) continue;
         seen.add(id);
-        if (changed === undefined || changed.has(String(id))) this.#putThreadRow(station, view, 1);
+        if (changed === undefined || changed.has(String(id))) items.push([id, view]);
       }
+      const existing = new Map<number, SqlRow>();
+      const listedIds: number[] = [];
+      if (changed === undefined) {
+        for (const r of this.#env.sql.all("SELECT id, listed, json, last, read, unread FROM thread WHERE station = ? AND listed = 1", [station])) {
+          const id = r[0] as number;
+          listedIds.push(id);
+          existing.set(id, r.slice(1));
+        }
+        const missing = items.filter(([id]) => !existing.has(id)).map(([id]) => id);
+        if (missing.length > 0) {
+          for (const r of this.#env.sql.all(
+            "SELECT t.id, t.listed, t.json, t.last, t.read, t.unread FROM json_each(?) AS k CROSS JOIN thread AS t WHERE t.station = ? AND t.id = k.value",
+            [JSON.stringify(missing), station],
+          )) {
+            existing.set(r[0] as number, r.slice(1));
+          }
+        }
+      } else {
+        for (const r of this.#env.sql.all("SELECT id FROM thread WHERE station = ? AND listed = 1", [station])) listedIds.push(r[0] as number);
+        if (items.length > 0) {
+          for (const r of this.#env.sql.all(
+            "SELECT t.id, t.listed, t.json, t.last, t.read, t.unread FROM json_each(?) AS k CROSS JOIN thread AS t WHERE t.station = ? AND t.id = k.value",
+            [JSON.stringify(items.map(([id]) => id)), station],
+          )) {
+            existing.set(r[0] as number, r.slice(1));
+          }
+        }
+      }
+      for (const [id, view] of items) this.#putThreadRow(station, view, 1, existing.get(id) ?? null);
+      const unlisted = listedIds.filter((id) => !seen.has(id));
       let wrote = false;
-      for (const r of this.#env.sql.all("SELECT id FROM thread WHERE station = ? AND listed = 1", [station])) {
-        const id = r[0] as number;
-        if (seen.has(id)) continue;
-        wrote = true;
-        const before = this.thread(station, id);
-        this.#env.run("UPDATE thread SET listed = 0 WHERE station = ? AND id = ?", [station, id]);
-        this.#env.loadedList(station, "threads")?.delete(String(id));
-        this.#env.tell({ topic: "threads", station });
-        this.#env.tell({ topic: "thread", station, thread: id });
-        for (const member of membersOf(before)) this.#tellSession(station, member);
+      if (unlisted.length > 0) {
+        const unlistedJson = new Map<number, SqlValue>();
+        const needJson: number[] = [];
+        for (const id of unlisted) {
+          if (this.#env.cache.get(K("thread", station, id))) continue;
+          const prev = existing.get(id);
+          if (prev) unlistedJson.set(id, prev[1]!);
+          else needJson.push(id);
+        }
+        if (needJson.length > 0) {
+          for (const r of this.#env.sql.all(
+            "SELECT t.id, t.json FROM json_each(?) AS k CROSS JOIN thread AS t WHERE t.station = ? AND t.id = k.value",
+            [JSON.stringify(needJson), station],
+          )) {
+            unlistedJson.set(r[0] as number, r[1]!);
+          }
+        }
+        for (const id of unlisted) {
+          wrote = true;
+          const cached = this.#env.cache.get(K("thread", station, id));
+          const before = cached ?? (unlistedJson.has(id) ? parse(unlistedJson.get(id)!) : undefined);
+          this.#env.run("UPDATE thread SET listed = 0 WHERE station = ? AND id = ?", [station, id]);
+          this.#env.loadedList(station, "threads")?.delete(String(id));
+          this.#env.tell({ topic: "threads", station });
+          this.#env.tell({ topic: "thread", station, thread: id });
+          for (const member of membersOf(before)) this.#tellSession(station, member);
+        }
       }
       this.#env.markListed(station, "threads", confirmed, wrote);
     });
