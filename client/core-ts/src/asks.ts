@@ -1,6 +1,6 @@
 // What a UI asks the core to find out: where one of still.fail's links opens in the app, whether a newer
 // app is out, a picture (fetched once and kept on the device), the buddies a Slack app can wear, a dev cloud's sign-in.
-import { Deferred, Effect, Semaphore } from "effect";
+import { Deferred, Effect, type Result, Semaphore } from "effect";
 import buddiesList from "../../../web/public/avatars/index.json" with { type: "json" };
 import { RELEASE_KEYS } from "../../../shared/release-keys.ts";
 import { type Deltas, deltaFrom, feedDeltas, winReleaseWords } from "./app-release.ts";
@@ -37,6 +37,7 @@ export const PICTURES_KEPT = 256;
 export const PICTURES_BYTES = 32 * 1024 * 1024;
 
 type Picture = Deferred.Deferred<[string, Uint8Array] | null, CoreError>;
+type PictureEntry = { deferred: Picture; bytes: number; settled: boolean };
 /// What is kept: each picture's name and size, the least lately had first; the name of the one standing in for each
 /// not had yet.
 type Kept = { kept: [string, number][]; standIn: Record<string, string> };
@@ -49,7 +50,7 @@ export class Asks {
   readonly #brings: Brings;
   /// The newest release of each feed as read (when, the release, its deltas), shared by every build asking.
   readonly #releases = new Map<string, [number, J, Deltas | null]>();
-  readonly #pictures = new Map<string, { deferred: Picture; bytes: number; settled: boolean }>();
+  readonly #pictures = new Map<string, PictureEntry>();
   #pictureBytes = 0;
   /// Pictures that could not be fetched: when, and why.
   readonly #pictureFailed = new Map<string, [number, CoreError]>();
@@ -170,11 +171,32 @@ export class Asks {
           this.#pictures.set(url, entry);
         } else {
           const made = Deferred.makeUnsafe<[string, Uint8Array] | null, CoreError>();
-          entry = { deferred: made, bytes: 0, settled: false };
-          this.#pictures.set(url, entry);
+          const own: PictureEntry = { deferred: made, bytes: 0, settled: false };
+          entry = own;
+          this.#pictures.set(url, own);
           this.#trimPictures(url);
+          // Settled in the same step the fetch ends in: an interruption anywhere before that (or a defect) lets the entry go
+          // and answers null, so those waiting fetch it themselves rather than wait for ever.
           let finished = false;
-          const fetched = yield* Effect.ensuring(
+          const settle = (fetched: Result.Result<[string, Uint8Array], CoreError>) => Effect.sync(() => {
+            finished = true;
+            if (fetched._tag === "Success") {
+              own.settled = true;
+              own.bytes = fetched.success[1].byteLength;
+              if (this.#pictures.get(url) === own) {
+                this.#pictureBytes += own.bytes;
+                this.#trimPictures(url);
+              }
+              Deferred.doneUnsafe(made, Effect.succeed(fetched.success));
+            } else {
+              if (this.#pictures.get(url) === own) {
+                this.#pictures.delete(url);
+                this.#pictureBytes -= own.bytes;
+              }
+              Deferred.doneUnsafe(made, Effect.fail(fetched.failure));
+            }
+          });
+          yield* Effect.ensuring(
             Effect.tap(
               Effect.result(
                 Effect.flatMap(this.#keptPicture(pictureName(url)), (kept) =>
@@ -186,30 +208,14 @@ export class Asks {
                       ),
                 ),
               ),
-              () => Effect.sync(() => { finished = true; }),
+              settle,
             ),
             Effect.sync(() => {
-              if (!finished) {
-                if (this.#pictures.get(url) === entry) this.#pictures.delete(url);
-                Deferred.doneUnsafe(made, Effect.succeed(null));
-              }
+              if (finished) return;
+              if (this.#pictures.get(url) === own) this.#pictures.delete(url);
+              Deferred.doneUnsafe(made, Effect.succeed(null));
             }),
           );
-          if (fetched._tag === "Success") {
-            entry.settled = true;
-            entry.bytes = fetched.success[1].byteLength;
-            if (this.#pictures.get(url) === entry) {
-              this.#pictureBytes += entry.bytes;
-              this.#trimPictures(url);
-            }
-            Deferred.doneUnsafe(made, Effect.succeed(fetched.success));
-          } else {
-            if (this.#pictures.get(url) === entry) {
-              this.#pictures.delete(url);
-              this.#pictureBytes -= entry.bytes;
-            }
-            Deferred.doneUnsafe(made, Effect.fail(fetched.failure));
-          }
         }
         const got = yield* Effect.result(Deferred.await(entry.deferred));
         if (got._tag === "Failure") {
