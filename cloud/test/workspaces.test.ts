@@ -393,6 +393,55 @@ test("a credential is one call of the Directory, and one asked by a non-member k
   }
 });
 
+test("mutators return WorkspaceView matching GET /v1/workspaces/:id without changing call accounting", async () => {
+  const h = await harness();
+  try {
+    const alice = h.as(await h.login("alice"));
+    const bob = h.as(await h.login("bob"));
+    const ws = ((await (await alice("POST", "/v1/workspaces", { name: "Home" })).json()) as any).id as string;
+    const directory = await h.object("DIRECTORY", "primary");
+    const countCalls = async () => ((await directory.adminLoad()).calls.families.workspaces ?? []).reduce((a: number, b: number) => a + b, 0);
+
+    const expectSameView = async (mutated: { status: number; json(): Promise<unknown> }, callDelta: number, before: number) => {
+      assert.equal(mutated.status, 200);
+      const returned = await mutated.json();
+      const fetched = await (await alice("GET", `/v1/workspaces/${ws}`)).json();
+      assert.deepEqual(returned, fetched);
+      assert.equal((await countCalls()) - before, callDelta + 1);
+    };
+
+    const beforeRename = await countCalls();
+    await expectSameView(await alice("PATCH", `/v1/workspaces/${ws}`, { name: "Studio", emoji: "🏠" }), 1, beforeRename);
+
+    const beforeRelays = await countCalls();
+    await expectSameView(await alice("PUT", `/v1/workspaces/${ws}/relays`, { relays: ["https://relay-one.example"] }), 1, beforeRelays);
+
+    const beforeWay = await countCalls();
+    await expectSameView(await alice("PUT", `/v1/workspaces/${ws}/ways`, { way: "https://relay-one.example", on: false }), 1, beforeWay);
+
+    const beforeAdd = await countCalls();
+    const added = await alice("POST", `/v1/workspaces/${ws}/members`, { role: "member", emails: ["pending@example.test"] });
+    assert.equal(added.status, 200);
+    const addedBody = (await added.json()) as any;
+    assert.deepEqual(addedBody.view, await (await alice("GET", `/v1/workspaces/${ws}`)).json());
+    assert.equal((await countCalls()) - beforeAdd, 2);
+
+    const beforeRemoveAdded = await countCalls();
+    await expectSameView(await alice("DELETE", `/v1/workspaces/${ws}/added/${encodeURIComponent("pending@example.test")}`), 1, beforeRemoveAdded);
+
+    const invite = (await (await alice("POST", `/v1/workspaces/${ws}/invitations`, { role: "member", email: "bob@example.test" })).json()) as any;
+    const accepted = await bob("POST", `/v1/invitations/${invite.id}/accept`);
+    assert.equal(accepted.status, 200);
+    assert.deepEqual(await accepted.json(), await (await bob("GET", `/v1/workspaces/${ws}`)).json());
+
+    const bobMe = (await (await bob("GET", "/v1/me")).json()) as any;
+    const beforeRole = await countCalls();
+    await expectSameView(await alice("PATCH", `/v1/workspaces/${ws}/members/${bobMe.user.sub}`, { role: "admin" }), 1, beforeRole);
+  } finally {
+    await h.close();
+  }
+});
+
 test("initSchema creates indexes for hot Directory lookups and stays idempotent", () => {
   const sqlite = new DatabaseSync(":memory:");
   try {
