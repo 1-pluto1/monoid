@@ -239,17 +239,35 @@ priv struct Later {
 }
 
 ///|
-/// What it holds as the core has it: its messages read and applied, as Client::take applies them to one let go of
-/// (one that is not JSON, none of its own, let be as `receive` lets it be). Read once: what it read is its base after.
+/// What it holds as the core has it: its messages read and applied, as Client::take applies them to one let go of.
+/// Read once: what it read is its base after. If any queued frame fails to parse or is malformed (e.g. a lone UTF-16
+/// surrogate or truncated frame), fail closed (`None`) so a stale `base` is never kept under a newer keep token `v`.
 fn Later::now(self : Later) -> Json? {
   let mut v = self.base
   for i, text in self.raw {
-    let msg = @json.parse(text) catch { _ => continue }
-    guard msg is Object(m) else { continue }
+    let msg = @json.parse(text) catch {
+      _ => {
+        self.base = None
+        self.raw.clear()
+        self.whole = false
+        return None
+      }
+    }
+    guard msg is Object(m) else {
+      self.base = None
+      self.raw.clear()
+      self.whole = false
+      return None
+    }
     match (m.get("value"), m.get("delta"), v) {
       (Some(whole), _, _) if i == 0 && self.whole => v = Some(whole)
       (_, Some(Array(ops)), Some(had)) => v = Some(apply_delta(had, ops))
-      _ => ()
+      _ => {
+        self.base = None
+        self.raw.clear()
+        self.whole = false
+        return None
+      }
     }
   }
   self.base = v
@@ -2009,18 +2027,179 @@ pub fn Client::later(self : Client, text : String) -> Bool {
 }
 
 ///|
+/// Exact IEEE-754 double integer ceiling (`2^53 - 1`): integers up to this value convert identically through
+/// `@json.parse` (`Double::to_int64()`) and direct decimal scanning, covering 16-digit production `conn` IDs
+/// (`Math.floor(Date.now() * 1000) + jitter`, e.g. `1795869167405123`).
+let max_safe_wire_int : Int64 = 9007199254740991L
+
+///|
+/// Compares an ASCII pattern against `text` at UTF-16 code-unit offset `start` without constructing a `StringView`
+/// (which would abort if a speculative probe offset lands on a UTF-16 low surrogate).
+fn string_matches_at(text : String, start : Int, pat : String) -> Bool {
+  let plen = pat.length()
+  if start < 0 || start + plen > text.length() {
+    return false
+  }
+  for i = 0; i < plen; i = i + 1 {
+    if text.unsafe_get(start + i) != pat.unsafe_get(i) {
+      return false
+    }
+  }
+  true
+}
+
+///|
+/// Reads trailing canonical top-level wire-identity integer fields (`conn`, `authGen`, `vaultGen`) from the end of a
+/// compact JSON object emitted by `core-ts` (`{ id, value|delta, ...gen }`), in strictly O(1) time and zero
+/// allocations without parsing the payload body.
+///
+/// Soundness (for valid JSON, as emitted by `core-ts` `JSON.stringify`): because the matched suffix contains only
+/// `,"<key>":<digits>` pairs immediately before the final `}` (with no `"`, `}`, `]`, or whitespace), in any valid
+/// JSON object starting with `{"id":` those pairs are grammatically guaranteed to be rightmost top-level members of
+/// the root object. Malformed bodies are not validated here; if any queued frame fails `@json.parse` later,
+/// `Later::now()` fails closed (`None`) so stale `base` is never retained under a newer keep token. Any non-canonical
+/// form (whitespace, duplicate tail keys, extra trailing fields, non-integer or out-of-range numbers, or invalid
+/// preceding value token) returns `None` so the caller falls back to full `@json.parse`.
+fn tail_wire_gen(text : String) -> (Int64?, Int?, Int?)? {
+  let n = text.length()
+  if n < 4 || text.unsafe_get(n - 1).to_int() != '}'.to_int() {
+    return None
+  }
+  let mut pos = n - 1
+  let mut conn : Int64? = None
+  let mut auth_gen : Int? = None
+  let mut vault_gen : Int? = None
+  let mut count = 0
+  let ch_0 = '0'.to_int()
+  let ch_9 = '9'.to_int()
+  let ch_colon = ':'.to_int()
+  for _step = 0; _step < 3; _step = _step + 1 {
+    let end_digits = pos
+    // Hard-bound backward digit scan to 17 chars so worst-case work is strictly O(1) even on adversarial inputs.
+    let min_i = if pos > 17 { pos - 17 } else { 0 }
+    let mut i = pos - 1
+    while i >= min_i {
+      let ch = text.unsafe_get(i).to_int()
+      if ch >= ch_0 && ch <= ch_9 {
+        i -= 1
+      } else {
+        break
+      }
+    }
+    let start_digits = i + 1
+    let dlen = end_digits - start_digits
+    if dlen == 0 || dlen > 16 {
+      break
+    }
+    if i < 0 || text.unsafe_get(i).to_int() != ch_colon {
+      break
+    }
+    if string_matches_at(text, i - 7, ",\"conn\"") {
+      if conn is Some(_) || (dlen > 1 && text.unsafe_get(start_digits).to_int() == ch_0) {
+        return None
+      }
+      let mut v = 0L
+      for j = start_digits; j < end_digits; j = j + 1 {
+        v = v * 10L + (text.unsafe_get(j).to_int() - ch_0).to_int64()
+      }
+      if v > max_safe_wire_int {
+        return None
+      }
+      conn = Some(v)
+      pos = i - 7
+      count += 1
+    } else if string_matches_at(text, i - 10, ",\"authGen\"") {
+      if auth_gen is Some(_) || dlen > 9 || (dlen > 1 && text.unsafe_get(start_digits).to_int() == ch_0) {
+        return None
+      }
+      let mut v = 0
+      for j = start_digits; j < end_digits; j = j + 1 {
+        v = v * 10 + (text.unsafe_get(j).to_int() - ch_0)
+      }
+      auth_gen = Some(v)
+      pos = i - 10
+      count += 1
+    } else if string_matches_at(text, i - 11, ",\"vaultGen\"") {
+      if vault_gen is Some(_) || dlen > 9 || (dlen > 1 && text.unsafe_get(start_digits).to_int() == ch_0) {
+        return None
+      }
+      let mut v = 0
+      for j = start_digits; j < end_digits; j = j + 1 {
+        v = v * 10 + (text.unsafe_get(j).to_int() - ch_0)
+      }
+      vault_gen = Some(v)
+      pos = i - 11
+      count += 1
+    } else {
+      break
+    }
+  }
+  if count == 0 || pos < 1 {
+    return None
+  }
+  // In valid compact JSON, the token immediately preceding the peeled `,` must end a JSON value.
+  let prev = text.unsafe_get(pos - 1).to_int()
+  let ok_prev = prev == '}'.to_int() ||
+    prev == ']'.to_int() ||
+    prev == '"'.to_int() ||
+    prev == 'e'.to_int() || // true / false
+    prev == 'l'.to_int() || // null
+    (prev >= ch_0 && prev <= ch_9)
+  if !ok_prev {
+    return None
+  }
+  Some((conn, auth_gen, vault_gen))
+}
+
+///|
+priv enum WireCheck {
+  Fresh
+  Stale
+  Corrupt
+}
+
+///|
+/// Checks whether raw wire text `text` is fresh, definitely stale, or unparseable/corrupt for `s` on a handshaked
+/// connection (`self.conn_id > 0L`).
+///
+/// One-sided fast-accept invariant:
+/// - `tail_wire_gen(text)` is ONLY used to fast-accept `Fresh` frames in O(1) without parsing the body (if a fast-
+///   accepted frame later turns out to be corrupt/truncated when materialized, `Later::now()` fails closed with `None`).
+/// - A frame is NEVER classified as `Stale` (which preserves the existing `base` for a subsequent keep receipt `v`)
+///   from the tail scan alone unless `s.gen_expired || self.awaiting_auth_sync` is already true: any surface-stale or
+///   non-canonical tail falls back to `@json.parse(text)` so a truncated frame whose inner object happened to end in
+///   stale-looking fields returns `Corrupt` and invalidates the cached base instead of preserving stale data.
+fn Client::text_wire_check(self : Client, text : String, s : Sub) -> WireCheck {
+  if s.gen_expired || self.awaiting_auth_sync {
+    return Stale
+  }
+  let name = topic_name(s.topic)
+  let is_device = (self.device_global_policy)(name)
+  let is_vault = name == "vaults" || name == "vaultItems" || name == "vaultUses"
+  match tail_wire_gen(text) {
+    Some((conn_opt, ag_opt, vg_opt)) => {
+      let has_all_required = conn_opt is Some(_) &&
+        (is_device || ag_opt is Some(_)) &&
+        (!is_vault || vg_opt is Some(_))
+      if has_all_required && !self.msg_stale_fields_resolved(s, is_device, is_vault, conn_opt, ag_opt, vg_opt) {
+        return Fresh
+      }
+    }
+    None => ()
+  }
+  let parsed = @json.parse(text) catch { _ => return Corrupt }
+  match parsed {
+    Object(m) => if self.msg_stale_for_resolved(m, s, is_device, is_vault) { Stale } else { Fresh }
+    _ => Corrupt
+  }
+}
+
+///|
 /// Client::later's, of a message whose head said its id and whether it is a whole value.
 fn Client::later_at(self : Client, id : Int, whole : Bool, text : String) -> Bool {
   guard self.subs.get(id) is Some(s) && s.ending else { return false }
   if s.gen_expired || self.awaiting_auth_sync {
     return true
-  }
-  if self.conn_id > 0L {
-    let parsed = @json.parse(text) catch { _ => Json::null() }
-    match parsed {
-      Object(m) => if self.msg_stale_for(m, s) { return true }
-      _ => ()
-    }
   }
   if !s.keeping && !self.subs.values().any(fn(o) { o.from == Some(id) }) {
     return true
@@ -2028,6 +2207,18 @@ fn Client::later_at(self : Client, id : Int, whole : Bool, text : String) -> Boo
   // (what changed of no value: let be, as Client::take lets it be)
   if !whole && !s.holds() {
     return true
+  }
+  if self.conn_id > 0L {
+    match self.text_wire_check(text, s) {
+      Stale => return true
+      Corrupt => {
+        s.value = None
+        s.later = None
+        s.held = None
+        return true
+      }
+      Fresh => ()
+    }
   }
   let l = match s.later {
     Some(l) => l
@@ -2466,24 +2657,28 @@ fn Client::reask_after_restart(self : Client) -> Unit {
 }
 
 ///|
-fn Client::msg_stale_for(self : Client, m : Map[String, Json], s : Sub) -> Bool {
-  if s.gen_expired || self.awaiting_auth_sync {
-    return true
-  }
-  let name = topic_name(s.topic)
-  let is_device = (self.device_global_policy)(name)
-  let is_vault = name == "vaults" || name == "vaultItems" || name == "vaultUses"
+/// Checks wire-identity staleness against pre-resolved `is_device` / `is_vault` flags.
+/// Precondition: caller has already checked `s.gen_expired || self.awaiting_auth_sync`.
+fn Client::msg_stale_fields_resolved(
+  self : Client,
+  s : Sub,
+  is_device : Bool,
+  is_vault : Bool,
+  conn_opt : Int64?,
+  auth_gen_opt : Int?,
+  vault_gen_opt : Int?,
+) -> Bool {
   if self.conn_id > 0L {
-    match m.get("conn") {
-      Some(Number(d, ..)) if d.to_int64() == self.conn_id => ()
+    match conn_opt {
+      Some(c) if c == self.conn_id => ()
       _ => return true
     }
     let mut ag = 0
     if !is_device {
       let cur = self.current_auth_gen(s.topic)
-      match m.get("authGen") {
-        Some(Number(d, ..)) => {
-          ag = d.to_int()
+      match auth_gen_opt {
+        Some(a) => {
+          ag = a
           if cur > 0 && ag < cur {
             return true
           }
@@ -2491,15 +2686,15 @@ fn Client::msg_stale_for(self : Client, m : Map[String, Json], s : Sub) -> Bool 
             return true
           }
         }
-        _ => return true
+        None => return true
       }
     }
     let mut vg = 0
     if is_vault {
       let cur = self.current_vault_gen(s.topic)
-      match m.get("vaultGen") {
-        Some(Number(d, ..)) => {
-          vg = d.to_int()
+      match vault_gen_opt {
+        Some(v) => {
+          vg = v
           if cur > 0 && vg < cur {
             return true
           }
@@ -2507,7 +2702,7 @@ fn Client::msg_stale_for(self : Client, m : Map[String, Json], s : Sub) -> Bool 
             return true
           }
         }
-        _ => return true
+        None => return true
       }
     }
     if !is_device && self.is_topic_masked(s.topic, ag, vg) {
@@ -2517,26 +2712,62 @@ fn Client::msg_stale_for(self : Client, m : Map[String, Json], s : Sub) -> Bool 
     if !is_device && self.is_topic_masked(s.topic, self.current_auth_gen(s.topic), self.current_vault_gen(s.topic)) {
       return true
     }
-    match m.get("authGen") {
-      Some(Number(d, ..)) => {
+    match auth_gen_opt {
+      Some(a) => {
         let cur = self.current_auth_gen(s.topic)
-        if cur > 0 && d.to_int() < cur {
+        if cur > 0 && a < cur {
           return true
         }
       }
-      _ => ()
+      None => ()
     }
-    match m.get("vaultGen") {
-      Some(Number(d, ..)) => {
+    match vault_gen_opt {
+      Some(v) => {
         let cur = self.current_vault_gen(s.topic)
-        if cur > 0 && d.to_int() < cur {
+        if cur > 0 && v < cur {
           return true
         }
       }
-      _ => ()
+      None => ()
     }
   }
   false
+}
+
+///|
+/// Extracts wire-identity fields from a parsed JSON object and checks staleness against pre-resolved flags.
+/// Precondition: caller has already checked `s.gen_expired || self.awaiting_auth_sync`.
+fn Client::msg_stale_for_resolved(
+  self : Client,
+  m : Map[String, Json],
+  s : Sub,
+  is_device : Bool,
+  is_vault : Bool,
+) -> Bool {
+  let conn_opt = match m.get("conn") {
+    Some(Number(d, ..)) => Some(d.to_int64())
+    _ => None
+  }
+  let auth_gen_opt = match m.get("authGen") {
+    Some(Number(d, ..)) => Some(d.to_int())
+    _ => None
+  }
+  let vault_gen_opt = match m.get("vaultGen") {
+    Some(Number(d, ..)) => Some(d.to_int())
+    _ => None
+  }
+  self.msg_stale_fields_resolved(s, is_device, is_vault, conn_opt, auth_gen_opt, vault_gen_opt)
+}
+
+///|
+fn Client::msg_stale_for(self : Client, m : Map[String, Json], s : Sub) -> Bool {
+  if s.gen_expired || self.awaiting_auth_sync {
+    return true
+  }
+  let name = topic_name(s.topic)
+  let is_device = (self.device_global_policy)(name)
+  let is_vault = name == "vaults" || name == "vaultItems" || name == "vaultUses"
+  self.msg_stale_for_resolved(m, s, is_device, is_vault)
 }
 
 ///|
