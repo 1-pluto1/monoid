@@ -123,7 +123,7 @@ pub fn tab_bar_node(
         let shut : Ref[@view.View?] = Ref(None)
         let on_shut = fn() {
           match shut.val {
-            Some(x) => x.pointed() || x.pressed()
+            Some(x) => x.pointed() || x.press_shown()
             None => false
           }
         }

@@ -268,7 +268,7 @@ fn field_frame(
       v.focused() ||
       (match @ui.pointing() {
         Mouse => f.pointed_in()
-        Finger => v.pressed() || f.pressed()
+        Finger => v.press_shown() || f.press_shown()
       })
     }
     f.edge(By(fn() { field_edge(hot=hot(), solid~) }))

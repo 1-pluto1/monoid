@@ -1921,7 +1921,7 @@ fn corner_pill_key_node(
       hover_ground_node(
         k,
         color=fn() {
-          if k.pressed() {
+          if k.press_shown() {
             bar_pill_press_ink(solid=k.glass_solid())
           } else {
             @glass.liquid_pill_hover_ink(solid=k.glass_solid())

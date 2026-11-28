@@ -243,13 +243,16 @@ test "profiles_list: grouped card hairlines fade smoothly on mouse hover and tou
   assert_eq(sl_sep_alpha_at(tm, y_ab), rest_alpha, msg="leaving Row-B restores A|B")
   assert_eq(sl_sep_alpha_at(tm, y_bc), rest_alpha, msg="leaving Row-B restores B|C")
 
-  // Touch press-and-hold on middle row fades both adjacent dividers and restores on release
+  // Touch press-and-hold inside scroller waits tap_indication_ms before fading adjacent dividers, and restores on release
   let tf = pl_open_tester(items, w=390.0, h=844.0, platform=2)
   let fseps = sl_seps_drawn(tf)
   assert_eq(fseps.length(), 2, msg="touch expected 2 profile hairlines")
   let (fbx, fby, fbw, fbh) = tf.rect_of("Row-B").unwrap()
   tf.press_at(fbx + fbw / 2.0, fby + fbh / 2.0)
-  tf.run_for(@sf.dur_ms + 30.0)
+  tf.run_for(@ui.tap_indication_ms / 2.0)
+  assert_eq(sl_sep_alpha_at(tf, fseps[0].0), rest_alpha, msg="touch brief hold before tap_indication_ms keeps A|B opaque")
+  assert_eq(sl_sep_alpha_at(tf, fseps[1].0), rest_alpha, msg="touch brief hold before tap_indication_ms keeps B|C opaque")
+  tf.run_for(@ui.tap_indication_ms / 2.0 + @sf.dur_ms + 30.0)
   assert_eq(sl_sep_alpha_at(tf, fseps[0].0), 0, msg="touch hold Row-B fades A|B")
   assert_eq(sl_sep_alpha_at(tf, fseps[1].0), 0, msg="touch hold Row-B fades B|C")
   tf.release(4.0, 4.0)

@@ -93,9 +93,9 @@ pub fn RadioItem::disabled(self : RadioItem) -> Bool {
 }
 
 ///|
-/// Whether a finger or the pointer is held on this item now (View::pressed).
+/// Whether visual press feedback is shown on this item now (`View::press_shown`, delayed in scrollers); read `node.pressed()` for immediate input logic.
 pub fn RadioItem::pressed(self : RadioItem) -> Bool {
-  self.node.pressed()
+  self.node.press_shown()
 }
 
 ///|

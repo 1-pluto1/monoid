@@ -30,6 +30,7 @@ pub fn Tree::lit_all(self : Tree, on : Bool) -> Unit {
       None => ()
     }
   }
+  self.press_shown_lit_all(on)
   @signals.end_batch()
   if !on && !self.eager_settle() && self.moves_causes > 0 {
     self.settle_layout_at(self.logic)
@@ -72,7 +73,10 @@ pub fn Tree::hand_nodes(self : Tree) -> Array[HandNode] {
       key,
       holder,
       said: n.look.words,
-      lights: n.pointed_cell is Some(_) || n.pressed_cell is Some(_) || n.on_press is Some(_),
+      lights: n.pointed_cell is Some(_) ||
+        n.pressed_cell is Some(_) ||
+        self.press_shown_watched({ at, gen: n.gen }) ||
+        n.on_press is Some(_),
       y: n.ly,
       w: n.lw,
       h: n.lh,

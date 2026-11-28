@@ -194,7 +194,7 @@ pub fn liquid_capsule_decorate(
         }
         None => ()
       }
-      let spot = if interactive && v.pressed() && !v.glass_solid() {
+      let spot = if interactive && v.press_shown() && !v.glass_solid() {
         let (_, _, w, h) = v.placed_now()
         if w > 0.0 && h > 0.0 {
           Some((w / 2.0, h / 2.0))

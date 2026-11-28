@@ -198,7 +198,7 @@ fn Tree::hand_on(
     Dragged(u) => {
       let n = self.nodes[u.at]
       guard n.on_drag is Some(f) else { return }
-      self.held_to(Some(u))
+      self.held_to(Some(u), immediate=true)
       self.downs.clear()
       self.downs.push(th.finger)
       let (nx, ny, ns) = self.placed(u.at)

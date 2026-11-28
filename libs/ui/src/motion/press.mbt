@@ -29,9 +29,6 @@ pub struct PressFeel {
   priv mut depth : Double
   /// a press told by a gesture (PressFeel::down) with its size, at its moment: what that press sinks by
   priv mut told : (Double, Double, Double)?
-  /// a finger's press in what scrolls not shown yet: its showing due
-  priv mut late : Bool
-  priv mut late_due : () -> Unit
   priv sink_px : Double
   priv sink_most : Double
   /// how big it is, where its look knows it (a box of a side said)
@@ -70,8 +67,6 @@ pub fn press_feel(
     press: Eased::new(0.0),
     depth: 0.0,
     told: None,
-    late: false,
-    late_due: fn() {  },
     sink_px,
     sink_most,
     size,
@@ -93,54 +88,26 @@ pub fn press_feel(
   // (whether the press now down is a hand's in the window: one every control is told at once (Tree::lit_all, a
   // Tester's measure of the looks) is none)
   let by_hand = Ref(false)
-  v.reacts(fn() { live() && v.pressed() }, at_start=false, fn(down) {
-    let at = v.cause_at()
+  v.reacts(fn() { live() && v.press_shown() }, at_start=false, fn(down) {
     if down {
-      (f.late_due)()
-      f.late_due = fn() {  }
-      f.late = false
       if !@signals.untracked(fn() { v.window_held() }) {
         by_hand.val = false
         f.told = None
         return
       }
       by_hand.val = true
-      if @ui.pointing() is Finger && v.scroll_holding() is Some(_) {
-        // (a finger in what scrolls: shown once it has stayed, as one that goes on to scroll presses nothing; what its
-        // gesture told of its size kept for then)
-        let told = f.told
-        f.told = None
-        f.late = true
-        f.late_due = v.at_moment(at + @ui.tap_indication_ms, fn() {
-          f.late = false
-          f.late_due = fn() {  }
-          f.told = told
-          scaled()
-          f.sink(v)
-        })
-      } else {
-        scaled()
-        f.sink(v)
-      }
+      scaled()
+      f.sink(v)
       return
     }
     guard by_hand.val else { return }
     by_hand.val = false
-    if f.late {
-      // (let go, or taken by the list it is in, before it showed: nothing shown of it)
-      (f.late_due)()
-      f.late_due = fn() {  }
-      f.late = false
-      f.told = None
-    } else {
-      f.told = None
-      f.press.go_by(v, 0.0, tactile_bounce)
-    }
+    f.told = None
+    f.press.go_by(v, 0.0, tactile_bounce)
   })
   v.owns(fn() {
     (f.hover.due)()
     (f.press.due)()
-    (f.late_due)()
   })
   |> ignore
   f

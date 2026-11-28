@@ -1762,7 +1762,7 @@ pub fn terminal_pane_node(
               @sf.hover_ground_node(
                 b,
                 color=fn() {
-                  if b.pressed() && !b.glass_solid() {
+                  if b.press_shown() && !b.glass_solid() {
                     0xFFFFFF2EL
                   } else {
                     @ui.tree_theme().color(Hover)
@@ -1978,8 +1978,8 @@ pub fn terminal_pane_node(
                   b,
                   color=fn() {
                     if @sf.theme().dark {
-                      if b.pressed() { 0x00000018L } else { 0xFFFFFF40L }
-                    } else if b.pressed() {
+                      if b.press_shown() { 0x00000018L } else { 0xFFFFFF40L }
+                    } else if b.press_shown() {
                       0xFFFFFF24L
                     } else {
                       0xFFFFFF18L

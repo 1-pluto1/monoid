@@ -604,7 +604,7 @@ fn sim_debug_toggle_node(parent : @view.View, pg : ScreenPage, corner? : @view.L
       }
     }))
     |> ignore
-    @sf.hover_ground_node(v, lit=Some(fn() { v.pointed() || v.pressed() || v.focus_shown() }))
+    @sf.hover_ground_node(v, lit=Some(fn() { v.pointed() || v.press_shown() || v.focus_shown() }))
     let ink = fn() { if open() { @sf.theme().p.accent_text } else { @ui.tree_theme().color(Fg) } }
     @sf.icon_node(v, "", round_bar_icon, By(ink), name_now=fn() { if open() { "panel-close" } else { "panel-open" } }) |> ignore
     let words = @sf.words_node(v, fn() { @sf.t("web-pages.screen.debug.pane") }, fn() { sim_debug_btn_words })

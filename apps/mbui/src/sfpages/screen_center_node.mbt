@@ -534,7 +534,7 @@ fn quick_tile_node(
   @sf.action_box_node(row, label, on=lit, fn(_) { press() }, fn(t) {
     @sf.style_node(t, fn() {
       let look = if lit() { tile_box.then(tile_lit) } else { tile_box }
-      if t.pressed() { look.then(tile_pressed) } else { look }
+      if t.press_shown() { look.then(tile_pressed) } else { look }
     }, in_row=true)
     let ink = fn() { @ui.tree_theme().color(if lit() { Bg } else { Fg }) }
     @sf.icon_node(t, "", round_icon, By(ink), name_now=icon) |> ignore
@@ -617,7 +617,7 @@ fn tiles_node(parent : @view.View, count : Int, per : Int, gap : @ui.Style, tile
 /// `label`, `press` as it is pressed; what is on it made by `face`.
 fn center_tile_node(row : @view.View, look : @ui.Style, label : String, press : () -> Unit, face : (@view.View) -> Unit) -> Unit {
   @sf.action_box_node(row, fn() { label }, fn(_) { press() }, fn(t) {
-    @sf.style_node(t, fn() { if t.pressed() { look.then(tile_pressed) } else { look } }, in_row=true)
+    @sf.style_node(t, fn() { if t.press_shown() { look.then(tile_pressed) } else { look } }, in_row=true)
     face(t)
   })
   |> ignore

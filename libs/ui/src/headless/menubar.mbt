@@ -99,9 +99,9 @@ pub fn MenubarTrigger::hovered(self : MenubarTrigger) -> Bool {
 }
 
 ///|
-/// Whether a finger or the pointer is held on this trigger now (View::pressed).
+/// Whether visual press feedback is shown on this trigger now (`View::press_shown`, delayed in scrollers); read `node.pressed()` for immediate input logic.
 pub fn MenubarTrigger::pressed(self : MenubarTrigger) -> Bool {
-  self.node.pressed()
+  self.node.press_shown()
 }
 
 ///|

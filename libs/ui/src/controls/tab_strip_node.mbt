@@ -280,7 +280,7 @@ pub fn tab_strip_node(parent : @view.View, spec : TabStripSpec, loc~ : SourceLoc
               let is_front = fn() { front_of(key) }
               let on_shut = fn() {
                 match shut.val {
-                  Some(x) => x.pointed() || x.pressed()
+                  Some(x) => x.pointed() || x.press_shown()
                   None => false
                 }
               }

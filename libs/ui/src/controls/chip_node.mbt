@@ -291,7 +291,7 @@ fn select_chip_look(
   content : (@view.View) -> Unit,
 ) -> Unit {
   let hand = @motion.NodeWay::new(0.0)
-  v.reacts(fn() { !disabled() && (v.pointed() || v.pressed() || v.focus_shown()) }, fn(lit) {
+  v.reacts(fn() { !disabled() && (v.pointed() || v.press_shown() || v.focus_shown()) }, fn(lit) {
     hand.go_ms(v, if lit { 1.0 } else { 0.0 }, dur_ms)
   })
   v

@@ -231,7 +231,7 @@ fn toast_look(
     |> ignore
     // its action: a capsule in its end, concentric with it, while it has one
     tb.show(acting, fn(a) {
-      let lit = fn() { a.pointed() || a.pressed() }
+      let lit = fn() { a.pointed() || a.press_shown() }
       a
       .row(Is(true))
       .min_height(Is(Some(toast_action_h)))

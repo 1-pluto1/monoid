@@ -136,21 +136,36 @@ fn SwipeActions::apply_offset(self : SwipeActions, raw : Double) -> Double {
 }
 
 ///|
-/// Attach horizontal swipe gesture handling (`on_drag`) to `v`.
-/// Locks horizontally only when `|dx| > |dy|` past `slop`, leaving vertical gestures free for list scrolling.
+/// Attach horizontal swipe gesture handling (`View::claims` + `on_drag`) to `v`.
+/// Claims the drag only when `|dx| > slop` and `|dx| > 2 * |dy|` (matching chat row swipe disambiguation) toward a
+/// direction that has actions or closes an already-open tray, leaving vertical and diagonal drags free for an outer
+/// `View::scrolls` list to scroll. Subtracts the signed `slop` threshold on claim so movement starts continuously from
+/// 0 with no jump and identical results across frame rates (slow open requires `threshold * width + slop` total travel
+/// from touch-down; velocity flick thresholds are unaffected).
 pub fn SwipeActions::bind(self : SwipeActions, v : @view.View) -> Unit {
-  let able = fn() { !(self.disabled_)() }
   let start_wx = Ref(0.0)
-  let start_wy = Ref(0.0)
   let start_offset = Ref(0.0)
-  // 0 = undecided, 1 = locked horizontal, -1 = locked vertical (ignored)
-  let axis = Ref(0)
+  let claimed = Ref(false)
+  let slop_shifted = Ref(false)
+  let swipes_on = fn(dx : Double, dy : Double) -> Bool {
+    if @signals.untracked(self.disabled_) || (self.left_width <= 0.0 && self.right_width <= 0.0) {
+      return false
+    }
+    let ax = dx.abs()
+    let ay = dy.abs()
+    if !(ax > self.slop && ax > 2.0 * ay) {
+      return false
+    }
+    let cur = self.offset_.untracked()
+    cur != 0.0 || (dx > 0.0 && self.left_width > 0.0) || (dx < 0.0 && self.right_width > 0.0)
+  }
   v
-  .presses(By(able))
+  .claims(swipes_on)
   .on_drag(fn(d) {
     if (self.disabled_)() || (self.left_width <= 0.0 && self.right_width <= 0.0) {
-      if axis.val == 1 {
-        axis.val = 0
+      if claimed.val {
+        claimed.val = false
+        slop_shifted.val = false
         self.dragging_.set(false)
         self.set_snapped(self.open_side_.untracked())
       }
@@ -159,31 +174,27 @@ pub fn SwipeActions::bind(self : SwipeActions, v : @view.View) -> Unit {
     match d.kind {
       Down => {
         start_wx.val = d.wx
-        start_wy.val = d.wy
         start_offset.val = self.offset_.untracked()
-        axis.val = 0
+        claimed.val = true
+        slop_shifted.val = false
+        self.dragging_.set(true)
       }
       Moved => {
-        let dx = d.wx - start_wx.val
-        let dy = d.wy - start_wy.val
-        if axis.val == 0 {
-          let ax = dx.abs()
-          let ay = dy.abs()
-          if ax >= self.slop || ay >= self.slop {
-            if ax > ay {
-              axis.val = 1
-              self.dragging_.set(true)
-            } else {
-              axis.val = -1
-            }
+        guard claimed.val else { return }
+        if !slop_shifted.val {
+          let raw_dx = d.wx - start_wx.val
+          if raw_dx != 0.0 {
+            start_wx.val = start_wx.val + (if raw_dx > 0.0 { self.slop } else { -self.slop })
+            slop_shifted.val = true
           }
         }
-        if axis.val == 1 {
-          self.offset_.set(self.apply_offset(start_offset.val + dx))
-        }
+        let eff_dx = d.wx - start_wx.val
+        self.offset_.set(self.apply_offset(start_offset.val + eff_dx))
       }
       Up => {
-        if axis.val == 1 {
+        if claimed.val {
+          claimed.val = false
+          slop_shifted.val = false
           self.dragging_.set(false)
           let cur = self.offset_.untracked()
           let vx_ps = d.vx() * 1000.0
@@ -212,14 +223,14 @@ pub fn SwipeActions::bind(self : SwipeActions, v : @view.View) -> Unit {
           }
           self.set_snapped(target)
         }
-        axis.val = 0
       }
       Off => {
-        if axis.val == 1 {
+        if claimed.val {
+          claimed.val = false
+          slop_shifted.val = false
           self.dragging_.set(false)
           self.set_snapped(self.open_side_.untracked())
         }
-        axis.val = 0
       }
     }
   })

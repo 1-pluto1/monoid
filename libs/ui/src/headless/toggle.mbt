@@ -48,9 +48,9 @@ pub fn Toggle::disabled(self : Toggle) -> Bool {
 }
 
 ///|
-/// Whether a finger or the pointer is held on it now (View::pressed).
+/// Whether visual press feedback is shown on it now (`View::press_shown`, delayed in scrollers); read `node.pressed()` for immediate input logic.
 pub fn Toggle::pressed(self : Toggle) -> Bool {
-  self.node.pressed()
+  self.node.press_shown()
 }
 
 ///|

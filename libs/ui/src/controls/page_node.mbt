@@ -12,8 +12,8 @@
 pub fn lit_node(v : @view.View) -> Bool {
   v.focus_shown() ||
   (match @ui.pointing() {
-    Mouse => v.pointed() || v.pressed()
-    Finger => v.pressed()
+    Mouse => v.pointed() || v.press_shown()
+    Finger => v.press_shown()
   })
 }
 

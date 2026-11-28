@@ -511,13 +511,16 @@ test "connects_node: unified card hairlines fade smoothly on mouse hover and tou
   assert_eq(sl_sep_alpha_at(tm, seps[0].0), rest_alpha, msg="leaving Conn-B restores A|B")
   assert_eq(sl_sep_alpha_at(tm, seps[1].0), rest_alpha, msg="leaving Conn-B restores B|C")
 
-  // Touch press-and-hold fades both adjacent hairlines and restores on release
+  // Touch press-and-hold inside scroller waits tap_indication_ms before fading adjacent hairlines, and restores on release
   let tf = cn_compact_tester(items, w=390.0, h=844.0, platform=2)
   let fseps = sl_seps_drawn(tf)
   assert_eq(fseps.length(), 2, msg="touch expected 2 connects hairlines")
   let (fbx, fby, fbw, fbh) = tf.rect_of("Conn-B").unwrap()
   tf.press_at(fbx + fbw / 2.0, fby + fbh / 2.0)
-  tf.run_for(@sf.dur_ms + 30.0)
+  tf.run_for(@ui.tap_indication_ms / 2.0)
+  assert_eq(sl_sep_alpha_at(tf, fseps[0].0), rest_alpha, msg="touch brief hold before tap_indication_ms keeps A|B opaque")
+  assert_eq(sl_sep_alpha_at(tf, fseps[1].0), rest_alpha, msg="touch brief hold before tap_indication_ms keeps B|C opaque")
+  tf.run_for(@ui.tap_indication_ms / 2.0 + @sf.dur_ms + 30.0)
   assert_eq(sl_sep_alpha_at(tf, fseps[0].0), 0, msg="touch hold Conn-B fades A|B")
   assert_eq(sl_sep_alpha_at(tf, fseps[1].0), 0, msg="touch hold Conn-B fades B|C")
   tf.release(4.0, 4.0)

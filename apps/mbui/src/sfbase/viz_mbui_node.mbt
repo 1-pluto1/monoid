@@ -2281,9 +2281,9 @@ fn viz_render_node(
               fn(head) {
                 @sf.style_node(head, fn() { head_style })
                 head
-                .ground(By(fn() { if head.pressed() { @ui.tree_theme().color(TintStrong) } else { 0L } }))
+                .ground(By(fn() { if head.press_shown() { @ui.tree_theme().color(TintStrong) } else { 0L } }))
                 |> ignore
-                @sf.hover_ground_node(head, on=fn() { !head.pressed() })
+                @sf.hover_ground_node(head, on=fn() { !head.press_shown() })
                 head.box(fn(titles) {
                   @sf.style_node(titles, fn() { viz_col_s0_5.then(@ui.style(w=@sf.grow, min_w=viz_zero_len)) }, in_row=true)
                   titles.box(fn(w) {

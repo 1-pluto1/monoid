@@ -614,10 +614,8 @@ fn remote_row_node(
       }
     })
     let row = slot.box(fn(_) {  })
-    // (pressed by a finger, shown so once it has stayed tap_indication_ms: one going on to scroll lights nothing)
-    let (press_lit, press_down, press_up) = @sf.press_late(row)
     // its ground: the pointer's eased in and out, the selected one's while it is the tab shown beside the list
-    // (nav_ground_by's); a finger's press the ink at 5%
+    // (nav_ground_by's); a finger's press the ink at 5% (delayed inside the scroller via View::press_shown)
     let hand = if !finger {
       @motion.hover_fade(row, fn() { @sf.lit_in_node(slot) }, duration_ms=@sf.dur_ms)
     } else {
@@ -633,7 +631,7 @@ fn remote_row_node(
       } else {
         @sf.over(@sf.alpha(p.hover, h * (1.0 - o)), @sf.alpha(p.selected, o))
       }
-      if finger && press_lit() {
+      if finger && row.press_shown() {
         @sf.over(base, @sf.alpha(p.text, 0.05))
       } else {
         base
@@ -752,8 +750,6 @@ fn remote_row_node(
       },
       @ui.long_press_ms,
       fn(d) { if finger { open_menu(d.wx, d.wy, true) } },
-      down=fn(_) { press_down() },
-      up=press_up,
     )
   })
   |> ignore

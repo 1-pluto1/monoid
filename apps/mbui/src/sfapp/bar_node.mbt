@@ -415,7 +415,7 @@ fn bar_holder_node(holder : @view.View, src : Source, ws : () -> Workspace?) -> 
       d.radius(Is(act_size / 2.0)),
       fn() {
         let t = bar_moment(d, Notch, bar_k_until())
-        let spot = if d.pressed() { Some((act_size / 2.0, act_size / 2.0)) } else { None }
+        let spot = if d.press_shown() { Some((act_size / 2.0, act_size / 2.0)) } else { None }
         (spot, bar_merge_at(t))
       },
       share_when_unmerged=true,

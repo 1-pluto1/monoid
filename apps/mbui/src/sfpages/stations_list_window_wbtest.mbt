@@ -579,7 +579,12 @@ test "stations_list: hairline dividers fade smoothly on mouse hover, finger pres
   let fy_cd = f_seps[2].0
   let (fbx, fby, fbw, fbh) = tf.rect_of("Station-B").unwrap()
   tf.press_at(fbx + fbw / 2.0, fby + fbh / 2.0)
-  tf.run_for(@sf.dur_ms / 2.0)
+  // Inside a scroller, a brief touch before tap_indication_ms must not flash pressed highlights or fade hairlines
+  tf.run_for(@ui.tap_indication_ms / 2.0)
+  assert_eq(sl_sep_alpha_at(tf, fy_ab), rest_alpha, msg="touch brief hold: A|B stays opaque before tap_indication_ms")
+  assert_eq(sl_sep_alpha_at(tf, fy_bc), rest_alpha, msg="touch brief hold: B|C stays opaque before tap_indication_ms")
+  // Once held past tap_indication_ms, adjacent dividers fade out smoothly over dur_ms
+  tf.run_for(@ui.tap_indication_ms / 2.0 + @sf.dur_ms / 2.0)
   let fmid_ab = sl_sep_alpha_at(tf, fy_ab)
   let fmid_bc = sl_sep_alpha_at(tf, fy_bc)
   assert_true(fmid_ab > 0 && fmid_ab < rest_alpha, msg="touch hold: A|B fades smoothly, got \{fmid_ab}")

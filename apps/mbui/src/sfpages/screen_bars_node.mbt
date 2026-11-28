@@ -42,7 +42,7 @@ fn screen_round_node(
     .lies_along(Is(Middle))
     .ground(By(fn() { if lit() { @sf.alpha(@ui.tree_theme().color(Fg), 0.1) } else { 0L } }))
     |> ignore
-    @sf.hover_ground_node(v, lit=Some(fn() { v.pointed() || v.pressed() || v.focus_shown() }))
+    @sf.hover_ground_node(v, lit=Some(fn() { v.pointed() || v.press_shown() || v.focus_shown() }))
     @sf.icon_node(v, "", if pane { round_bar_icon } else { round_icon }, By(fn() { @ui.tree_theme().color(Fg) }), name_now=icon)
     |> ignore
     @sf.tip_node(pg.tips, v, label) |> ignore
@@ -982,7 +982,7 @@ fn foot_action_node(
   @sf.action_box_node(parent, label, on=lit, press, fn(v) {
     @sf.style_node(v, fn() { foot_action_box }, in_row=true)
     v.ground(By(fn() { if lit() { @sf.alpha(@ui.tree_theme().color(Fg), 0.1) } else { 0L } })) |> ignore
-    @sf.hover_ground_node(v, lit=Some(fn() { v.pressed() }))
+    @sf.hover_ground_node(v, lit=Some(fn() { v.press_shown() }))
     @sf.icon_node(v, icon, round_icon, By(fn() { @ui.tree_theme().color(Fg) })) |> ignore
     @sf.words_node(v, words, fn() { foot_action_words }) |> ignore
     if felt != 0 {
@@ -1253,7 +1253,7 @@ fn mouse_left_round_node(cap : @view.View, s : ScreenSess, u : ScreenUi) -> Unit
     )
     |> ignore
     v.ground(By(fn() { if held() { @ui.tree_theme().color(Fg) } else { 0L } })) |> ignore
-    @sf.hover_ground_node(v, lit=Some(fn() { v.pressed() && !held() }))
+    @sf.hover_ground_node(v, lit=Some(fn() { v.press_shown() && !held() }))
     @sf.icon_node(v, "mouse-left", round_icon, By(fn() { @ui.tree_theme().color(if held() { Bg } else { Fg }) })) |> ignore
     button_felt_node(v, btn_primary)
   })

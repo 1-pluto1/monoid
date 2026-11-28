@@ -20,7 +20,7 @@ pub fn check_row_node(
   parent.box(made_for=loc, fn(r) {
     style_node(r, fn() { check_row_box.then(@ui.style(min_h=Fixed(theme().items.least))) })
     // (check_row_box's hovered{bg=Hover} pressed{bg=Hover}: a mouse over any of it, or it pressed)
-    hover_ground_node(r, on=fn() { !disabled() }, lit=Some(fn() { hovered_in_node(r) || r.pressed() || r.focus_shown() }))
+    hover_ground_node(r, on=fn() { !disabled() }, lit=Some(fn() { hovered_in_node(r) || r.press_shown() || r.focus_shown() }))
     // (the row pressed, past its box: ticked or not as its box would be)
     presses_node(r, on=fn() { !disabled() }, fn() {
       if !@signals.untracked(disabled) {

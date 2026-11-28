@@ -34,7 +34,7 @@ pub fn bar_pill_key_press_node(v : @view.View) -> Unit {
   hover_ground_node(
     v,
     color=fn() {
-      if v.pressed() {
+      if v.press_shown() {
         bar_pill_press_ink(solid=v.glass_solid())
       } else {
         @glass.liquid_pill_hover_ink(solid=v.glass_solid())

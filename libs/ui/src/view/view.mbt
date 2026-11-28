@@ -3212,6 +3212,7 @@ pub fn Tree::dispose(self : Tree) -> Unit {
   self.unsettled_clean = false
   self.answer_unsettled = false
   self.rest_book_clear()
+  self.press_delay_clear()
   self.inputs_in.clear()
   self.inputs_at.clear()
   self.inputs_whole = false
@@ -6097,11 +6098,17 @@ pub fn Tree::lit_row_state(self : Tree, id : NodeId) -> (Bool, Bool, Bool) {
   }
   let n = self.nodes[id.at]
   let has_ground_bind = n.prop_has(Ground.ord()) || n.prop_has(GroundOver.ord())
-  let watches_hand = n.pointed_cell is Some(_) || n.pressed_cell is Some(_) || n.pointed_in_cell is Some(_)
+  let watches_hand = n.pointed_cell is Some(_) ||
+    n.pressed_cell is Some(_) ||
+    n.pointed_in_cell is Some(_) ||
+    self.press_shown_watched(id)
   let lights = ((n.ground_read | n.ground_over_read) & (ground_read_hand | ground_read_focus)) != 0 ||
     (has_ground_bind && watches_hand)
   let chooses = n.on_pointer_moved is Some(_)
-  let hand_on = self.pointed == Some(id) || self.pressing == Some(id) || self.pointed_within_at(id.at)
+  let hand_on = self.pointed == Some(id) ||
+    self.pressing == Some(id) ||
+    self.press_shown_id() == Some(id) ||
+    self.pointed_within_at(id.at)
   (lights, chooses, hand_on)
 }
 
@@ -11002,6 +11009,7 @@ fn View::let_go(self : View) -> Unit {
   n.flex.children_cut(0)
   n.flex.holds_gone = false
   self.tree.rest_scope_dispose(self.at, self.gen)
+  self.tree.press_shown_drop(self.at, self.gen)
   let parent = n.parent
   if !in_subtree && parent >= 0 {
     self.tree.marked_up(parent, true, true, false, false, true)
@@ -11129,6 +11137,7 @@ fn View::retire_parked(self : View) -> Unit {
     self.tree.hosting = -1
   }
   self.tree.rest_scope_dispose(self.at, self.gen)
+  self.tree.press_shown_drop(self.at, self.gen)
   n.parent = -1
   self.tree.parked_garbage.push((self.at, self.gen))
 }
@@ -18836,9 +18845,10 @@ pub fn View::holds_for(self : View, ms : Double, later? : Bool = false) -> (() -
 }
 
 ///|
-/// The node held now (`h`, none): the one it was on and the one it is on now told, each by its own cell (View::pressed),
-/// nothing else.
-fn Tree::held_to(self : Tree, h : NodeId?) -> Unit {
+/// The node held now (`h`, none): updates `View::pressed()` (`pressed_cell`) immediately for input logic, and updates
+/// `View::press_shown()` for visual press feedback (delayed in scrollers unless `immediate=true`, e.g. handed-off
+/// holds from `Tree::hand_on`).
+fn Tree::held_to(self : Tree, h : NodeId?, immediate? : Bool = false) -> Unit {
   let was = self.held
   self.held = h
   // (held by another, or by none: what a still hold of the one before was to hand on, no more)
@@ -18850,6 +18860,7 @@ fn Tree::held_to(self : Tree, h : NodeId?) -> Unit {
     self.pressing = h
     self.hand_told(was, fn(n) { n.pressed_cell }, false)
     self.hand_told(h, fn(n) { n.pressed_cell }, true)
+    self.press_shown_update(h, immediate)
     // (what a still pointer is over worked out again: held by what captures it, nothing else is pointed at; let go, what
     // is under it is again: Tree::pointed_of)
     self.hits_bump()

@@ -664,7 +664,7 @@ fn size_key_node(parent : @view.View, p : ServicePage, tips : @sf.TipLayer) -> U
       })
       v.fits(Is(true)) |> ignore
       @sf.hover_ground_node(v, on=fn() { p.viewport.get() is None && !moving() }, lit=Some(fn() {
-        v.pointed() || v.pressed() || v.focus_shown()
+        v.pointed() || v.press_shown() || v.focus_shown()
       }))
       @sf.icon_node(
         v,

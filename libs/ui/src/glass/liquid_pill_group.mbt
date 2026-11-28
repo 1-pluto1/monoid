@@ -66,7 +66,7 @@ pub fn liquid_pill_press_ink(solid? : Bool = false) -> Int64 {
 pub fn bind_pill_press(child : @view.View) -> Unit {
   // (pressed by a hand in the window: not as every control is told at once (Tree::lit_all, a Tester's measure of the
   // looks), as a control's own sink is not (@motion.press_feel))
-  bind_pill_press_by(child, fn() { child.pressed() && child.window_held() })
+  bind_pill_press_by(child, fn() { child.press_shown() && child.window_held() })
 }
 
 ///|

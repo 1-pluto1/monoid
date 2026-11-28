@@ -64,7 +64,7 @@ fn page_mark_mode_node(parent : @view.View, src : Source, p : ServicePage, site 
     // ×: marking left
     @sf.action_box_node(bar, fn() { @sf.t("common.close") }, fn(_) { page_marks_leave(p, site) }, disabled=busy, fn(v) {
       @sf.style_node(v, fn() { mark_close }, in_row=true)
-      @sf.hover_ground_node(v, on=fn() { !busy() }, lit=Some(fn() { v.pointed() || v.pressed() || v.focus_shown() }))
+      @sf.hover_ground_node(v, on=fn() { !busy() }, lit=Some(fn() { v.pointed() || v.press_shown() || v.focus_shown() }))
       @sf.icon_node(v, "close", mark_small_icon, By(fn() { @sf.theme().p.muted })) |> ignore
     })
     |> ignore
@@ -332,7 +332,7 @@ fn mark_note_node(
       m.note.let_go()
     }, fn(v) {
       @sf.style_node(v, fn() { mark_note_remove }, in_row=true)
-      @sf.hover_ground_node(v, lit=Some(fn() { v.pointed() || v.pressed() || v.focus_shown() }))
+      @sf.hover_ground_node(v, lit=Some(fn() { v.pointed() || v.press_shown() || v.focus_shown() }))
       @sf.icon_node(v, "trash", note_icon, By(fn() { @sf.theme().p.muted })) |> ignore
     })
     |> ignore

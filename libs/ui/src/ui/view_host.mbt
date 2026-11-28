@@ -540,6 +540,15 @@ fn view_made_now(make : (@view.View) -> Unit) -> Unit {
       Mouse => (double_click_ms, double_click_slop)
     }
   })
+  // (a finger's press inside a scrollable container lights View::press_shown() only once it has stayed
+  // tap_indication_ms, so scrolling past rows/buttons never flashes pressed highlights; View::pressed() stays
+  // immediate for input logic, and mouse clicks highlight immediately)
+  t.press_delay_in_scroll(fn() {
+    match pointing() {
+      Finger => tap_indication_ms
+      Mouse => 0.0
+    }
+  })
   // (the focus on one of its nodes let go of at a cause: none's from then, on either side)
   t.on_focus_lost(view_focus_lost)
   // (what its rows leave out or lay out again told: the focus on an old view's field in it let go of then, and given

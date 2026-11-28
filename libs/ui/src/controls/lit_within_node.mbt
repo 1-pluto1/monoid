@@ -9,8 +9,8 @@
 pub fn lit_within_node(v : @view.View, yields_to? : @view.View) -> Bool {
   v.focus_shown() ||
   (match @ui.pointing() {
-    Mouse => (v.pointed_in() && !yielded(yields_to)) || v.pressed()
-    Finger => v.pressed()
+    Mouse => (v.pointed_in() && !yielded(yields_to)) || v.press_shown()
+    Finger => v.press_shown()
   })
 }
 

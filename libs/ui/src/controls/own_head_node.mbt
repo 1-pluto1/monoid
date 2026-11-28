@@ -120,7 +120,7 @@ pub fn own_head_node(
                 fn(_) { f() },
                 fn(n, pressed) {
                   if pressed {
-                    n.alpha(By(fn() { if n.pressed() { head_pressed_alpha } else { 1.0 } })) |> ignore
+                    n.alpha(By(fn() { if n.press_shown() { head_pressed_alpha } else { 1.0 } })) |> ignore
                   }
                   name_words(n)
                 },

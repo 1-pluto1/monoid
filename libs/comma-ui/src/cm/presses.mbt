@@ -8,8 +8,8 @@
 pub fn lit(v : @view.View, on : () -> Bool) -> Bool {
   on() &&
   (match @ui.pointing() {
-    Mouse => v.pointed() || v.pressed()
-    Finger => v.pressed()
+    Mouse => v.pointed() || v.press_shown()
+    Finger => v.press_shown()
   })
 }
 
