@@ -92,6 +92,12 @@ test("a relay sampled long ago has no rate now", () => {
   assert.equal(view.now, null);
   assert.equal(view.open, null);
   assert.equal(relayLoadView("https://r.example", [], now).at, null);
+  // Two recent samples with the same timestamp must not divide by zero.
+  const sameAt = relayLoadView("https://r.example", [
+    { at: now - 60, load: load({ sent: 100, recv: 200, rx: 10, tx: 20 }) },
+    { at: now - 60, load: load({ sent: 500, recv: 600, rx: 50, tx: 60 }) },
+  ], now);
+  assert.equal(sameAt.now, null);
 });
 
 test("relays send their load from their own address; the console shows each relay's", async () => {

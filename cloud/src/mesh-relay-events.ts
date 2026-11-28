@@ -12,6 +12,8 @@ export function watchRequest(body: unknown, now: number): { node: string; genera
   return { node: value.node, generation: value.generation, at: value.at };
 }
 type Listener = { node: string; generation: number; update: (relays: MeshRelay[]) => void };
+const encoder = new TextEncoder();
+const HEARTBEAT = encoder.encode('{"heartbeat":true}\n');
 export class MeshRelayEvents {
   #listeners = new Set<Listener>();
   #seen = new Map<string, number[]>();
@@ -37,14 +39,14 @@ export class MeshRelayEvents {
     };
     const listener: Listener = { node, generation, update: relays => {
       if (stopped) return;
-      pending = new TextEncoder().encode(JSON.stringify({ relays }) + "\n");
+      pending = encoder.encode(JSON.stringify({ relays }) + "\n");
       ending = !relays.some(r => r.node === node && r.generation === generation);
       flush();
     } };
     return new ReadableStream<Uint8Array>({
       start: value => {
         controller = value; this.#listeners.add(listener); listener.update(initial);
-        heartbeat = setInterval(() => { if (!pending && !stopped) { pending = new TextEncoder().encode('{"heartbeat":true}\n'); flush(); } }, 20_000); // timer: keep the stream alive without reading the registry again.
+        if (!stopped) heartbeat = setInterval(() => { if (!pending && !stopped) { pending = HEARTBEAT; flush(); } }, 20_000); // timer: keep the stream alive without reading the registry again.
       },
       pull: flush,
       cancel: stop,

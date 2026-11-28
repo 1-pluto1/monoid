@@ -115,7 +115,7 @@ export function relayLoadView(url: string, received: Sample[], now: number): Rel
   const last = samples.at(-1);
   const recent = samples.filter((s) => s.at >= now - NOW);
   let current: RelayLoadView["now"] = null;
-  if (recent.length >= 2) {
+  if (recent.length >= 2 && recent.at(-1)!.at > recent[0]!.at) {
     const secs = recent.at(-1)!.at - recent[0]!.at;
     // Step by step: a restart between two of them counts from zero there.
     const sum = (key: keyof Load) => recent.slice(1).reduce((n, b, i) => n + grew(recent[i]!.load[key], b.load[key]), 0);
