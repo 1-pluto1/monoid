@@ -3,11 +3,12 @@
 // would have the whole of it read again at full price; instead the agent reads back what it needs (session_history,
 // chat_history). The runtime sessions a session ran in are kept in order (store `runtime_sessions`), and its history
 // reads them as one (read/tail.ts ChainTail).
-import { access, copyFile, mkdir } from "node:fs/promises";
+import { access, mkdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { coldAfresh, coldWorth } from "../../../client/core-ts/src/cache-policy.ts";
 import { LONG_CHAT, afresh, cleared, longChat, resumeLost, threadAddress } from "../agents/instructions.ts";
 import type { Profile } from "../agents/runtime.ts";
+import { cloneFile } from "../ops/clone.ts";
 import { log } from "../ops/log.ts";
 import { transcriptOf } from "../read/machine.ts";
 import { usageNow } from "../read/usage.ts";
@@ -82,7 +83,8 @@ export function toldLongChat(hub: Hub, key: string): string | null {
 /// Claude's subagents `ids` of runtime session `from`, stopped with its process, copied to session `to` (just started on
 /// `on`) so that SendMessage takes them up there where they stopped: a subagent's transcript is in its session's
 /// (<project>/<session>/subagents/agent-<id>.jsonl, with its .meta.json). The ids copied. Nothing of it on the
-/// station's thread.
+/// station's thread. Cloned where the volume can (Btrfs, APFS): a long subagent carried through every account a chat
+/// runs out of was copied whole each time, 28 copies of 120–140 MB in one chat on a Linux station.
 export async function carrySubagents(hub: Hub, from: string, to: string, on: Profile, ids: string[]): Promise<string[]> {
   if (ids.length === 0 || on.runtime !== "claude") return [];
   const { dataDir, profiles } = hub.config();
@@ -96,7 +98,7 @@ export async function carrySubagents(hub: Hub, from: string, to: string, on: Pro
     try {
       if (!(await there(join(source, `agent-${id}.jsonl`)))) continue;
       await mkdir(target, { recursive: true });
-      for (const ext of ["jsonl", "meta.json"]) if (await there(join(source, `agent-${id}.${ext}`))) await copyFile(join(source, `agent-${id}.${ext}`), join(target, `agent-${id}.${ext}`));
+      for (const ext of ["jsonl", "meta.json"]) if (await there(join(source, `agent-${id}.${ext}`))) await cloneFile(join(source, `agent-${id}.${ext}`), join(target, `agent-${id}.${ext}`));
       carried.push(id);
     } catch (error) {
       log.warn("session", "could not carry a subagent to the new runtime session", { from, to, subagent: id, error: (error as Error).message });

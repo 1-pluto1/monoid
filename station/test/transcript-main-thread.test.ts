@@ -5,7 +5,7 @@
 // `prepare`): nothing of node:fs's synchronous calls (station/AGENTS.md, the main thread waits on nothing). Each looked
 // through every Claude project and every day of Codex's rollouts on the station's thread before, seconds of it.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -106,6 +106,10 @@ test("a session's subagents are carried to its new runtime session waiting on no
   const calls = await syncCalls(async () => void (carried = await carrySubagents(hub, "from", "to", on, ["x", "y", "gone"])));
   assert.deepEqual(calls, []);
   assert.deepEqual(carried, ["x", "y"]);
+  const target = join(home, "projects", "-w", "to", "subagents");
+  assert.equal(readFileSync(join(target, "agent-x.jsonl"), "utf8"), "x\n");
+  assert.equal(readFileSync(join(target, "agent-x.meta.json"), "utf8"), "{}");
+  assert.equal(readFileSync(join(target, "agent-y.jsonl"), "utf8"), "y\n");
 });
 
 test("an archived session's files are found where no locator is, waiting on no file", async () => {
