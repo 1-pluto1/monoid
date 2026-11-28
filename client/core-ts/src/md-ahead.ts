@@ -61,6 +61,7 @@ export class MdAhead {
   readonly #queue: Ahead[] = [];
   readonly #queued = new Set<string>();
   readonly #waiting = new Map<string, Set<string>>();
+  readonly #waitingCounts = new Map<string, number>();
   /// A kept entry is immutable: reuse its text's key while that entry is held, without keeping the entry alive.
   readonly #keys = new WeakMap<object, string>();
   #running = false;
@@ -187,9 +188,16 @@ export class MdAhead {
   refresh(station: string, of: string, text: string): void {
     const key = mdKey(text);
     const id = `${station}\u0001${key}`;
-    const waiting = this.#waiting.get(id) ?? new Set<string>();
-    waiting.add(of);
-    this.#waiting.set(id, waiting);
+    let waiting = this.#waiting.get(id);
+    if (!waiting) {
+      waiting = new Set<string>();
+      this.#waiting.set(id, waiting);
+    }
+    if (!waiting.has(of)) {
+      waiting.add(of);
+      const countKey = `${station}\u0001${of}`;
+      this.#waitingCounts.set(countKey, (this.#waitingCounts.get(countKey) ?? 0) + 1);
+    }
     this.#enqueue({ station, of, text, key }, true);
     this.#run();
   }
@@ -227,12 +235,20 @@ export class MdAhead {
             if (store !== undefined && !store.has(next.key)) timed("md.ahead", () => refreshMarkdown(next.text, store, oldMdKey(store, next.key, 1) ?? undefined));
             const waiting = this.#waiting.get(id);
             this.#waiting.delete(id);
-            if (store !== undefined) for (const of of waiting ?? []) {
-              const prefix = `${next.station}\u0001`;
-              if (![...this.#waiting].some(([other, owners]) => other.startsWith(prefix) && owners.has(of))) told.push([next.station, of]);
+            if (waiting !== undefined) {
+              for (const of of waiting) {
+                const countKey = `${next.station}\u0001${of}`;
+                const left = (this.#waitingCounts.get(countKey) ?? 1) - 1;
+                if (left <= 0) {
+                  this.#waitingCounts.delete(countKey);
+                  if (store !== undefined) told.push([next.station, of]);
+                } else {
+                  this.#waitingCounts.set(countKey, left);
+                }
+              }
+              // (one a view waits for goes alone: it is told at once)
+              break;
             }
-            // (one a view waits for goes alone: it is told at once)
-            if (waiting !== undefined) break;
           }
           // what the step read, written in one transaction before what showed an older tree is made again
           this.#data.flushMd();
