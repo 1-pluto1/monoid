@@ -285,3 +285,29 @@ test "morph_glass.set on layer 7 updates rendered glass immediately without touc
   assert_eq(t.drawn_glass().length(), 2, msg="clearing morph_glass to None on layer 7 must restore base glass")
   set_dark(None)
 }
+
+///|
+test "DampedDrag::set_bounds invalidates reactive progress computed" {
+  let host_ref : Ref[@view.View?] = Ref(None)
+  let t = glass_case(false, false, fn(page) {
+    page.box(fn(b) {
+      b.width(Is(Some(100.0))).height(Is(Some(40.0))) |> ignore
+      host_ref.val = Some(b)
+    })
+    |> ignore
+  })
+  t.draw()
+  guard host_ref.val is Some(host) else { @halt.saying("missing host view") }
+  let dd = DampedDrag::new(0.5, lo=0.0, hi=1.0, held_scale=1.2)
+  dd.attach(host)
+  let c = @signals.computed(fn(_) { dd.progress(host) })
+  assert_true((c.get() - 0.5).abs() < 1.0e-6)
+  assert_eq(dd.bounds_seq.untracked(), 0)
+  dd.set_bounds(lo=0.0, hi=2.0)
+  assert_true((c.get() - 0.25).abs() < 1.0e-6)
+  assert_eq(dd.bounds_seq.untracked(), 1)
+  dd.set_bounds(lo=0.0, hi=2.0)
+  assert_eq(dd.bounds_seq.untracked(), 1)
+  assert_true((c.get() - 0.25).abs() < 1.0e-6)
+  set_dark(None)
+}

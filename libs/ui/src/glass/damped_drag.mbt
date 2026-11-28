@@ -42,6 +42,7 @@ pub struct DampedDrag {
   priv gest_owner : Ref[@view.View?]
   priv gest_seq : @signals.Signal[Int]
   priv host_seq : @signals.Signal[Int]
+  priv bounds_seq : @signals.Signal[Int]
   priv last : Ref[(Double, Double)?]
   priv letting_go : Ref[(() -> Unit)?]
   priv stilling : Ref[(() -> Unit)?]
@@ -78,6 +79,7 @@ pub fn DampedDrag::new(
     gest_owner: Ref(None),
     gest_seq: @signals.signal(0),
     host_seq: @signals.signal(0),
+    bounds_seq: @signals.signal(0),
     last: Ref(None),
     letting_go: Ref(None),
     stilling: Ref(None),
@@ -268,8 +270,11 @@ pub fn DampedDrag::drop_lens(self : DampedDrag) -> Unit {
 ///|
 /// Update the drag bounds (for controls whose item count may change dynamically).
 pub fn DampedDrag::set_bounds(self : DampedDrag, lo~ : Double, hi~ : Double) -> Unit {
-  self.lo = lo
-  self.hi = hi
+  if lo != self.lo || hi != self.hi {
+    self.lo = lo
+    self.hi = hi
+    self.bounds_seq.set(self.bounds_seq.untracked() + 1)
+  }
 }
 
 ///|
@@ -289,6 +294,7 @@ pub fn DampedDrag::value(self : DampedDrag, n : @view.View) -> Double {
 ///|
 /// How far along its range its value is as `n` is drawn (0 at `lo`, 1 at `hi`).
 pub fn DampedDrag::progress(self : DampedDrag, n : @view.View) -> Double {
+  let _ = self.bounds_seq.get()
   let span = self.hi - self.lo
   if span <= 0.0 {
     0.0
