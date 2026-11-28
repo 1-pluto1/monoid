@@ -143,7 +143,9 @@ const joinTyped = (folder: string, sub: string) => {
 export function resolveTyped(typed: string, stations: readonly Named[], from: { station: string; abs: string }): Typed | null {
   const trimmedInput = typed.trim();
   const colon = typed.indexOf(":");
-  const named = colon > 0 && !/^[A-Za-z]:(?:$|[\\/])/.test(trimmedInput) ? typed.slice(0, colon).trim().toLowerCase() : null;
+  // (`C:` alone is a drive only where the folder shown is on Windows: elsewhere it names a station, such as one called `c`)
+  const drive = /^[A-Za-z]:[\\/]/.test(trimmedInput) || (/^[A-Za-z]:$/.test(trimmedInput) && driveRootOf(from.abs) !== null);
+  const named = colon > 0 && !drive ? typed.slice(0, colon).trim().toLowerCase() : null;
   const s = named === null ? stations.find((v) => v.station === from.station) : stations.find((v) => v.name.toLowerCase() === named) ?? stations.find((v) => v.name.toLowerCase().startsWith(named));
   if (!s) return null;
   const rest = (named === null ? typed : typed.slice(colon + 1)).trim();

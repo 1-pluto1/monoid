@@ -362,6 +362,9 @@ test("movesOf and resolveTyped handle Windows drives, case-insensitive prefixes,
   // Bare drive letter resolves as the Windows drive root rather than station named "c".
   assert.deepEqual(resolveTyped("C:", stations, from), { station: ST, abs: "C:\\", parent: "C:\\", partial: "" });
   assert.deepEqual(resolveTyped("win:D:", stations, from), { station: ST, abs: "D:\\", parent: "D:\\", partial: "" });
+  // Seen from a station that is not on Windows, a bare letter and colon still names the station.
+  assert.deepEqual(resolveTyped("c:", stations, { station: "ws/c", abs: "/home/c/src" }), { station: "ws/c", abs: "/home/c", parent: "/home/c", partial: "" });
+  assert.deepEqual(resolveTyped("c:", stations, { station: ST, abs: "/Users/alice" })?.station, "ws/c");
   // Station named "c" with non-drive remainder still matches the station.
   assert.deepEqual(resolveTyped("c:~/docs", stations, from), { station: "ws/c", abs: "/home/c/docs", parent: "/home/c", partial: "docs" });
   // Both ~\ and ~/ under a Windows home produce clean backslash paths without mixed separators.
