@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ed25519 } from "@noble/curves/ed25519.js";
-import { Effect } from "effect";
+import { Effect, Fiber } from "effect";
 import { Accounts } from "../src/accounts.ts";
 import { Core } from "../src/core.ts";
 import { keyIdOf } from "../src/app-release.ts";
@@ -429,4 +429,40 @@ test("a_picture_asked_as_kept_is_answered_from_the_device_at_once_or_with_none_i
   assert.deepEqual([k2, [...b2]], ["image/png", [20, 3]]);
   assert.equal(fetched, 1);
   await assert.rejects(run(asks.pictureKept("file:///etc/passwd")));
+});
+
+test("interrupting the leader of Asks.picture cleans up the unsettled entry for waiters and later callers", async () => {
+  const host = new FakeHost();
+  host.onFetch((req) => {
+    if (req.url === "https://p.test/sole.png") return { status: 200, headers: [["content-type", "image/png"]], body: new Uint8Array([4, 5, 6]) };
+    if (req.url === "https://p.test/shared.png") return { status: 200, headers: [["content-type", "image/png"]], body: new Uint8Array([7, 8, 9]) };
+    return jsonResponse(404, {});
+  });
+  const asks = new Asks(host, nothing);
+
+  const waitReq = async (url: string, count: number) => {
+    for (let i = 0; i < 100 && host.requests.filter((r) => r.url === url).length < count; i++) await Promise.resolve();
+    assert.equal(host.requests.filter((r) => r.url === url).length, count);
+  };
+
+  // 1. Sole caller interrupted mid-fetch: a follow-up call starts a fresh fetch and succeeds instead of hanging.
+  host.hold("sole.png");
+  const sole = Effect.runFork(asks.picture("https://p.test/sole.png"));
+  await waitReq("https://p.test/sole.png", 1);
+  await run(Fiber.interrupt(sole));
+  const [soleType, soleBytes] = await run(asks.picture("https://p.test/sole.png"));
+  assert.deepEqual([soleType, [...soleBytes]], ["image/png", [4, 5, 6]]);
+  assert.equal(host.requests.filter((r) => r.url === "https://p.test/sole.png").length, 2);
+
+  // 2. Concurrent waiter seamlessly takes over when the leader is interrupted mid-fetch.
+  host.hold("shared.png");
+  const leader = Effect.runFork(asks.picture("https://p.test/shared.png"));
+  await waitReq("https://p.test/shared.png", 1);
+  const waiter = Effect.runFork(asks.picture("https://p.test/shared.png"));
+  await Promise.resolve();
+  assert.equal(host.requests.filter((r) => r.url === "https://p.test/shared.png").length, 1);
+  await run(Fiber.interrupt(leader));
+  const [sharedType, sharedBytes] = await run(Fiber.join(waiter));
+  assert.deepEqual([sharedType, [...sharedBytes]], ["image/png", [7, 8, 9]]);
+  assert.equal(host.requests.filter((r) => r.url === "https://p.test/shared.png").length, 2);
 });

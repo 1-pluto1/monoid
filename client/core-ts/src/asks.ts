@@ -36,7 +36,7 @@ export const PICTURES_KEY = "pictures";
 export const PICTURES_KEPT = 256;
 export const PICTURES_BYTES = 32 * 1024 * 1024;
 
-type Picture = Deferred.Deferred<[string, Uint8Array], CoreError>;
+type Picture = Deferred.Deferred<[string, Uint8Array] | null, CoreError>;
 /// What is kept: each picture's name and size, the least lately had first; the name of the one standing in for each
 /// not had yet.
 type Kept = { kept: [string, number][]; standIn: Record<string, string> };
@@ -161,49 +161,70 @@ export class Asks {
   picture(url: string): Effect.Effect<[string, Uint8Array], CoreError> {
     return Effect.gen({ self: this }, function* () {
       if (!(url.startsWith("https://") || url.startsWith("http://"))) return yield* Effect.fail(CoreError.invalid(t("core-misc.ask.bad_picture_url")));
-      const failed = this.#pictureFailed.get(url);
-      if (failed !== undefined && this.#host.nowMs() - failed[0] < PICTURE_RETRY_MS) return yield* this.#standIn(url, failed[1]);
-      let entry = this.#pictures.get(url);
-      if (entry) {
-        this.#pictures.delete(url);
-        this.#pictures.set(url, entry);
-      } else {
-        const made = Deferred.makeUnsafe<[string, Uint8Array], CoreError>();
-        entry = { deferred: made, bytes: 0, settled: false };
-        this.#pictures.set(url, entry);
-        this.#trimPictures(url);
-        const fetched = yield* Effect.result(
-          Effect.flatMap(this.#keptPicture(pictureName(url)), (kept) =>
-            kept !== null
-              ? Effect.succeed(kept)
-              : Effect.flatMap(
-                  Effect.mapError(this.#host.fetch({ method: "GET", url: this.#host.pictureVia?.(url) ?? url, headers: [], body: null }), (e) => CoreError.plainly("picture", e, t("core-misc.ask.picture_failed", { error: CoreError.host(e).message }))),
-                  (r) => (r.status !== 200 ? Effect.fail(new CoreError("picture", t("core-misc.ask.picture_failed", { error: r.status }))) : Effect.as(this.#keep(url, header(r, "content-type") ?? "", r.body), [header(r, "content-type") ?? "", r.body] as [string, Uint8Array])),
+      while (true) {
+        const failed = this.#pictureFailed.get(url);
+        if (failed !== undefined && this.#host.nowMs() - failed[0] < PICTURE_RETRY_MS) return yield* this.#standIn(url, failed[1]);
+        let entry = this.#pictures.get(url);
+        if (entry) {
+          this.#pictures.delete(url);
+          this.#pictures.set(url, entry);
+        } else {
+          const made = Deferred.makeUnsafe<[string, Uint8Array] | null, CoreError>();
+          entry = { deferred: made, bytes: 0, settled: false };
+          this.#pictures.set(url, entry);
+          this.#trimPictures(url);
+          let finished = false;
+          const fetched = yield* Effect.ensuring(
+            Effect.tap(
+              Effect.result(
+                Effect.flatMap(this.#keptPicture(pictureName(url)), (kept) =>
+                  kept !== null
+                    ? Effect.succeed(kept)
+                    : Effect.flatMap(
+                        Effect.mapError(this.#host.fetch({ method: "GET", url: this.#host.pictureVia?.(url) ?? url, headers: [], body: null }), (e) => CoreError.plainly("picture", e, t("core-misc.ask.picture_failed", { error: CoreError.host(e).message }))),
+                        (r) => (r.status !== 200 ? Effect.fail(new CoreError("picture", t("core-misc.ask.picture_failed", { error: r.status }))) : Effect.as(this.#keep(url, header(r, "content-type") ?? "", r.body), [header(r, "content-type") ?? "", r.body] as [string, Uint8Array])),
+                      ),
                 ),
-          ),
-        );
-        if (fetched._tag === "Success") {
-          entry.settled = true;
-          entry.bytes = fetched.success[1].byteLength;
-          if (this.#pictures.get(url) === entry) {
-            this.#pictureBytes += entry.bytes;
-            this.#trimPictures(url);
+              ),
+              () => Effect.sync(() => { finished = true; }),
+            ),
+            Effect.sync(() => {
+              if (!finished) {
+                if (this.#pictures.get(url) === entry) this.#pictures.delete(url);
+                Deferred.doneUnsafe(made, Effect.succeed(null));
+              }
+            }),
+          );
+          if (fetched._tag === "Success") {
+            entry.settled = true;
+            entry.bytes = fetched.success[1].byteLength;
+            if (this.#pictures.get(url) === entry) {
+              this.#pictureBytes += entry.bytes;
+              this.#trimPictures(url);
+            }
+            Deferred.doneUnsafe(made, Effect.succeed(fetched.success));
+          } else {
+            if (this.#pictures.get(url) === entry) {
+              this.#pictures.delete(url);
+              this.#pictureBytes -= entry.bytes;
+            }
+            Deferred.doneUnsafe(made, Effect.fail(fetched.failure));
           }
         }
-        Deferred.doneUnsafe(made, fetched._tag === "Success" ? Effect.succeed(fetched.success) : Effect.fail(fetched.failure));
-      }
-      const got = yield* Effect.result(Deferred.await(entry.deferred));
-      if (got._tag === "Failure") {
-        if (this.#pictures.get(url) === entry) {
-          this.#pictures.delete(url);
-          this.#pictureBytes -= entry.bytes;
+        const got = yield* Effect.result(Deferred.await(entry.deferred));
+        if (got._tag === "Failure") {
+          if (this.#pictures.get(url) === entry) {
+            this.#pictures.delete(url);
+            this.#pictureBytes -= entry.bytes;
+          }
+          if (this.#pictureFailed.size >= PICTURES) this.#pictureFailed.delete(this.#pictureFailed.keys().next().value!);
+          this.#pictureFailed.set(url, [this.#host.nowMs(), got.failure]);
+          return yield* this.#standIn(url, got.failure);
         }
-        if (this.#pictureFailed.size >= PICTURES) this.#pictureFailed.delete(this.#pictureFailed.keys().next().value!);
-        this.#pictureFailed.set(url, [this.#host.nowMs(), got.failure]);
-        return yield* this.#standIn(url, got.failure);
+        if (got.success === null) continue;
+        this.#pictureFailed.delete(url);
+        return got.success;
       }
-      this.#pictureFailed.delete(url);
-      return got.success;
     });
   }
 
