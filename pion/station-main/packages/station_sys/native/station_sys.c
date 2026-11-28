@@ -5306,7 +5306,9 @@ typedef struct {
     pid_t pid;
     _Atomic int closing;
     pthread_mutex_t kill_lock;
+    int new_pgid;
     int exited;
+    int reaped;
     int kill_revoked;
 
     int stdin_fd;
@@ -5337,6 +5339,14 @@ static void posix_proc_unref(posix_proc_t *p) {
     int last = (--p->refs == 0);
     pthread_mutex_unlock(&p->ref_lock);
     if (!last) return;
+    if (p->new_pgid && p->exited && !p->reaped) {
+        int st = 0;
+        pid_t wr;
+        do {
+            wr = waitpid(p->pid, &st, WNOHANG);
+        } while (wr < 0 && errno == EINTR);
+        p->reaped = 1;
+    }
     free_chunks(p->stdin_head);
     if (p->stdin_fd >= 0) close(p->stdin_fd);
     if (p->stdout_fd >= 0) close(p->stdout_fd);
@@ -5541,7 +5551,7 @@ static void *posix_stdin_thread(void *arg) {
     return NULL;
 }
 
-static int posix_wait_exited_nowait(pid_t pid) {
+static int posix_wait_exited_nowait(pid_t pid, siginfo_t *out_si) {
     for (;;) {
         siginfo_t si;
         memset(&si, 0, sizeof(si));
@@ -5552,6 +5562,9 @@ static int posix_wait_exited_nowait(pid_t pid) {
         }
         if (si.si_pid == pid &&
             (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED || si.si_code == CLD_DUMPED)) {
+            if (out_si != NULL) {
+                *out_si = si;
+            }
             return 0;
         }
         // macOS XNU wakes waitid(WEXITED | WNOWAIT) on CLD_STOPPED / CLD_CONTINUED
@@ -5567,21 +5580,44 @@ static int posix_wait_exited_nowait(pid_t pid) {
 
 static void *posix_wait_thread(void *arg) {
     posix_proc_t *p = (posix_proc_t *)arg;
-    int wid = posix_wait_exited_nowait(p->pid);
+    siginfo_t si;
+    memset(&si, 0, sizeof(si));
+    int wid = posix_wait_exited_nowait(p->pid, &si);
 
     int status = 0;
     pid_t wr = -1;
-    if (wid == 0) {
+    int deferred_reap = 0;
+    if (wid == 0 && p->new_pgid) {
+        // For new_pgid processes, keep p->pid locked in kernel (unreaped via WNOWAIT) until
+        // sts_proc_close(handle) so kill(-p->pid, sig) remains 100% immune to PID reuse even
+        // after the group leader exits while descendants are still alive.
+        deferred_reap = 1;
+        pthread_mutex_lock(&p->kill_lock);
+        p->exited = 1;
+        if (atomic_load_explicit(&p->closing, memory_order_acquire) && !p->reaped) {
+            do {
+                wr = waitpid(p->pid, &status, WNOHANG);
+            } while (wr < 0 && errno == EINTR);
+            p->reaped = 1;
+        }
+        pthread_mutex_unlock(&p->kill_lock);
+    } else if (wid == 0) {
         pthread_mutex_lock(&p->kill_lock);
         p->exited = 1;
         do {
             wr = waitpid(p->pid, &status, WNOHANG);
         } while (wr < 0 && errno == EINTR);
+        if (wr == p->pid) {
+            p->reaped = 1;
+        }
         pthread_mutex_unlock(&p->kill_lock);
         if (wr == 0) {
             do {
                 wr = waitpid(p->pid, &status, 0);
             } while (wr < 0 && errno == EINTR);
+            pthread_mutex_lock(&p->kill_lock);
+            p->reaped = 1;
+            pthread_mutex_unlock(&p->kill_lock);
         }
     } else {
         // waitid failed (non-EINTR): revoke handle-based kill permission BEFORE reaping
@@ -5594,6 +5630,7 @@ static void *posix_wait_thread(void *arg) {
         } while (wr < 0 && errno == EINTR);
         pthread_mutex_lock(&p->kill_lock);
         p->exited = 1;
+        p->reaped = 1;
         pthread_mutex_unlock(&p->kill_lock);
     }
 
@@ -5603,12 +5640,21 @@ static void *posix_wait_thread(void *arg) {
     wake_pipe_signal(p->stdin_wake[1]);
 
     pthread_mutex_lock(&p->kill_lock);
-    if (wr == p->pid && !atomic_load_explicit(&p->closing, memory_order_acquire)) {
-        if (WIFSIGNALED(status)) {
-            int sig = WTERMSIG(status);
-            push_exit_event(p->event_id, STS_EV_PROC_EXIT, -1, (int32_t)sig, posix_signal_name(sig));
-        } else {
-            push_exit_event(p->event_id, STS_EV_PROC_EXIT, (int32_t)WEXITSTATUS(status), 0, "");
+    if (!atomic_load_explicit(&p->closing, memory_order_acquire)) {
+        if (deferred_reap) {
+            if (si.si_code == CLD_KILLED || si.si_code == CLD_DUMPED) {
+                int sig = si.si_status;
+                push_exit_event(p->event_id, STS_EV_PROC_EXIT, -1, (int32_t)sig, posix_signal_name(sig));
+            } else {
+                push_exit_event(p->event_id, STS_EV_PROC_EXIT, (int32_t)si.si_status, 0, "");
+            }
+        } else if (wr == p->pid) {
+            if (WIFSIGNALED(status)) {
+                int sig = WTERMSIG(status);
+                push_exit_event(p->event_id, STS_EV_PROC_EXIT, -1, (int32_t)sig, posix_signal_name(sig));
+            } else {
+                push_exit_event(p->event_id, STS_EV_PROC_EXIT, (int32_t)WEXITSTATUS(status), 0, "");
+            }
         }
     }
     pthread_mutex_unlock(&p->kill_lock);
@@ -6046,6 +6092,7 @@ int64_t sts_proc_spawn(
     }
     p->event_id = event_id;
     p->pid = pid;
+    p->new_pgid = (flags & STS_PROC_NEW_PGID) ? 1 : 0;
     atomic_store_explicit(&p->closing, 0, memory_order_relaxed);
     p->stdin_fd = in_p[1];
     p->stdout_fd = out_p[0];
@@ -6171,7 +6218,12 @@ int32_t sts_proc_kill_handle(int64_t handle, int32_t sig, int32_t group) {
     if (p == NULL) return -ESRCH;
     pthread_mutex_lock(&p->kill_lock);
     int32_t res;
-    if (p->exited) {
+    if (group && p->new_pgid && !p->reaped && !p->kill_revoked) {
+        // Delayed reap (waitid WNOWAIT) keeps p->pid locked in kernel until sts_proc_close,
+        // so signaling -p->pid after leader exit has zero PID-reuse risk.
+        int rc = kill(-p->pid, posix_signal_of(sig));
+        res = (rc == 0) ? 0 : -errno;
+    } else if (p->exited) {
         res = -ESRCH;
     } else if (p->kill_revoked) {
         res = -ENOTSUP;
@@ -6189,6 +6241,14 @@ int32_t sts_proc_close(int64_t handle) {
     if (p == NULL) return 0;
     pthread_mutex_lock(&p->kill_lock);
     atomic_store_explicit(&p->closing, 1, memory_order_release);
+    if (p->new_pgid && p->exited && !p->reaped) {
+        int st = 0;
+        pid_t wr;
+        do {
+            wr = waitpid(p->pid, &st, WNOHANG);
+        } while (wr < 0 && errno == EINTR);
+        p->reaped = 1;
+    }
     pthread_mutex_unlock(&p->kill_lock);
     pthread_mutex_lock(&p->stdin_lock);
     p->stdin_aborted = 1;
@@ -8778,7 +8838,7 @@ static void *posix_pty_read_thread(void *arg) {
 
 static void *posix_pty_wait_thread(void *arg) {
     posix_pty_t *pt = (posix_pty_t *)arg;
-    int wid = posix_wait_exited_nowait(pt->pid);
+    int wid = posix_wait_exited_nowait(pt->pid, NULL);
 
     int status = 0;
     pid_t wr = -1;

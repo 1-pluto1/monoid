@@ -1043,8 +1043,79 @@ static void test_proc_pipes_exit_and_env_strip(void) {
     assert(got_sig_exit && term_sig == SIGKILL);
     assert(sts_proc_close(sh) == 1);
     drain_queue();
+
+    // Test delayed reap (waitid WNOWAIT) for STS_PROC_NEW_PGID:
+    // leader exits while descendant `sleep 600` stays alive in the same PGID;
+    // sts_proc_kill_handle(h, STS_SIG_KILL, 1) MUST still kill the descendant with zero PID reuse,
+    // and sts_proc_close(h) MUST reap the leader with zero zombies.
+    {
+        const char *pg_script = "sleep 600 & echo $!";
+        size_t pglen = strlen(pg_script);
+        uint8_t *pgargs = (uint8_t *)malloc(3 + pglen + 1);
+        assert(pgargs != NULL);
+        memcpy(pgargs, "-c", 3);
+        memcpy(pgargs + 3, pg_script, pglen + 1);
+        int64_t pgpid = 0;
+        int64_t pgh = sts_proc_spawn(
+            203, "/bin/sh", pgargs, (int64_t)(3 + pglen + 1), NULL, 0, NULL,
+            STS_PROC_NEW_PGID | STS_PROC_PIPE_STDOUT | STS_PROC_PIPE_STDERR, &pgpid, err, sizeof(err));
+        free(pgargs);
+        assert(pgh > 0 && pgpid > 0);
+
+        int got_leader_exit = 0;
+        int32_t leader_code = -1;
+        char out_buf[64];
+        size_t out_len = 0;
+        memset(out_buf, 0, sizeof(out_buf));
+        deadline = sth_now_ms() + 5000;
+        while ((!got_leader_exit || out_len == 0) && sth_now_ms() < deadline) {
+            int64_t len = 0;
+            uint8_t *ev = (uint8_t *)sth_wait(500, &len);
+            if (ev == NULL) continue;
+            if (ev[0] == STH_EV_SYS && read_u64_le(ev + 1) == 203 && len >= 10) {
+                if (ev[9] == STS_EV_PROC_STDOUT && len > 10) {
+                    size_t avail = sizeof(out_buf) - 1 - out_len;
+                    size_t take = (size_t)(len - 10);
+                    if (take > avail) take = avail;
+                    memcpy(out_buf + out_len, ev + 10, take);
+                    out_len += take;
+                    out_buf[out_len] = '\0';
+                } else if (ev[9] == STS_EV_PROC_EXIT && len >= 18) {
+                    leader_code = read_i32_le(ev + 10);
+                    got_leader_exit = 1;
+                }
+            }
+            sth_free(ev);
+        }
+        assert(got_leader_exit && leader_code == 0);
+        pid_t desc_pid = (pid_t)strtol(out_buf, NULL, 10);
+        assert(desc_pid > 0 && desc_pid != (pid_t)pgpid);
+        // Leader exited, descendant `sleep 600` is still alive in PGID `pgpid`.
+        assert(kill(desc_pid, 0) == 0);
+        assert(sts_proc_kill((int32_t)pgpid, STS_SIG_PROBE, 1) == 0);
+        // Handle-bound group kill MUST succeed even after leader exit and kill the descendant!
+        assert(sts_proc_kill_handle(pgh, STS_SIG_KILL, 1) == 0);
+        int desc_gone = 0;
+        deadline = sth_now_ms() + 3000;
+        while (sth_now_ms() < deadline) {
+            if (kill(desc_pid, 0) != 0 && errno == ESRCH) {
+                desc_gone = 1;
+                break;
+            }
+            usleep(10000);
+        }
+        assert(desc_gone == 1);
+        // Close handle -> MUST reap the delayed-reap leader immediately (zero zombie, PGID gone).
+        assert(sts_proc_close(pgh) == 1);
+        int wst = 0;
+        pid_t wrc = waitpid((pid_t)pgpid, &wst, WNOHANG);
+        assert(wrc == -1 && errno == ECHILD);
+        assert(sts_proc_kill((int32_t)pgpid, STS_SIG_PROBE, 1) == -ESRCH);
+        drain_queue();
+    }
+
     assert(sts_wait_detached_for_test(5000) == 1);
-    printf("  [PASS] async proc (pipes, handle kill, exit/sig, start_time_of, MallocSpaceEfficient strip)\n");
+    printf("  [PASS] async proc (pipes, handle kill, post-leader-exit pgroup kill + delayed reap, exit/sig, start_time_of, MallocSpaceEfficient strip)\n");
 }
 
 static void test_proc_adversarial(void) {

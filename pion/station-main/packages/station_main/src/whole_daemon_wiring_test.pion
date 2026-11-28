@@ -697,3 +697,179 @@ test "w17d3 R5: feedback signed_post_headers matches independent Cloud Ed25519 +
     panic("independent Ed25519 verification of feedback signature failed")
   }
 }
+
+test "w17e1 R3: all 11 daemon event_id segments (production constants) are pairwise disjoint & env filter preserves approved overrides" {
+  let step : Int64 = 4294967296L // 1 << 32
+  let bases : Array[(String, Int64)] = [
+    ("jobs", 4294967296L),
+    ("browser", 8589934592L),
+    ("terminals", 12884901888L),
+    ("logins", 17179869184L),
+    ("adb", 21474836480L),
+    ("restore", 25769803776L),
+    ("dns", 30064771072L),
+    ("live_runner", LIVE_RUNNER_EV_BASE),
+    ("upkeep", UPKEEP_EVENT_ID_BASE),
+    ("mdns", station_whole::MDNS_EVENT_ID_BASE),
+    ("secret_run", SECRET_RUN_EVENT_BASE),
+  ]
+  if SECRET_RUN_EVENT_BASE == UPKEEP_EVENT_ID_BASE {
+    panic("SECRET_RUN_EVENT_BASE must NOT collide with UPKEEP_EVENT_ID_BASE")
+  }
+  if station_whole::MDNS_EVENT_ID_BASE == LIVE_RUNNER_EV_BASE {
+    panic("MDNS_EVENT_ID_BASE must NOT collide with LIVE_RUNNER_EV_BASE")
+  }
+  if SECRET_RUN_EVENT_END != SECRET_RUN_EVENT_BASE + step {
+    panic("SECRET_RUN_EVENT_END must equal SECRET_RUN_EVENT_BASE + (1 << 32)")
+  }
+  for i in 0..<bases.length() {
+    for j in (i + 1)..<bases.length() {
+      let a = bases[i].1
+      let b = bases[j].1
+      if a == b || (a >= b && a < b + step) || (b >= a && b < a + step) {
+        panic("event_id segment collision between " + bases[i].0 + " and " + bases[j].0)
+      }
+    }
+  }
+  // Verify Node `incoming.ts:28-30` sensitive env prefix filter strips inherited keys
+  // while explicitly approved grant overrides (e.g. `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) ARE delivered!
+  let base_env = [
+    "PATH=/usr/bin",
+    "STILLFAIL_TOKEN=station-secret",
+    "OPENAI_API_KEY=inherited-station-openai",
+    "ANTHROPIC_API_KEY=inherited-station-anthropic",
+    "CLAUDE_CODE_OAUTH=inherited-claude",
+    "CODEX_HOME=/tmp/codex",
+  ]
+  let child_env = build_child_env_from(base_env, [("OPENAI_API_KEY", "sk-approved-123"), ("STILLFAIL_SECRET", "sk-approved-123")])
+  let mut has_path = false
+  let mut has_approved_openai = false
+  for i in 0..<child_env.length() {
+    let e = child_env[i]
+    if e == "PATH=/usr/bin" { has_path = true }
+    if e == "OPENAI_API_KEY=sk-approved-123" { has_approved_openai = true }
+    if e.starts_with("STILLFAIL_TOKEN=") || e.starts_with("ANTHROPIC_API_KEY=") || e.starts_with("CLAUDE_") || e.starts_with("CODEX_") {
+      panic("inherited sensitive env leaked into child: " + e)
+    }
+    if e == "OPENAI_API_KEY=inherited-station-openai" {
+      panic("inherited OPENAI_API_KEY leaked instead of approved override")
+    }
+  }
+  if !has_path || !has_approved_openai {
+    panic("expected PATH and approved OPENAI_API_KEY override in child env")
+  }
+}
+
+test "w17e1 R4: secret_run NEVER attaches claude/endTurn: true on success, error, or timeout & ssh close scrubs key" {
+  let claude_ended = Some(base_codec::json_obj([("claude/endTurn", base_codec::json_bool(true))]))
+  let ok_rpc = encode_mcp_tool_rpc_result(base_codec::json_int(1), "exit code 0\nok", false, ended_meta=claude_ended)
+  let err_rpc = encode_mcp_tool_rpc_result(base_codec::json_int(2), "refused: browser grant", true, ended_meta=claude_ended)
+  let timeout_rpc = encode_mcp_tool_rpc_result(base_codec::json_int(3), "stopped: it ran too long", false, ended_meta=claude_ended)
+  if ok_rpc.contains("claude/endTurn") {
+    panic("secret_run success reply must NEVER contain claude/endTurn: " + ok_rpc)
+  }
+  if err_rpc.contains("claude/endTurn") {
+    panic("secret_run error reply must NEVER contain claude/endTurn: " + err_rpc)
+  }
+  if timeout_rpc.contains("claude/endTurn") {
+    panic("secret_run timeout reply must NEVER contain claude/endTurn: " + timeout_rpc)
+  }
+  // Verify `SshAgentServer::close` immediately zeroes key seed & blob in memory.
+  let seed = Bytes::new(32)
+  for i in 0..<32 {
+    seed[i] = (i + 7) as Byte
+  }
+  let key = match station_vault::SshEd25519Key::from_seed(seed, "test") {
+    Ok(k) => k
+    Err(e) => panic("from_seed failed: " + e)
+  }
+  let ag = station_vault::SshAgentServer::new("/tmp/sf-r4-test-never-bound.sock", key)
+  let transport = builders_core::MuxTransport::{
+    call_async: fn(_id : Int64, _op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {},
+    call_sync: fn(_op : String, _json_str : String) -> String { "{\"value\":{}}" },
+    write_stdout_line: fn(_line : String) -> Bool { true },
+    write_stdout_frame: fn(_fields : Array[(String, base_codec::Json)], _body : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { 1000L },
+    wall_ms: fn() -> Int64 { 1790000000000L },
+    wait: fn(_ms : Int64) -> Option[host_shim::HostEvent] { None },
+  }
+  let mux = builders_core::ShellMux::new(transport, start_stdin=false)
+  ag.close(mux)
+  if ag.key.seed.length() != 0 || ag.key.blob.length() != 0 {
+    panic("SshAgentServer::close must immediately scrub key.seed and key.blob")
+  }
+}
+
+test "w17e1 R5: SshAgentServer exact inflight_ops + out-of-order LISTEN/ACCEPT drains closing_ssh to 0" {
+  let seed = Bytes::new(32)
+  for i in 0..<32 {
+    seed[i] = (i + 19) as Byte
+  }
+  let key = match station_vault::SshEd25519Key::from_seed(seed, "r5-test") {
+    Ok(k) => k
+    Err(e) => panic("from_seed failed: " + e)
+  }
+  let ops : Array[String] = []
+  let transport = builders_core::MuxTransport::{
+    call_async: fn(_id : Int64, op : String, _json_str : String, _payload : Option[Bytes]) -> Unit {
+      ops.push(op)
+    },
+    call_sync: fn(_op : String, _json_str : String) -> String { "{\"value\":{}}" },
+    write_stdout_line: fn(_line : String) -> Bool { true },
+    write_stdout_frame: fn(_fields : Array[(String, base_codec::Json)], _body : Bytes) -> Bool { true },
+    now_ms: fn() -> Int64 { 1000L },
+    wall_ms: fn() -> Int64 { 1790000000000L },
+    wait: fn(_ms : Int64) -> Option[host_shim::HostEvent] { None },
+  }
+  let mux = builders_core::ShellMux::new(transport, start_stdin=false)
+  let ag = station_vault::SshAgentServer::new("/tmp/sf-r5-ooo-never-bound.sock", key)
+  ag.run_seq = 77L
+  // 1. start() submits unix.listen -> inflight_ops == 1.
+  let _ = ag.start(mux)
+  if ag.inflight_ops() != 1 {
+    panic("expected inflight_ops == 1 after start, got " + ag.inflight_ops().to_string())
+  }
+  // 2. LISTEN completes with listener id=10 -> arms tcp.accept -> inflight_ops == 1.
+  let ok_listen = host_shim::ShellDone::{ id: 1L, json: "{\"id\":10}", error: "", bytes: None }
+  let _ = ag.on_shell_done(mux, builders_core::MuxToken::Tagged(station_vault::SSH_MUX_TAG_LISTEN, 0, 77L), ok_listen, true)
+  if ag.inflight_ops() != 1 {
+    panic("expected inflight_ops == 1 after listen+arm_accept, got " + ag.inflight_ops().to_string())
+  }
+  // 3. close() submits listen.close + fs.remove -> inflight_ops == 3 (1 accept + 1 close + 1 unlink).
+  ag.close(mux)
+  if ag.inflight_ops() != 3 {
+    panic("expected inflight_ops == 3 after close (accept+close+unlink), got " + ag.inflight_ops().to_string())
+  }
+  // Place in SecretRunManager::closing_ssh and deliver completions OUT OF ORDER:
+  // ACCEPT arrives with late cid=42 -> spawns tcp.close (+1, net 0 -> still 3!),
+  // then UNLINK (-1 -> 2), then listener CLOSE (-1 -> 1), then late conn CLOSE (-1 -> 0 -> removed!).
+  let mgr = SecretRunManager::new("/tmp", "/")
+  mgr.closing_ssh.set(
+    77L,
+    ClosingSshEntry::{
+      agent: ag,
+      dir_path: "",
+      listen_pending: false,
+      expire_ms: 31000L,
+    },
+  )
+  let noop_rm = fn(_p : String) -> Bool { true }
+  let ok_empty = host_shim::ShellDone::{ id: 2L, json: "{}", error: "", bytes: None }
+  let late_accept = host_shim::ShellDone::{ id: 3L, json: "{\"id\":42}", error: "", bytes: None }
+  let _ = mgr.handle_closing_ssh_done(mux, builders_core::MuxToken::Tagged(station_vault::SSH_MUX_TAG_ACCEPT, 10, 77L), late_accept, noop_rm, noop_rm)
+  if mgr.closing_ssh_count() != 1 || ag.inflight_ops() != 3 {
+    panic("closing_ssh must stay alive while late tcp.close + close + unlink are in flight")
+  }
+  let _ = mgr.handle_closing_ssh_done(mux, builders_core::MuxToken::Tagged(station_vault::SSH_MUX_TAG_UNLINK, 0, 77L), ok_empty, noop_rm, noop_rm)
+  if mgr.closing_ssh_count() != 1 || ag.inflight_ops() != 2 {
+    panic("expected inflight_ops == 2 after unlink")
+  }
+  let _ = mgr.handle_closing_ssh_done(mux, builders_core::MuxToken::Tagged(station_vault::SSH_MUX_TAG_CLOSE, 10, 77L), ok_empty, noop_rm, noop_rm)
+  if mgr.closing_ssh_count() != 1 || ag.inflight_ops() != 1 {
+    panic("expected inflight_ops == 1 after listen.close")
+  }
+  let _ = mgr.handle_closing_ssh_done(mux, builders_core::MuxToken::Tagged(station_vault::SSH_MUX_TAG_CLOSE, 42, 77L), ok_empty, noop_rm, noop_rm)
+  if mgr.closing_ssh_count() != 0 || ag.inflight_ops() != 0 {
+    panic("closing_ssh must drain to 0 once all in-flight ops complete")
+  }
+}
