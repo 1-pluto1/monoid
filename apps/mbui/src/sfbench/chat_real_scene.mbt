@@ -64,22 +64,26 @@ fn chat_real_anew(m : Json, k : Int) -> Json {
     ops.map(fn(op) {
       guard op is Object(o) else { return op }
       let o = o.copy()
-      match (o.get("path"), o.get("put")) {
-        (Some(Array([String("messages")])), Some(Object(put))) if put.contains("seq") => {
-          let p = put.copy()
-          p["seq"] = Json::number(seq.to_double())
-          p["ts"] = Json::string("1001.00\{seq}")
-          match p.get("text") {
-            Some(String(t)) => {
-              let words = t + " (\{k})"
-              p["text"] = Json::string(words)
-              p["words"] = Json::array([{ "text": Json::string(words) }])
+      match o.get("path") {
+        Some(Array([String("messages")])) =>
+          match o.get("put") {
+            Some(Object(put)) if put.contains("seq") => {
+              let p = put.copy()
+              p["seq"] = Json::number(seq.to_double())
+              p["ts"] = Json::string("1001.00\{seq}")
+              match p.get("text") {
+                Some(String(t)) => {
+                  let words = t + " (\{k})"
+                  p["text"] = Json::string(words)
+                  p["words"] = Json::array([{ "text": Json::string(words) }])
+                }
+                _ => ()
+              }
+              o["put"] = Json::object(p)
             }
             _ => ()
           }
-          o["put"] = Json::object(p)
-        }
-        (Some(Array([String("lastEntry")])), _) => o["set"] = Json::number(seq.to_double())
+        Some(Array([String("lastEntry")])) => o["set"] = Json::number(seq.to_double())
         _ => ()
       }
       Json::object(o)

@@ -385,7 +385,7 @@ let svg_fonts : Ref[(Array[Bytes], @font.FontDb, String)?] = Ref(None)
 
 ///|
 fn init_svg_font_families(db : @font.FontDb) -> String {
-  let family = fn(i) {
+  let family = fn(i : Int) {
     match db.faces().get(i) {
       Some(f) if f.families.length() > 0 => f.families[0].0
       _ => ""
