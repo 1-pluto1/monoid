@@ -736,14 +736,18 @@ pub fn open_mode(mode : String) -> Unit {
     // (with many models starred: more of them than the levels beside them)
     if mode.has_suffix("-many") {
       @sffixture.new_fix.liked.push_iter(["claude-sonnet-5", "kimi-for-coding"].iter())
-      @sffixture.new_fix.liked.push_iter(@sffixture.fix_providers[:8].iter().map(fn(p) { p.0 }))
+      for i = 0; i < 8 && i < @sffixture.fix_providers.length(); i = i + 1 {
+        @sffixture.new_fix.liked.push(@sffixture.fix_providers[i].0)
+      }
     }
     // (as many starred, the one picked the first of them: in a sheet risen from the foot the lowest, past what it
     // shows at first)
     if mode == "newchat-providers-model-far" {
       let n = @sffixture.new_fix
       n.liked.push_iter(["claude-sonnet-5", "kimi-for-coding"].iter())
-      n.liked.push_iter(@sffixture.fix_providers[:8].iter().map(fn(p) { p.0 }))
+      for i = 0; i < 8 && i < @sffixture.fix_providers.length(); i = i + 1 {
+        n.liked.push(@sffixture.fix_providers[i].0)
+      }
       n.model = "claude-sonnet-5"
       n.d_model = n.model
     }
@@ -1151,7 +1155,7 @@ pub fn fixture_corner_modes() -> Array[String] {
     "board-side", "board-add",
   ]
   // (and the card to share in each of its other looks: share_looks.mbt)
-  let looks = @sfpages.share_look_keys()
+  let looks : Array[String] = @sfpages.share_look_keys()
   for i in 1..<looks.length() {
     modes.push("share-card-" + looks[i])
   }

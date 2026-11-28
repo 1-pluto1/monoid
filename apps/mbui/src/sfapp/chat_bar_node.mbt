@@ -1129,10 +1129,10 @@ fn chat_composer_bar_node(o : @view.View, src : Source, r : ChatRef, shows : () 
           }
           let on_press = if n == 1 {
             let key = group.agents[0].key
-            fn(_) { open_agent(src, r, key) }
+            fn(_ : @view.View) { open_agent(src, r, key) }
           } else {
             let st_addr = group.station
-            fn(_) { open_station_agents(src, r, st_addr) }
+            fn(_ : @view.View) { open_station_agents(src, r, st_addr) }
           }
           @sf.action_box_node(slot, fn() { label }, label_is=label, on_press, fn(k) {
             small_glass_capsule(k)

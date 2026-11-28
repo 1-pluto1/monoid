@@ -536,6 +536,13 @@ priv enum ShareRow {
 }
 
 ///|
+#derive(Eq, Hash)
+priv struct ShareChatKey {
+  station : String
+  id : String
+}
+
+///|
 /// What is shared, 发到 (搜索 from six), the chats it can go to, 新 chat (then the stations, with several), in `look`,
 /// as the core's `shareIn` for workspace `scope` says them now (in `v`).
 fn share_parts_node(v : @view.View, src : Source, scope : String, look : ShareLook) -> Unit {
@@ -650,13 +657,15 @@ fn share_parts_node(v : @view.View, src : Source, scope : String, look : ShareLo
   }, fn(list) {
     @sf.style_node(list, fn() { share_whole })
     // (its chats by station and id once: each row reads its own, told only as that one changes)
-    let by_chat = list.keyed_by(rows, fn(i) { (text(Some(i), "station"), text(Some(i), "id")) })
+    let by_chat = list.keyed_by(rows, fn(i) {
+      ShareChatKey::{ station: text(Some(i), "station"), id: text(Some(i), "id") }
+    })
     list.each(fn() { keys.get() }, fn(k) { k }, fn(b, k) {
       let row = @signals.untracked(fn() { k.get() })
       match row {
         ShareNote(words) => share_note_node(b, fn() { words }, look)
         ShareChat(station, id) => {
-          let it = fn() { by_chat.get((station, id)) }
+          let it = fn() { by_chat.get(ShareChatKey::{ station, id }) }
           // (its session as it is now, kept for its press by what reads it: never read outside a reader)
           let session = Ref("")
           b.reacts(fn() { text(it(), "session") }, fn(x) { session.val = x })
