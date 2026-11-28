@@ -634,3 +634,34 @@ test("a frame-only delivery while a station socket opens sends the frame without
     await h.close();
   }
 });
+
+test("outbox retry and drain handle more than 100 queued rows without exceeding SQLite bind limits", async () => {
+  const h = await harness();
+  try {
+    const { tokens, bob } = await setUp(h);
+    const admin = h.as(tokens.alice, "admin");
+    const dir = await directory(h);
+    await dir.failTo(`account ${bob}`);
+    for (let i = 0; i < 105; i++) {
+      assert.equal((await admin("POST", `/v1/admin/users/${bob}/beta`, { on: i % 2 === 0 })).status, 200);
+    }
+    await h.settled();
+    const queued = (await dir.waiting()) as { tries: number }[];
+    assert.equal(queued.length, 105);
+    const beforeMaxTries = queued.reduce((max, r) => Math.max(max, r.tries), 0);
+
+    // Retrying while still failing updates all 105 rows without exceeding SQLite variable limits.
+    await dir.retry();
+    const afterRetry = (await dir.waiting()) as { tries: number }[];
+    assert.equal(afterRetry.length, 105);
+    assert.ok(afterRetry.every((r) => r.tries === beforeMaxTries + 1));
+
+    // Recovering drains all 105 rows and delivers the final beta state.
+    await dir.failTo();
+    await dir.retry();
+    assert.deepEqual(await dir.waiting(), []);
+    assert.equal((await h.as(tokens.bob, "beta")("GET", "/v1/me")).status, 200);
+  } finally {
+    await h.close();
+  }
+});

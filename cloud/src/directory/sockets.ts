@@ -154,18 +154,24 @@ export class DirectorySockets {
         // Made as it is sent, so the station need not ask for it.
         ...(bodies.some((b) => b.state) || (kind === "station" && tried) ? { state: true as const, frame: this.frame(key) } : {}),
       };
-      const ids = group.map((r) => r.id as number);
-      const marks = ids.map(() => "?").join(", ");
+      const maxId = group.at(-1)!.id as number;
       const gen = this.#db.one("SELECT gen FROM live WHERE kind = ? AND key = ?", kind, key)?.gen as number | undefined;
       try {
         const said = await this.#host.send(kind, key, body);
-        this.#db.run(`DELETE FROM outbox WHERE id IN (${marks})`, ...ids);
+        this.#db.run("DELETE FROM outbox WHERE kind = ? AND key = ? AND id <= ?", kind, key, maxId);
         // It holds no socket: out of `live`, unless one opened since (a newer gen).
         if (!said.live && gen !== undefined) this.#db.run("DELETE FROM live WHERE kind = ? AND key = ? AND gen <= ?", kind, key, gen);
       } catch (error) {
-        const tries = Math.max(...group.map((r) => r.tries as number)) + 1;
+        const tries = group.reduce((max, r) => Math.max(max, r.tries as number), 0) + 1;
         if (tries % 8 === 0) console.warn(`directory: ${kind} ${key} not told after ${tries} tries: ${(error as Error).message}`);
-        this.#db.run(`UPDATE outbox SET tries = ?, next_at = ? WHERE id IN (${marks})`, tries, nowSeconds() + Math.min(2 ** tries, OUTBOX_MAX_DELAY), ...ids);
+        this.#db.run(
+          "UPDATE outbox SET tries = ?, next_at = ? WHERE kind = ? AND key = ? AND id <= ?",
+          tries,
+          nowSeconds() + Math.min(2 ** tries, OUTBOX_MAX_DELAY),
+          kind,
+          key,
+          maxId,
+        );
         await this.arm();
         return;
       }
