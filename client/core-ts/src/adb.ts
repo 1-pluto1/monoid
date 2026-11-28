@@ -31,6 +31,20 @@ function grantChat(g: J): string {
   return typeof g.chat === "string" && g.chat !== "" ? g.chat : typeof g.session === "string" && g.session !== "" ? g.session : g.id;
 }
 
+function concatBytes(parts: readonly Uint8Array[]): Uint8Array {
+  if (parts.length === 0) return new Uint8Array(0);
+  if (parts.length === 1) return parts[0]!;
+  let total = 0;
+  for (const part of parts) total += part.length;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
 /// The trusted devices on a person's own lock that can approve this device (`AdbPersonal.approvers`), deduplicated by
 /// `id` in deterministic order, with `kind` and `nameText` normalized as `views/lock.ts` does.
 function personalApprovers(devices: readonly PersonalDevice[], pair: J): J[] {
@@ -365,7 +379,7 @@ class Lend {
           if (chunk === null) break;
           parts.push(chunk);
         }
-        const said = fromUtf8(new Uint8Array(parts.flatMap((p) => [...p])));
+        const said = fromUtf8(concatBytes(parts));
         return { lost: message(said) ?? t("core-misc.adb.not_accepted"), pause: true } as Ended;
       }
       if (this.#current(run) === null) return { changed: true } as Ended;
@@ -550,7 +564,7 @@ class Lend {
         if (chunk === null) break;
         parts.push(chunk);
       }
-      const body = fromUtf8(new Uint8Array(parts.flatMap((p) => [...p])));
+      const body = fromUtf8(concatBytes(parts));
       const said = message(body) ?? "";
       if (reply.status === 200) return { message: said, ...((parseJson(utf8(body)) as J) ?? {}) };
       // (the station's code where it gives one, which an app goes by: `adb_grant_refused`, station/src/adb/link.ts)

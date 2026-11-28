@@ -480,3 +480,78 @@ test("r18: overlapping same-owner boundaries coalesce refresh and never drop the
     runner.shutdown();
   }
 });
+
+test("multi-chunk askAt and share error responses reassemble split UTF-8 bytes without flatMap boxing", async () => {
+  const host = new FakeHost();
+  const runner = new Runner(host.time.clock);
+  const store = new Store(host, runner);
+  const encoder = new TextEncoder();
+  let mode: "ok-split" | "err-split" | "ok-empty" | "share-err" = "ok-split";
+  let drainedResolve: (() => void) | null = null;
+  const makeStream = (chunks: Uint8Array[]) => {
+    let idx = 0;
+    return {
+      take: Effect.sync(() => {
+        if (idx < chunks.length) return chunks[idx++]!;
+        drainedResolve?.();
+        drainedResolve = null;
+        return null;
+      }),
+    };
+  };
+  const sliceBytes = (text: string, cuts: number[]) => {
+    const raw = encoder.encode(text);
+    const out: Uint8Array[] = [];
+    let prev = 0;
+    for (const c of cuts) {
+      out.push(raw.subarray(prev, c));
+      prev = c;
+    }
+    out.push(raw.subarray(prev));
+    return out;
+  };
+  const link = {
+    ask: () =>
+      Effect.sync(() => {
+        if (mode === "ok-empty") return { status: 200, cancel: () => {}, body: makeStream([]) };
+        if (mode === "ok-split") {
+          const text = JSON.stringify({ message: "手机已恢复授权🎉", request: { id: "g1", status: "ended" } });
+          return { status: 200, cancel: () => {}, body: makeStream(sliceBytes(text, [5, 13, 15, 22])) };
+        }
+        if (mode === "err-split") {
+          const text = JSON.stringify({ message: "跨分块拒绝对话：测试🎉", code: "adb_grant_refused" });
+          return { status: 422, cancel: () => {}, body: makeStream(sliceBytes(text, [4, 14, 16, 25])) };
+        }
+        const text = JSON.stringify({ message: "隧道分块错误：已拒绝" });
+        return { status: 500, cancel: () => {}, body: makeStream(sliceBytes(text, [6, 13, 16])) };
+      }),
+  };
+  const mesh = { deviceId: () => "phone", link: () => Effect.succeed(link) } as unknown as Mesh;
+  const adb = new Adb({ ...personalStub(), host, runner, store, mesh: () => Effect.succeed(mesh), credentials: () => (() => Effect.succeed({} as never)), relays: () => [], lends: () => true });
+  takeAll(adb);
+  const exp = Math.floor(host.nowMs() / 1000) + 3600;
+  try {
+    adb.heard("ws/st", { id: "g1", chat: "c1", session: "s1", reason: "debug", status: "granted", exp, at: 1 });
+    await runner.run(adb.run({ kind: "revoke", station: "ws/st", request: "g1" }));
+    assert.deepEqual(adb.grants(), []);
+
+    mode = "ok-empty";
+    adb.heard("ws/st", { id: "g2", chat: "c2", session: "s2", reason: "debug", status: "granted", exp, at: 2 });
+    await runner.run(adb.run({ kind: "revoke", station: "ws/st", request: "g2" }));
+    assert.deepEqual(adb.grants(), []);
+
+    mode = "err-split";
+    const err = await runner.run(Effect.flip(adb.run({ kind: "revoke", station: "ws/st", request: "g3" })));
+    assert.deepEqual([err.code, err.message], ["adb_grant_refused", "跨分块拒绝对话：测试🎉"]);
+
+    mode = "share-err";
+    const shareDrained = new Promise<void>((resolve) => { drainedResolve = resolve; });
+    await runner.run(adb.run({ kind: "share", offer: { station: "ws/st", connect: null, pair: null, device: "Pixel", android: "15", package: "app", minutes: 5 } }));
+    await shareDrained;
+    await host.time.pass(10);
+    assert.equal((adb.value() as { message?: string | null }).message, "隧道分块错误：已拒绝");
+    await runner.run(adb.run({ kind: "stop" }));
+  } finally {
+    runner.shutdown();
+  }
+});
