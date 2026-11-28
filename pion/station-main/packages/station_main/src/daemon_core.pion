@@ -2248,17 +2248,24 @@ pub fn run_daemon(argv : Array[String], hooks : DaemonRoleHooks) -> Int {
     (hooks.on_carried)(ctx, v)
   })
   control.on("handover", fn() -> Unit {
-    handover_stopping = true
-    match (hooks.on_handover_start)(ctx) {
-      Ok(_) => ()
-      Err(msg) => {
+    let outcome = resolve_handover_start_outcome((hooks.on_handover_start)(ctx))
+    match outcome.carry_failed_msg {
+      Some(msg) => {
         log("handover start failed: " + msg)
-        handover_failed = true
         let _ = control.carry(base_codec::json_obj([("handoverFailed", base_codec::json_str(msg))]))
         let _ = control.failed("handover start failed: " + msg)
       }
+      None => ()
     }
-    stopping = true
+    if outcome.handover_failed {
+      handover_failed = true
+    }
+    if outcome.handover_stopping {
+      handover_stopping = true
+    }
+    if outcome.should_stop {
+      stopping = true
+    }
   })
   control.on("hup", fn() -> Unit {
     log("received hup")

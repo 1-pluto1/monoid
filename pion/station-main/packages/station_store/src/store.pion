@@ -722,10 +722,12 @@ fn bring_back_in_tx(
 
 /// Append a message entry to `thread`, returning `(n, fresh)` matching `store.ts:3378-3439, 5539-5540`:
 /// - Deduplicates by `(thread, ts)` returning `(existing_n, false)` without inserting.
+/// Transactional body of `Store::insert_message` for callers that must atomically bind
+/// message creation with other SQLite updates (e.g. `turns.(about_thread, about_n, about_ts)`):
+/// - Deduplicates on `(thread, ts)` when `msg.ts` is `Some`.
 /// - Numbers `n = MAX(entries.n) + 1` when entries exist, or `last_known(thread) + 1` when empty.
 /// - Complements `options` <-> `card` JSON when only one is supplied.
 /// - Persists `agent_identity`, enqueues `deliver_to`, and runs `#bringBack` for auto-archived chats.
-/// Insert a message inside an caller-owned write transaction (for atomic card + vault_requests commit).
 pub fn insert_message_in_tx(
   t : sql_db::Db,
   msg : NewMessage,
@@ -1523,4 +1525,39 @@ pub fn Store::mark_handed_delivered(
     }
     Ok(updated)
   })
+}
+
+/// R9: Returns `true` iff `handed` is non-empty and EVERY token is already recorded with
+/// `delivered_at IS NOT NULL` in SQLite (`deliveries` / `letter_deliveries`), so restart
+/// recovery skips replaying stale snapshots whose deletion failed after delivery succeeded.
+pub fn Store::all_handed_delivered(
+  self : Store,
+  session : String,
+  handed : Array[HandedToken],
+) -> Bool {
+  if handed.length() == 0 {
+    return false
+  }
+  for i in 0..<handed.length() {
+    let h = handed[i]
+    let sql = if h.apart {
+      "SELECT 1 FROM letter_deliveries WHERE thread = ?1 AND n = ?2 AND session = ?3 AND delivered_at IS NOT NULL LIMIT 1"
+    } else {
+      "SELECT 1 FROM deliveries WHERE thread = ?1 AND n = ?2 AND session = ?3 AND delivered_at IS NOT NULL LIMIT 1"
+    }
+    match self.db.all(
+      sql,
+      [
+        sql_db::int64_to_json(h.thread),
+        sql_db::int64_to_json(h.n),
+        base_codec::json_str(session),
+      ],
+    ) {
+      Ok(rows) => if rows.length() == 0 {
+        return false
+      }
+      Err(_) => return false
+    }
+  }
+  true
 }
