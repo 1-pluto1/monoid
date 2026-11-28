@@ -32,7 +32,14 @@ export async function keptIcon(env: Env, icon: string): Promise<string> {
   if (!bucket) return icon;
   const m = icon.length <= ICON_URL_CHARS ? /^data:image\/(png|webp|jpeg|gif);base64,([A-Za-z0-9+/]+={0,2})$/.exec(icon) : null;
   const kind = m?.[1] ?? "";
-  const bytes = m ? Uint8Array.from(atob(m[2]!), (c) => c.charCodeAt(0)) : new Uint8Array();
+  let bytes = new Uint8Array();
+  if (m) {
+    try {
+      bytes = Uint8Array.from(atob(m[2]!), (c) => c.charCodeAt(0));
+    } catch {
+      throw new Error("invalid_icon");
+    }
+  }
   if (!m || bytes.length > ICON_FILE_BYTES || !looksLike(kind, bytes)) throw new Error("invalid_icon");
   const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].slice(0, 16).map((b) => b.toString(16).padStart(2, "0")).join("");
   const name = `${hash}.${kind}`;

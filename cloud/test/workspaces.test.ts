@@ -32,6 +32,8 @@ test("accounts own workspaces, invite each other, enroll stations and get creden
     assert.deepEqual(aliceMe.workspaces.map((w: any) => w.name), ["Home", "Lab"]);
     assert.equal(aliceMe.user.name, "Name of alice");
     assert.equal((await bob("GET", `/v1/workspaces/${home.id}`)).status, 404);
+    assert.equal((await bob("GET", "/v1/workspaces/%ZZ")).status, 404);
+    assert.equal((await bob("GET", `/v1/workspaces/${home.id}/members/%E0%A4%A`)).status, 404);
 
     // An invitation bound to bob's email; bob previews and accepts it.
     const invite = await (await alice("POST", `/v1/workspaces/${home.id}/invitations`, { role: "member", email: "bob@example.test" })).json() as any;

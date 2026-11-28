@@ -91,3 +91,19 @@ test("bootstrap addresses cannot contain custom routes, DNS sockets, or excessiv
   assert.equal(meshRegistration(JSON.stringify({...value,address:{id:node,addrs:Array(9).fill({Ip:"127.0.0.1:1"})}}),true,false),null);
   assert.equal(meshRegistration("x".repeat(8193),true,false),null);
 });
+
+test("mesh relay POST routes return 4xx on malformed JSON, wrong content type, or oversized bodies", async () => {
+  const h = await harness();
+  try {
+    for (const [route, limit] of [["events", 4096], ["enroll", 20_480], ["address", 20_480]] as const) {
+      const badJson = await h.fetch(`/v1/relays/mesh/${route}`, { method: "POST", headers: { "content-type": "application/json" }, body: "{not-json" });
+      assert.equal(badJson.status, 400, `${route} bad json`);
+      const wrongType = await h.fetch(`/v1/relays/mesh/${route}`, { method: "POST", headers: { "content-type": "text/plain" }, body: "{}" });
+      assert.equal(wrongType.status, 400, `${route} wrong content-type`);
+      const tooLarge = await h.fetch(`/v1/relays/mesh/${route}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pad: "x".repeat(limit + 32) }) });
+      assert.equal(tooLarge.status, 413, `${route} too large`);
+    }
+  } finally {
+    await h.close();
+  }
+});

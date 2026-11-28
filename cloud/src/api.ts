@@ -175,6 +175,16 @@ async function body(request: Request, maximum?: number): Promise<Record<string, 
   return readJson(request, maximum);
 }
 
+async function jsonBody(request: Request, maximum?: number): Promise<Record<string, unknown> | Response> {
+  try {
+    return await body(request, maximum);
+  } catch (error) {
+    return error instanceof Error && error.message === "body_too_large"
+      ? reply({ error: "body_too_large" }, 413)
+      : reply({ error: "invalid_request" }, 400);
+  }
+}
+
 /** How large a change to a workspace or a station, or an account's own picture, may be: it can carry a picture put up
  * (icons.ts). */
 const MARK_BODY = ICON_URL_CHARS + 8192;
@@ -189,7 +199,8 @@ export async function api(request: Request, env: Env, url: URL): Promise<Respons
   // A relay putting itself on the cloud's list with a token its operator made (relay-registry.ts, relay-enroll.sh):
   // { token, url } (url where the token names none). Answers its secret, which its counters come with.
   if (path === "/v1/relays/mesh/events" && method === "POST") {
-    const input = await body(request, 4096);
+    const input = await jsonBody(request, 4096);
+    if (input instanceof Response) return input;
     return env.DIRECTORY.getByName("primary").fetch(new Request("https://directory/mesh-relays/events", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
     }));
@@ -198,8 +209,9 @@ export async function api(request: Request, env: Env, url: URL): Promise<Respons
     return directory(async () => ({ relays: await env.DIRECTORY.getByName("primary").meshRelays() }));
   }
   if ((path === "/v1/relays/mesh/enroll" || path === "/v1/relays/mesh/address") && method === "POST") {
-    const input = await body(request, 20_480);
-    return directory(() => env.DIRECTORY.getByName("primary").meshRelayRegister(input.body,input.signature,path.endsWith("/enroll")));
+    const input = await jsonBody(request, 20_480);
+    if (input instanceof Response) return input;
+    return directory(() => env.DIRECTORY.getByName("primary").meshRelayRegister(input.body, input.signature, path.endsWith("/enroll")));
   }
   if (path === "/v1/relays/enroll" && method === "POST") {
     const input = await readJson(request).catch(() => null);
@@ -431,7 +443,12 @@ export async function api(request: Request, env: Env, url: URL): Promise<Respons
   if (path === "/v1/invitations/preview" && method === "POST") return directory(() => dir.previewInvitation(text("token")));
   if (path === "/v1/invitations/accept" && method === "POST") return directory(() => dir.acceptInvitation(sub, claims.email, text("token")));
 
-  const parts = path.split("/").slice(3).map(decodeURIComponent); // after /v1/workspaces/
+  let parts: string[];
+  try {
+    parts = path.split("/").slice(3).map(decodeURIComponent); // after /v1/workspaces/
+  } catch {
+    return reply({ error: "not_found" }, 404);
+  }
   const [ws, kind, target, action] = parts;
   if (!ws || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(ws)) return reply({ error: "not_found" }, 404);
   // A picture sent as the icon, kept in the bucket once the caller and other fields pass checks (icons.ts).

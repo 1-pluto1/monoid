@@ -47,7 +47,7 @@ test("an account's own picture is shown in place of its sign-in's until it takes
     // Its address may be given again; anything not a picture kept here, or not a picture, is refused, and changes nothing.
     assert.equal((await alice("PUT", "/v1/me/picture", { picture: own })).status, 200);
     // (the one too large is just past a picture's limit, within the call's: events.test.ts says why)
-    for (const bad of ["data:image/svg+xml;base64,PHN2Zz4=", "data:image/png;base64,R0lGODlh", `data:image/jpeg;base64,/9j/${"A".repeat(ICON_URL_CHARS)}`, GOOGLE, "glyph:rocket", ""]) {
+    for (const bad of ["data:image/svg+xml;base64,PHN2Zz4=", "data:image/png;base64,R0lGODlh", "data:image/png;base64,A", "data:image/png;base64,AA=", `data:image/jpeg;base64,/9j/${"A".repeat(ICON_URL_CHARS)}`, GOOGLE, "glyph:rocket", ""]) {
       assert.equal((await alice("PUT", "/v1/me/picture", { picture: bad })).status, 400, bad.slice(0, 30));
     }
     assert.equal((await alice("PUT", "/v1/me/picture", {})).status, 400, "none");
