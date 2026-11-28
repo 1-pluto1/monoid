@@ -382,8 +382,11 @@ fn ro_agent_home_for_viewer(
   fs : station_jobs::FsPort,
   data_dir : String,
   viewer : station_api::Viewer,
+  config_path_override : Option[String] = None,
 ) -> Result[String, station_api::ApiError] {
-  let agent_root = nodepath::join(fs.sep, [data_dir, "agent"])
+  let cfg_path = effective_config_path_for_agent_home(data_dir, fs.sep, config_path_override=config_path_override)
+  let cfg_text = (fs.read_file)(cfg_path)
+  let agent_root = resolve_agent_home_from_config_text(data_dir, fs.sep, cfg_text)
   if viewer.home {
     return Ok(agent_root)
   }
@@ -490,7 +493,7 @@ pub fn ReadOpsPort::in_memory(
 pub fn ReadOpsPort::production(
   whole_store : WholeStore,
   agents : WholeAgents,
-  home_ws_str : String,
+  get_home_ws : () -> String,
   shared_transfers : station_screens::TransfersManager,
 ) -> ReadOpsPort {
   let sep = agents.jobs.fs.sep
@@ -861,7 +864,7 @@ pub fn ReadOpsPort::production(
           "SELECT s.key, s.title, COALESCE(s.ws, ?1) AS eff_ws," +
           " (SELECT ts.thread FROM thread_sessions ts WHERE ts.session = s.key ORDER BY ts.joined_at DESC LIMIT 1) AS tid" +
           " FROM sessions s WHERE s.key = ?2",
-          [base_codec::json_str(home_ws_str), base_codec::json_str(sk)],
+          [base_codec::json_str(get_home_ws()), base_codec::json_str(sk)],
         ) {
           Ok(Some(r)) => {
             let eff_ws = match r.get("eff_ws") { Some(base_codec::Json::Str(s)) => s, _ => "" }
@@ -2272,8 +2275,9 @@ fn read_workspace_projects_jsonl(
   fs : station_jobs::FsPort,
   data_dir : String,
   viewer : station_api::Viewer,
+  config_path_override : Option[String] = None,
 ) -> Result[(String, station_api::ParsedProjectsJsonl), station_api::ApiError] {
-  let home = match ro_agent_home_for_viewer(fs, data_dir, viewer) {
+  let home = match ro_agent_home_for_viewer(fs, data_dir, viewer, config_path_override=config_path_override) {
     Ok(h) => h
     Err(e) => return Err(e)
   }
@@ -2326,6 +2330,7 @@ pub fn dispatch_wave17c3a_call_op(
   hooks : WholeApiRuntimeHooks,
   port : WholeApiRuntimePort,
   now_ms : Int64,
+  config_path_override : Option[String] = None,
 ) -> Option[Result[base_codec::Json, station_api::ApiError]] {
   let fs = agents.jobs.fs
   let data_dir = agents.config.data_dir
@@ -2575,7 +2580,7 @@ pub fn dispatch_wave17c3a_call_op(
       }
       Some(_) => return Some(Err(station_api::ApiError::new(400, "refs must be an array of strings or null")))
     }
-    let (jsonl_path, parsed) = match read_workspace_projects_jsonl(fs, data_dir, req.viewer) {
+    let (jsonl_path, parsed) = match read_workspace_projects_jsonl(fs, data_dir, req.viewer, config_path_override=config_path_override) {
       Ok(v) => v
       Err(e) => return Some(Err(e))
     }

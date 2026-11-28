@@ -1,0 +1,397 @@
+// Wave 17E-4B pure-Pion unit tests (run via `pionc test --json pion/station-main`):
+// 1. CSPRNG UUID v4 `opId` generation (RFC 4122 v4 bits, non-identical across draws, fail-closed on RNG error).
+// 2. Causal chain `forward_resolve_target` (multi-hop rename, same-ms origin_seq tie-break, self_op_id skip).
+// 3. `PROJECTS.jsonl` consumer (`rename_project_info_doc`, `ensure_project_registered_doc`,
+//    `prune_applied_op_ids_doc`, idempotent `op_id` receipt replay, `0600` private mode skip).
+// 4. Partial failure guard (`is_partial_rename_result` prevents caching degraded outcomes in `AdminApi`).
+// 5. `tools.access.get` / `tools.access.put` 1:1 parity (`read_ops`, `manages_station`, `read_only_handover`).
+
+import "base_codec"
+import "station_api"
+import "station_ops"
+
+test "wave17e4b: generate_csprng_uuid_v4 sets RFC 4122 v4 bits and fails closed on RNG error" {
+  let mut call_n = 0
+  let mock_rng = fn(n : Int) -> Result[Bytes, String] {
+    call_n = call_n + 1
+    let b = Bytes::new(n)
+    for i in 0..<n {
+      b[i] = ((i * 17 + call_n * 31) & 255).to_byte()
+    }
+    Ok(b)
+  }
+  let u1 = match generate_csprng_uuid_v4(mock_rng) {
+    Ok(s) => s
+    Err(e) => panic("generate_csprng_uuid_v4 failed: " + e)
+  }
+  let u2 = match generate_csprng_uuid_v4(mock_rng) {
+    Ok(s) => s
+    Err(e) => panic("generate_csprng_uuid_v4 second call failed: " + e)
+  }
+  if u1.length() != 36 || u2.length() != 36 {
+    panic("expected 36-char UUID v4, got: " + u1)
+  }
+  if u1 == u2 {
+    panic("CSPRNG UUID v4 must not collide: " + u1)
+  }
+  if u1.slice(14, 15) != "4" {
+    panic("expected UUID version 4, got: " + u1)
+  }
+  let vch = u1.slice(19, 20)
+  if vch != "8" && vch != "9" && vch != "a" && vch != "b" {
+    panic("expected RFC 4122 variant, got: " + u1)
+  }
+  // Fail-closed when RNG returns error or short buffer
+  match generate_csprng_uuid_v4(fn(_n : Int) -> Result[Bytes, String] { Err("entropy unavailable") }) {
+    Err(_) => ()
+    Ok(s) => panic("expected fail-closed error on RNG failure, got: " + s)
+  }
+  match generate_csprng_uuid_v4(fn(_n : Int) -> Result[Bytes, String] { Ok(Bytes::new(8)) }) {
+    Err(_) => ()
+    Ok(s) => panic("expected fail-closed error on short RNG bytes, got: " + s)
+  }
+}
+
+test "wave17e4b: forward_resolve_target resolves causal chains and respects origin_seq & self_op_id" {
+  let events : Array[station_api::ProjectRenameEventMeta] = [
+    station_api::ProjectRenameEventMeta::{
+      seq: 1L,
+      from: "Alpha",
+      to: "Beta",
+      renamed_at: 1000L,
+      wall_at: 1000L,
+      origin_seq: 1L,
+      op_id: Some("op-1"),
+    },
+    station_api::ProjectRenameEventMeta::{
+      seq: 2L,
+      from: "Beta",
+      to: "Gamma",
+      renamed_at: 1000L,
+      wall_at: 1000L,
+      origin_seq: 2L,
+      op_id: Some("op-2"),
+    },
+    station_api::ProjectRenameEventMeta::{
+      seq: 3L,
+      from: "Gamma",
+      to: "Delta",
+      renamed_at: 2000L,
+      wall_at: 2000L,
+      origin_seq: 3L,
+      op_id: Some("op-3"),
+    },
+  ]
+  let r1 = station_api::forward_resolve_target(events, "Beta", 1000L, 1L, Some("op-1"), 1000L)
+  if r1.target != "Delta" || !r1.advanced || r1.at != 2000L || r1.origin_seq != 3L || r1.seq != 3L {
+    panic("expected Delta at (2000, 3), got: " + r1.target)
+  }
+  let r2 = station_api::forward_resolve_target(events, "Beta", 1000L, 1L, Some("op-2"), 1000L)
+  if r2.target != "Beta" || r2.advanced {
+    panic("expected skip of self_op_id op-2 to stop at Beta, got: " + r2.target)
+  }
+}
+
+test "wave17e4b: PROJECTS.jsonl consumer rename/merge/replay/prune and 0600 private isolation" {
+  let init_jsonl = "{\"name\":\"Alpha\",\"note\":\"Alpha note\",\"noteAt\":100,\"refs\":[\"https://a.example\"],\"refsAt\":100,\"refAts\":{\"https://a.example\":100},\"updatedAt\":100}\n{\"name\":\"Beta\",\"note\":\"Beta note\",\"noteAt\":150,\"refs\":[\"https://b.example\"],\"refsAt\":150,\"refAts\":{\"https://b.example\":150},\"updatedAt\":150}\n"
+  // Verify MemFs 0600 private isolation with skip_private=true
+  let mfs = station_ops::MemFs::new()
+  let path = match workspace_projects_jsonl_path("/agent", "ws-1", "ws-1", "/") {
+    Ok(p) => p
+    Err(e) => panic("workspace_projects_jsonl_path failed: " + e)
+  }
+  // Path traversal / invalid workspace id rejected before joining workspaces/<ws>
+  if !is_valid_workspace_id("ws_good-123") || is_valid_workspace_id("../evil") || is_valid_workspace_id("a/b") || is_valid_workspace_id("") {
+    panic("is_valid_workspace_id validation failed")
+  }
+  match workspace_projects_jsonl_path("/agent", "../evil", "ws-home", "/") {
+    Ok(_) => panic("expected invalid workspace id to be rejected")
+    Err(_) => ()
+  }
+  // Non-ENOENT stat error must NOT be treated as empty PROJECTS.jsonl
+  let base_ops = mfs.ops()
+  let denied_ops = station_ops::OpsFs::{
+    read_bytes: base_ops.read_bytes,
+    write_bytes: base_ops.write_bytes,
+    stat: fn(_p : String) -> Result[station_ops::FileMeta, station_ops::FsErr] {
+      Err(station_ops::FsErr::PermissionDenied("EACCES"))
+    },
+    lstat: base_ops.lstat,
+    readlink: base_ops.readlink,
+    realpath: base_ops.realpath,
+    mkdir_p: base_ops.mkdir_p,
+    rename: base_ops.rename,
+    remove: base_ops.remove,
+    truncate: base_ops.truncate,
+    readdir: base_ops.readdir,
+    rotate_in_place_native: base_ops.rotate_in_place_native,
+  }
+  match read_projects_jsonl_for_ws(denied_ops, "/agent", "ws-1", "ws-1", "/", false) {
+    Ok(_) => panic("expected EACCES stat error to fail, not return empty doc")
+    Err(msg) => if !msg.contains("EACCES") { panic("unexpected error: " + msg) }
+  }
+  // sort_name_counts sorts by count DESC then name ASC
+  let nc = [("zeta", 1, false), ("alpha", 1, false), ("beta", 5, true)]
+  sort_name_counts(nc)
+  if nc[0].0 != "beta" || nc[1].0 != "alpha" || nc[2].0 != "zeta" {
+    panic("sort_name_counts order wrong")
+  }
+  let _ = mfs.put_text(path, init_jsonl, 384) // 0600
+  match read_projects_jsonl_for_ws(mfs.ops(), "/agent", "ws-1", "ws-1", "/", true) {
+    Ok(p) => if p.entries.length() != 0 { panic("0600 PROJECTS.jsonl leaked with skip_private=true") }
+    Err(e) => panic("read_projects_jsonl_for_ws failed: " + e)
+  }
+  let parsed = match read_projects_jsonl_for_ws(mfs.ops(), "/agent", "ws-1", "ws-1", "/", false) {
+    Ok(p) => p
+    Err(e) => panic("read_projects_jsonl_for_ws(false) failed: " + e)
+  }
+  // Merge Alpha -> Beta with op_id="op-merge-1"
+  let mres = match station_api::rename_project_info_doc(
+    parsed,
+    "Alpha",
+    "Beta",
+    200L,
+    true,
+    Some("op-merge-1"),
+    Some(["op-merge-1"]),
+  ) {
+    Ok(r) => r
+    Err(e) => panic("rename_project_info_doc failed: " + e)
+  }
+  if !mres.changed || mres.already_applied {
+    panic("expected changed=true, already_applied=false")
+  }
+  // Roundtrip through canonical JSONL serialization & re-parse
+  let serialized = match station_api::serialize_projects_jsonl_with_keep(mres.doc, Some(["op-merge-1"])) {
+    Ok(s) => s
+    Err(e) => panic("serialize failed: " + e)
+  }
+  let reparsed = match station_api::parse_projects_jsonl(serialized, true) {
+    Ok(p) => p
+    Err(e) => panic("reparse failed: " + e)
+  }
+  if reparsed.entries.length() != 1 || reparsed.entries[0].name != "Beta" {
+    panic("expected only Beta after merge")
+  }
+  let beta = reparsed.entries[0]
+  match beta.note {
+    Some(n) => if !n.contains("Beta note") || !n.contains("Alpha note") { panic("merged note missing content: " + n) }
+    None => panic("merged note missing")
+  }
+  if beta.refs.length() != 2 {
+    panic("expected 2 merged refs, got " + beta.refs.length().to_string())
+  }
+  // Replay with same op_id MUST short-circuit as already_applied=true!
+  let replay = match station_api::rename_project_info_doc(
+    reparsed,
+    "Alpha",
+    "Beta",
+    250L,
+    true,
+    Some("op-merge-1"),
+    Some(["op-merge-1"]),
+  ) {
+    Ok(r) => r
+    Err(e) => panic("replay failed: " + e)
+  }
+  if replay.changed || !replay.already_applied {
+    panic("expected replay already_applied=true, changed=false")
+  }
+  // Prune op-merge-1 once confirmed
+  let (pruned_doc, pruned_changed) = station_api::prune_applied_op_ids_doc(reparsed, ["op-merge-1"], Some([]))
+  if !pruned_changed || pruned_doc.entries[0].applied_op_ids.length() != 0 {
+    panic("expected op-merge-1 to be pruned")
+  }
+  // Ensure new project registration
+  let (reg_doc, reg_changed) = match station_api::ensure_project_registered_doc(pruned_doc, "Gamma", 300L, None) {
+    Ok(v) => v
+    Err(e) => panic("ensure_project_registered_doc failed: " + e)
+  }
+  if !reg_changed || reg_doc.entries.length() != 2 {
+    panic("expected Gamma to be registered")
+  }
+}
+
+test "wave17e4b: partial failure outcomes MUST NOT be cached in AdminApi permanent success cache" {
+  if !is_partial_rename_result(Some("disk full"), None, ["ok"]) {
+    panic("infoError must be treated as partial failure (noCache)")
+  }
+  if !is_partial_rename_result(None, Some("roster timeout"), []) {
+    panic("rosterError must be treated as partial failure (noCache)")
+  }
+  if !is_partial_rename_result(None, None, ["ok", "offline"]) {
+    panic("offline peer must be treated as partial failure (noCache)")
+  }
+  if !is_partial_rename_result(None, None, ["ok", "error"]) {
+    panic("error peer must be treated as partial failure (noCache)")
+  }
+  if is_partial_rename_result(None, None, ["ok", "rig"]) {
+    panic("ok + rig peers should NOT be treated as partial failure")
+  }
+  if is_partial_rename_result(None, None, []) {
+    panic("empty peers with no errors should NOT be treated as partial failure")
+  }
+}
+
+test "wave17e4b: tools.access.get and tools.access.put enforce manages_station, read_only_handover, and read_ops parity" {
+  let (_, _, api, _, _, _) = make_mem_whole_api_fixture()
+  let owner_v = make_test_viewer("owner@example.com", "u-owner", "ws-main", true, "owner")
+  let member_v = make_test_viewer("member@example.com", "u-member", "ws-main", true, "member")
+  let owner = PeerIdentity::AuthenticatedMember(owner_v, "ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+  let member = PeerIdentity::AuthenticatedMember(member_v, "ed25519:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+  let empty_status = fn(_v : station_api::Viewer) { ([], []) }
+
+  // 1. read_only_handover=true blocks PUT /tools/access with 403
+  api.read_only_handover = true
+  match api.handle_authenticated_api_with_status(owner, "PUT", "/tools/access", [], "{\"access\":\"read\"}".to_bytes(), 1000L, empty_status) {
+    station_http::HandlerAction::Respond(r) => if r.status != 403 { panic("expected 403 during read_only_handover, got " + r.status.to_string()) }
+    _ => panic("expected Respond")
+  }
+  api.read_only_handover = false
+
+  // 2. GET /tools/access returns default "off" + levels + read_ops + about
+  match api.handle_authenticated_api_with_status(member, "GET", "/tools/access", [], Bytes::new(0), 1001L, empty_status) {
+    station_http::HandlerAction::Respond(r) => {
+      let s = r.body.to_string()
+      if r.status != 200 || !s.contains("\"access\":\"off\"") || !s.contains("\"read_ops\"") || !s.contains("\"fs.read\"") {
+        panic("unexpected GET /tools/access response: " + s)
+      }
+    }
+    _ => panic("expected Respond")
+  }
+
+  // 3. Non-manager member gets 403 on PUT /tools/access
+  match api.handle_authenticated_api_with_status(member, "PUT", "/tools/access", [], "{\"access\":\"read\"}".to_bytes(), 1002L, empty_status) {
+    station_http::HandlerAction::Respond(r) => if r.status != 403 { panic("expected 403 for non-manager, got " + r.status.to_string()) }
+    _ => panic("expected Respond")
+  }
+
+  // 4. Invalid access value gets 400
+  match api.handle_authenticated_api_with_status(owner, "PUT", "/tools/access", [], "{\"access\":\"admin\"}".to_bytes(), 1003L, empty_status) {
+    station_http::HandlerAction::Respond(r) => if r.status != 400 { panic("expected 400 for invalid access, got " + r.status.to_string()) }
+    _ => panic("expected Respond")
+  }
+
+  // 5. Manager PUT /tools/access {"access":"read"} persists to config.json and roundtrips via GET
+  match api.handle_authenticated_api_with_status(owner, "PUT", "/tools/access", [], "{\"access\":\"read\"}".to_bytes(), 1004L, empty_status) {
+    station_http::HandlerAction::Respond(r) => {
+      let s = r.body.to_string()
+      if r.status != 200 || !s.contains("\"access\":\"read\"") || !s.contains("\"read_ops\"") {
+        panic("unexpected PUT /tools/access response: " + s)
+      }
+    }
+    _ => panic("expected Respond")
+  }
+  match api.handle_authenticated_api_with_status(member, "GET", "/tools/access", [], Bytes::new(0), 1005L, empty_status) {
+    station_http::HandlerAction::Respond(r) => {
+      if r.status != 200 || !r.body.to_string().contains("\"access\":\"read\"") {
+        panic("GET /tools/access did not reflect persisted read: " + r.body.to_string())
+      }
+    }
+    _ => panic("expected Respond")
+  }
+}
+
+test "wave17e4b R3: custom agentHome resolution, strict 3rd-attempt CAS conflict, and SQLite Result error propagation" {
+  // 1. Custom agentHome resolution (absolute, relative, and default fallback)
+  let abs_ah = resolve_agent_home_from_config_text("/data", "/", Some("{\"agentHome\":\"/custom/agent-home\"}"))
+  if abs_ah != "/custom/agent-home" {
+    panic("expected /custom/agent-home, got: " + abs_ah)
+  }
+  let rel_ah = resolve_agent_home_from_config_text("/data", "/", Some("{\"agentHome\":\"my-agent\"}"))
+  if rel_ah != "/data/my-agent" {
+    panic("expected /data/my-agent, got: " + rel_ah)
+  }
+  let def_ah = resolve_agent_home_from_config_text("/data", "/", None)
+  if def_ah != "/data/agent" {
+    panic("expected /data/agent, got: " + def_ah)
+  }
+  // 2. Strict CAS conflict on final (3rd) attempt MUST return Err and NEVER clobber!
+  let mfs = station_ops::MemFs::new()
+  let path = match workspace_projects_jsonl_path("/agent", "ws-1", "ws-1", "/") {
+    Ok(p) => p
+    Err(e) => panic("path failed: " + e)
+  }
+  let _ = mfs.put_text(path, "{\"name\":\"Alpha\",\"note\":\"v1\",\"updatedAt\":100}\n", 420)
+  let base_ops = mfs.ops()
+  let mut tick_mtime = 1000L
+  let drifting_ops = station_ops::OpsFs::{
+    read_bytes: base_ops.read_bytes,
+    write_bytes: base_ops.write_bytes,
+    stat: fn(p : String) -> Result[station_ops::FileMeta, station_ops::FsErr] {
+      match (base_ops.stat)(p) {
+        Ok(m) => {
+          tick_mtime = tick_mtime + 1L
+          Ok(station_ops::FileMeta::{
+            size: m.size,
+            mtime_ms: tick_mtime,
+            mtime_exact: tick_mtime.to_string(),
+            ino: m.ino,
+            mode: m.mode,
+            is_dir: m.is_dir,
+            is_file: m.is_file,
+            is_link: m.is_link,
+          })
+        }
+        Err(e) => Err(e)
+      }
+    },
+    lstat: base_ops.lstat,
+    readlink: base_ops.readlink,
+    realpath: base_ops.realpath,
+    mkdir_p: base_ops.mkdir_p,
+    rename: base_ops.rename,
+    remove: base_ops.remove,
+    truncate: base_ops.truncate,
+    readdir: base_ops.readdir,
+    rotate_in_place_native: base_ops.rotate_in_place_native,
+  }
+  let mut writes_attempted = 0
+  match apply_rename_project_info_file_with(
+    drifting_ops,
+    "/agent",
+    "ws-1",
+    "ws-1",
+    "/",
+    "Alpha",
+    "Beta",
+    200L,
+    true,
+    Some("op-cas"),
+    None,
+    fn(_p : String, _b : Bytes, _m : Int) -> Bool {
+      writes_attempted = writes_attempted + 1
+      true
+    },
+  ) {
+    Ok(_) => panic("expected 3rd-attempt CAS conflict to return Err, not clobber")
+    Err(e) => if !e.contains("retry exhausted") { panic("unexpected CAS error: " + e) }
+  }
+  if writes_attempted != 0 {
+    panic("3rd-attempt CAS conflict MUST NOT write to disk!")
+  }
+  // 3. Verify `ro_agent_home_for_viewer` reads custom `agentHome` from `<data>/config.json` (same resolver as rename/merge)
+  let (_, agents_fix, _, _, _, _) = make_mem_whole_api_fixture()
+  let jfs = agents_fix.jobs.fs
+  let _ = (jfs.write_file)(agents_fix.config.data_dir + "/config.json", "{\"agentHome\":\"custom-agent\"}")
+  let v_home = station_api::Viewer::owner("a@example.com", "ws-1")
+  match ro_agent_home_for_viewer(jfs, agents_fix.config.data_dir, v_home) {
+    Ok(h) => if !h.ends_with("/custom-agent") { panic("expected .../custom-agent, got: " + h) }
+    Err(e) => panic("ro_agent_home_for_viewer failed: " + e.message)
+  }
+}
+
+test "wave17e4b R4: STILLFAIL_CONFIG config_path_override drives ro_agent_home_for_viewer and resolve_agent_home_ops" {
+  let eff = effective_config_path_for_agent_home("/data", "/", config_path_override=Some("/override/custom-config.json"))
+  if eff != "/override/custom-config.json" {
+    panic("expected /override/custom-config.json, got: " + eff)
+  }
+  let (_, agents_fix, _, _, _, _) = make_mem_whole_api_fixture()
+  let jfs = agents_fix.jobs.fs
+  let _ = (jfs.write_file)("/override/custom-config.json", "{\"agentHome\":\"/opt/overridden-agent\"}")
+  let v_home = station_api::Viewer::owner("a@example.com", "ws-1")
+  match ro_agent_home_for_viewer(jfs, agents_fix.config.data_dir, v_home, config_path_override=Some("/override/custom-config.json")) {
+    Ok(h) => if h != "/opt/overridden-agent" { panic("expected /opt/overridden-agent, got: " + h) }
+    Err(e) => panic("ro_agent_home_for_viewer override failed: " + e.message)
+  }
+}

@@ -37,7 +37,7 @@ pub struct WholeCoreConfig {
   pub assets_dir : String
   pub runner_bin : String
   pub mcp_port : Int
-  pub home_workspace : String
+  pub mut home_workspace : String
   pub allowed_workspaces : Array[String]
   /// Workspaces in which this full station operates strictly as an isolated `MixedRig`.
   pub rig_workspaces : Array[String]
@@ -702,10 +702,10 @@ pub fn WholeCore::init_pre_handover(
     }
   }
   let updates = station_drivers::RuntimeUpdatesManager::new()
-  let home_ws_for_wt = config.home_workspace
-  let waiting_tracker = station_api::WaitingTracker::new(build_waiting_store_port(store, home_ws_for_wt, home_ws_for_wt))
+  let get_live_home_ws = fn() -> String { auth_policy.home_workspace }
+  let waiting_tracker = station_api::WaitingTracker::new(build_waiting_store_port_live(store, get_live_home_ws, get_live_home_ws))
   let wt_factory = fn(ws : String) -> station_api::WaitingTracker {
-    station_api::WaitingTracker::new(build_waiting_store_port(store, ws, home_ws_for_wt))
+    station_api::WaitingTracker::new(build_waiting_store_port_live(store, fn() -> String { ws }, get_live_home_ws))
   }
   let api = WholeApi::new(
     store,
@@ -1413,4 +1413,22 @@ pub fn WholeCore::active_object_count(self : WholeCore) -> Int {
   self.agents.active_token_count() +
   self.agents.jobs.list().length() +
   self.rig.wired_count()
+}
+
+/// Hot-switch the station's home workspace across config, agents, and peer auth policy
+/// (called when a rig-only machine promotes a newly joined full workspace to home).
+pub fn WholeCore::set_home_workspace(self : WholeCore, new_home : String) -> Unit {
+  if new_home.length() == 0 {
+    return
+  }
+  self.config.home_workspace = new_home
+  self.agents.config.home_ws = new_home
+  self.api.auth_policy.set_home_workspace(new_home)
+  // Invalidate cached waiting trackers so workspace-scoped `COALESCE(s.ws, home)` queries
+  // immediately reflect the new home workspace ownership without stale cached entries.
+  self.waiting_tracker.reset()
+  let ks = self.api.waiting_trackers.keys()
+  for i in 0..<ks.length() {
+    self.api.waiting_trackers.remove(ks[i])
+  }
 }

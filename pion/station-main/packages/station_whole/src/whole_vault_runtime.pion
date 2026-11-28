@@ -999,7 +999,7 @@ pub fn run_vault_daemon_e2e_selftest() -> Result[Unit, String] {
     allowed_workspaces: [ws],
     verify_fn: None,
   }
-  let port = WholeApiRuntimePort::production(ws_store, agents, ws, station_screens::TransfersManager::new(fn(n : Int) -> Bytes { Bytes::new(n) }))
+  let port = WholeApiRuntimePort::production(ws_store, agents, fn() -> String { ws }, station_screens::TransfersManager::new(fn(n : Int) -> Bytes { Bytes::new(n) }))
 
   let eph_priv = Bytes::new(32)
   for i in 0..<32 { eph_priv[i] = (80 + i) as Byte }

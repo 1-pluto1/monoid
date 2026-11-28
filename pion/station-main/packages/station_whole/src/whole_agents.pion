@@ -28,7 +28,7 @@ pub struct WholeAgentsConfig {
   pub assets_dir : String
   pub runner_bin : String
   pub mut mcp_port : Int
-  pub home_ws : String
+  pub mut home_ws : String
 }
 
 pub struct McpHttpResponse {

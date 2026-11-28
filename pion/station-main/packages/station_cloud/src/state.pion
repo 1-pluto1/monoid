@@ -1360,6 +1360,29 @@ pub fn CloudStore::open(
   }
 }
 
+/// Reload `cloud.json` and pinned lock caches from disk after an external or join update
+/// (1:1 with Node `Cloud.reload(true)`).
+pub fn CloudStore::reload(self : CloudStore) -> Bool {
+  let next_state = match read_state(self.data, self.fs, sep=self.sep) {
+    Ok(s) => s
+    Err(_) => return false
+  }
+  self.state = next_state
+  self.lock = read_lock(self.data, self.fs, ws=None, sep=self.sep, verify_fn=self.verify_fn)
+  self.joined_locks = Map::new()
+  let removed = match next_state {
+    Some(s) => match s.removed_at {
+      Some(_) => true
+      None => false
+    }
+    None => false
+  }
+  if removed {
+    self.peers_current = false
+  }
+  true
+}
+
 /// Production constructor: wires `CloudFs::from_shell` and defaults signature verification
 /// to `client/shell`'s formally verified `libcrux` `crypto.verify` op.
 pub fn CloudStore::open_with_shell(
@@ -2769,12 +2792,14 @@ pub fn apply_join_workspace_response(
         (turned_off_path(lock_path(data, sep=sep)), turned_off_path(joined_lock_path(data, old_home, sep=sep))),
         (pending_lock_path(data, sep=sep), joined_pending_path(data, old_home, sep=sep)),
       ]
-      let moved_back : Array[(String, String)] = []
-      let rollback_moves = fn() -> Unit {
-        let mut rbi = moved_back.length() - 1
+      // Stage copies of old home lock files under `joined/<old_home>/` BEFORE mutating `cloud.json`
+      // so an abrupt crash before `write_state` NEVER leaves old `cloud.json` with missing home locks.
+      let staged_dests : Array[String] = []
+      let remove_after_commit : Array[String] = []
+      let rollback_staged = fn() -> Unit {
+        let mut rbi = staged_dests.length() - 1
         while rbi >= 0 {
-          let (orig_from, orig_to) = moved_back[rbi]
-          let _ = (fs.rename_file)(orig_to, orig_from)
+          let _ = (fs.remove_file)(staged_dests[rbi])
           rbi = rbi - 1
         }
       }
@@ -2782,10 +2807,24 @@ pub fn apply_join_workspace_response(
       while mi < move_pairs.length() {
         let (from, to) = move_pairs[mi]
         if (fs.exists)(from) {
-          match (fs.rename_file)(from, to) {
-            Ok(_) => moved_back.push((from, to))
+          match (fs.read_text)(from) {
+            Ok(Some(content)) => {
+              match (fs.write_private_text)(to, content) {
+                Ok(_) => {
+                  staged_dests.push(to)
+                  remove_after_commit.push(from)
+                }
+                Err(e) => {
+                  rollback_staged()
+                  return Err(e)
+                }
+              }
+            }
+            Ok(None) => {
+              let _ = (fs.remove_file)(to)
+            }
             Err(e) => {
-              rollback_moves()
+              rollback_staged()
               return Err(e)
             }
           }
@@ -2793,23 +2832,6 @@ pub fn apply_join_workspace_response(
           let _ = (fs.remove_file)(to)
         }
         mi = mi + 1
-      }
-      let _ = (fs.remove_file)(pending_lock_path(data, sep=sep))
-      let mut wrote_new_pending = false
-      match lock_hash {
-        Some(h) => {
-          match (fs.write_private_text)(
-            pending_lock_path(data, sep=sep),
-            base_codec::json_stringify(base_codec::json_obj([("hash", base_codec::json_str(h))])),
-          ) {
-            Ok(_) => wrote_new_pending = true
-            Err(e) => {
-              rollback_moves()
-              return Err(e)
-            }
-          }
-        }
-        None => ()
       }
       let demoted = Joined::{
         workspace: old_home,
@@ -2850,12 +2872,32 @@ pub fn apply_join_workspace_response(
       match write_state(data, now, fs, sep=sep) {
         Ok(_) => ()
         Err(e) => {
-          if wrote_new_pending {
-            let _ = (fs.remove_file)(pending_lock_path(data, sep=sep))
-          }
-          rollback_moves()
+          rollback_staged()
           return Err(e)
         }
+      }
+      // `cloud.json` is now atomically promoted: remove old home lock files and write new home pending lock if needed.
+      for ri in 0..<remove_after_commit.length() {
+        match (fs.remove_file)(remove_after_commit[ri]) {
+          Ok(_) => ()
+          Err(e) => return Err(e)
+        }
+      }
+      match (fs.remove_file)(pending_lock_path(data, sep=sep)) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+      match lock_hash {
+        Some(h) => {
+          match (fs.write_private_text)(
+            pending_lock_path(data, sep=sep),
+            base_codec::json_stringify(base_codec::json_obj([("hash", base_codec::json_str(h))])),
+          ) {
+            Ok(_) => ()
+            Err(e) => return Err(e)
+          }
+        }
+        None => ()
       }
     } else {
       match lock_hash {

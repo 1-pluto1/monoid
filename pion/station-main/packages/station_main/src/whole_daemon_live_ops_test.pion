@@ -371,3 +371,317 @@ test "wave17d2 r6: updates.check binds beta channel without updateChannel and dr
     panic("stable view leaked cached beta check state: " + stable_view_s)
   }
 }
+
+test "wave17e4b: durable join constants, CloudStore::reload, PeerAuthPolicy::set_home_workspace, and disconnect detach" {
+  // Verify pre-allocated disjoint event & MuxToken::Tagged ranges
+  if PROJECTS_WS_EVENT_BASE != 55834574848L || PROJECTS_WS_EVENT_END != 60129542144L {
+    panic("PROJECTS_WS_EVENT_BASE/END mismatch")
+  }
+  if JOIN_TOK_HTTP_OPEN < 5310 || JOIN_TOK_HTTP_OPEN > 5319 || JOIN_TOK_HTTP_READ < 5310 || JOIN_TOK_HTTP_READ > 5319 {
+    panic("JOIN_TOK_HTTP_OPEN/READ outside allocated 5310..5319 range")
+  }
+  // Verify CloudStore::reload picks up newly joined workspace written to cloud.json
+  let mem = station_cloud::MemCloudFs::new()
+  let cfs = mem.as_fs()
+  let data = "/tmp/w17e4b-reload-test"
+  mem.files.set(station_cloud::state_path(data), "{\"origin\":\"https://api.still.fail\",\"workspace\":\"ws-home\",\"workspaceName\":\"Home\",\"name\":\"Box\",\"peers\":[],\"joined\":[]}")
+  let cs = station_cloud::CloudStore::open(data, cfs)
+  if cs.memberships(1700000000.0).length() != 1 {
+    panic("expected 1 membership before join")
+  }
+  let seed = Bytes::new(32)
+  for i in 0..<32 {
+    seed[i] = (i + 13).to_byte()
+  }
+  let key = match station_cloud::StationKey::from_seed(seed) { Ok(k) => k, Err(e) => panic(e) }
+  let prep = match station_cloud::prepare_join_workspace(data, cfs, key, "tok_dur_1", "0.1.9999", 1700000000L, store=Some(cs)) {
+    Ok(p) => p
+    Err(e) => panic("prepare_join_workspace failed: " + e)
+  }
+  let _ = match station_cloud::apply_join_workspace_response(
+    data,
+    cfs,
+    prep,
+    200,
+    "{\"workspace\":\"ws-new\",\"workspace_name\":\"New WS\",\"name\":\"Box\"}",
+    1700000001L,
+  ) {
+    Ok(jr) => jr
+    Err(e) => panic("apply_join_workspace_response failed: " + e)
+  }
+  if !cs.reload() {
+    panic("CloudStore::reload returned false")
+  }
+  if cs.memberships(1700000001.0).length() != 2 {
+    panic("expected 2 memberships after reload")
+  }
+  // Verify PeerAuthPolicy::set_home_workspace promotes home and adds to allowed_workspaces
+  let pol = station_whole::PeerAuthPolicy::{
+    station_id: "st-1",
+    station_build: "9999",
+    home_workspace: "ws-home",
+    allowed_workspaces: ["ws-home"],
+    verify_fn: None,
+  }
+  pol.set_home_workspace("ws-new")
+  if pol.home_workspace != "ws-new" || pol.allowed_workspaces.length() != 2 {
+    panic("PeerAuthPolicy::set_home_workspace failed")
+  }
+  // Verify DurableJoinTx detaching waiter_sid preserves tx state and idem_claim (disconnect/timeout resilience)
+  let tx = DurableJoinTx::{
+    join_id: 77L,
+    waiter_sid: Some(999L),
+    conn_id: 1L,
+    viewer: station_api::Viewer::owner("alice@example.com", "ws-home"),
+    lang: station_api::Lang::En,
+    method_name: "POST",
+    norm_path: "/workspaces/join",
+    prep: prep,
+    body_idx: 0,
+    lock_hash: None,
+    rig_person_hash: None,
+    stream_id: Some(42),
+    status: 0,
+    body_chunks: [],
+    total_bytes: 0,
+    max_bytes: 262144,
+    deadline_ms: 20000L,
+    idem_claim: Some(("slot-1", "idem-1")),
+  }
+  tx.waiter_sid = None
+  if tx.stream_id != Some(42) || tx.idem_claim.is_none() {
+    panic("detaching waiter_sid must NOT close outbound stream or abort idem_claim")
+  }
+  // Verify P0: cloud.json peers WITHOUT `online` field MUST default to online=true (only explicit online:false is offline)
+  let peer_no_online = base_codec::json_obj([
+    ("id", base_codec::json_str("peer-no-online")),
+    ("name", base_codec::json_str("Box B")),
+    ("version", base_codec::json_str("0.1.0")),
+  ])
+  let peer_explicit_offline = base_codec::json_obj([
+    ("id", base_codec::json_str("peer-offline")),
+    ("name", base_codec::json_str("Box C")),
+    ("online", base_codec::json_bool(false)),
+  ])
+  let peer_rig = base_codec::json_obj([
+    ("id", base_codec::json_str("peer-rig")),
+    ("mode", base_codec::json_str("tasks")),
+  ])
+  let parsed_peers = full_peer_stations_from_json([peer_no_online, peer_explicit_offline, peer_rig], "self-id")
+  if parsed_peers.length() != 2 {
+    panic("expected 2 non-rig peers, got " + parsed_peers.length().to_string())
+  }
+  if parsed_peers[0].id != "peer-no-online" || !parsed_peers[0].online {
+    panic("peer without online field MUST default to online=true")
+  }
+  if parsed_peers[1].id != "peer-offline" || parsed_peers[1].online {
+    panic("peer with explicit online=false MUST be offline")
+  }
+}
+
+test "wave17e4b R3: join journal I/O preservation, promoted-home crash recovery, and ws_rename_owner mutex" {
+  // 1. Local disk I/O errors MUST NOT be classified as deterministic invalid payload errors
+  if is_deterministic_invalid_join_payload_err("EIO: disk full") {
+    panic("local disk error must NOT clear redeemed 2xx join journal")
+  }
+  if !is_deterministic_invalid_join_payload_err("invalid join response JSON: unexpected EOF") {
+    panic("invalid JSON payload must be classified as deterministic invalid payload")
+  }
+  // 2. Re-entrant promoted-home lock cleanup + new home pending pin recovery
+  let files : Map[String, String] = Map::new()
+  let data = "/tmp/w17e4b-r3-promo"
+  let old_lock = station_cloud::lock_path(data, sep="/")
+  let old_off = station_cloud::turned_off_path(old_lock)
+  let new_pend = station_cloud::pending_lock_path(data, sep="/")
+  files.set(old_lock, "{\"stale\":true}")
+  files.set(old_off, "1")
+  let cfs = station_cloud::CloudFs::{
+    read_text: fn(p : String) -> Result[Option[String], String] { Ok(files.get(p)) },
+    write_private_text: fn(p : String, t : String) -> Result[Unit, String] { files.set(p, t); Ok(()) },
+    mkdir_p: fn(_p : String) -> Result[Unit, String] { Ok(()) },
+    remove_file: fn(p : String) -> Result[Unit, String] { files.remove(p); Ok(()) },
+    rename_file: fn(a : String, b : String) -> Result[Unit, String] {
+      match files.get(a) { Some(v) => { files.set(b, v); files.remove(a) }, None => () }
+      Ok(())
+    },
+    exists: fn(p : String) -> Bool { files.get(p).is_some() },
+  }
+  let pin_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  match finalize_promoted_home_locks_with_fs(data, cfs, Some(pin_hash), "/") {
+    Ok(_) => ()
+    Err(e) => panic("finalize_promoted_home_locks_with_fs failed: " + e)
+  }
+  if files.get(old_lock).is_some() || files.get(old_off).is_some() {
+    panic("promoted-home recovery must clear stale old home locks")
+  }
+  match files.get(new_pend) {
+    Some(t) => if !t.contains(pin_hash) { panic("new home pending-lock missing pin_hash: " + t) }
+    None => panic("promoted-home recovery must write new home pending-lock")
+  }
+}
+
+test "wave17e4b R4: promoted-home lock cleanup propagates unlink errors and stages old_home_ws lock before removal" {
+  let files : Map[String, String] = Map::new()
+  let data = "/tmp/w17e4b-r4-promo"
+  let old_lock = station_cloud::lock_path(data, sep="/")
+  let staged_lock = station_cloud::joined_lock_path(data, "ws-old-home", sep="/")
+  files.set(old_lock, "{\"head\":\"old-head\"}")
+  // 1. Failing remove_file MUST propagate Err (never silently clear join journal!)
+  let fail_cfs = station_cloud::CloudFs::{
+    read_text: fn(p : String) -> Result[Option[String], String] { Ok(files.get(p)) },
+    write_private_text: fn(p : String, t : String) -> Result[Unit, String] { files.set(p, t); Ok(()) },
+    mkdir_p: fn(_p : String) -> Result[Unit, String] { Ok(()) },
+    remove_file: fn(p : String) -> Result[Unit, String] { Err("EPERM: cannot unlink " + p) },
+    rename_file: fn(_a : String, _b : String) -> Result[Unit, String] { Ok(()) },
+    exists: fn(p : String) -> Bool { files.get(p).is_some() },
+  }
+  match finalize_promoted_home_locks_with_fs(data, fail_cfs, None, "/", old_home_ws="ws-old-home") {
+    Ok(_) => panic("expected EPERM unlink failure to return Err, not Ok")
+    Err(e) => if !e.contains("EPERM") { panic("unexpected error: " + e) }
+  }
+  // Old lock was safely staged under joined/ws-old-home/ before attempted removal!
+  if files.get(staged_lock) != Some("{\"head\":\"old-head\"}") {
+    panic("old home lock must be staged under joined/<old_home>/ before removal")
+  }
+  // 2. When remove_file succeeds, old lock is removed and staged copy remains intact
+  let ok_cfs = station_cloud::CloudFs::{
+    read_text: fn(p : String) -> Result[Option[String], String] { Ok(files.get(p)) },
+    write_private_text: fn(p : String, t : String) -> Result[Unit, String] { files.set(p, t); Ok(()) },
+    mkdir_p: fn(_p : String) -> Result[Unit, String] { Ok(()) },
+    remove_file: fn(p : String) -> Result[Unit, String] { files.remove(p); Ok(()) },
+    rename_file: fn(_a : String, _b : String) -> Result[Unit, String] { Ok(()) },
+    exists: fn(p : String) -> Bool { files.get(p).is_some() },
+  }
+  match finalize_promoted_home_locks_with_fs(data, ok_cfs, None, "/", old_home_ws="ws-old-home") {
+    Ok(_) => ()
+    Err(e) => panic("finalize_promoted_home_locks_with_fs ok_cfs failed: " + e)
+  }
+  if files.get(old_lock).is_some() {
+    panic("old home lock must be removed on success")
+  }
+  if files.get(staged_lock) != Some("{\"head\":\"old-head\"}") {
+    panic("staged old home lock must remain intact")
+  }
+}
+
+test "wave17e4b R5: join journal fail-closed, queued outbound RPC finite timeout, and CloudFs remove_file ENOENT vs error" {
+  // 1. has_pending_redeemed_join_journal_with_fs fail-closed semantics
+  let jpath = "/tmp/w17e4b-r5-join-pending.json"
+  let make_fs = fn(res : Result[Option[String], String]) -> station_cloud::CloudFs {
+    station_cloud::CloudFs::{
+      read_text: fn(_p : String) -> Result[Option[String], String] { res },
+      write_private_text: fn(_p : String, _t : String) -> Result[Unit, String] { Ok(()) },
+      mkdir_p: fn(_p : String) -> Result[Unit, String] { Ok(()) },
+      remove_file: fn(_p : String) -> Result[Unit, String] { Ok(()) },
+      rename_file: fn(_a : String, _b : String) -> Result[Unit, String] { Ok(()) },
+      exists: fn(_p : String) -> Bool { true },
+    }
+  }
+  if has_pending_redeemed_join_journal_with_fs(jpath, make_fs(Ok(None))) {
+    panic("missing join journal must return false")
+  }
+  if has_pending_redeemed_join_journal_with_fs(jpath, make_fs(Ok(Some("{\"phase\":\"intent\"}")))) {
+    panic("explicit intent join journal must return false")
+  }
+  if !has_pending_redeemed_join_journal_with_fs(jpath, make_fs(Ok(Some("{\"phase\":\"redeemed\"}")))) {
+    panic("redeemed join journal must return true")
+  }
+  if !has_pending_redeemed_join_journal_with_fs(jpath, make_fs(Ok(Some("{\"status\":200,\"body\":\"{}\"}")))) {
+    panic("legacy join journal missing phase must fail-closed (true)")
+  }
+  if !has_pending_redeemed_join_journal_with_fs(jpath, make_fs(Ok(Some("{corrupt")))) {
+    panic("corrupt join journal must fail-closed (true)")
+  }
+  if !has_pending_redeemed_join_journal_with_fs(jpath, make_fs(Err("EACCES"))) {
+    panic("unreadable join journal must fail-closed (true)")
+  }
+
+  // 2. expire_queued_outbound_tells expires finite 15s continuation RPC even when mesh is offline
+  let q : Array[OutboundTell] = [
+    OutboundTell::{
+      ask_id: 1L,
+      peer: "peer-offline",
+      method: "thread.classify",
+      ref_id: "",
+      payload: Bytes::new(0),
+      attempts: 0,
+      next_at_ms: 1000L,
+      created_at_ms: 1000L,
+      max_retry_ms: 15000L,
+      on_ask_done: None,
+    },
+    OutboundTell::{
+      ask_id: 2L,
+      peer: "peer-default",
+      method: "thread.classify",
+      ref_id: "",
+      payload: Bytes::new(0),
+      attempts: 0,
+      next_at_ms: 1000L,
+      created_at_ms: 1000L,
+      max_retry_ms: TELL_RETRY_MAX_MS,
+      on_ask_done: None,
+    },
+  ]
+  let expired = expire_queued_outbound_tells(q, 16000L)
+  if expired.length() != 1 || expired[0].ask_id != 1L {
+    panic("expected ask_id=1 to expire at 16000ms")
+  }
+  if q.length() != 1 || q[0].ask_id != 2L {
+    panic("expected ask_id=2 to remain queued at 16000ms")
+  }
+
+  // 3. classify_unlink_result: unlinked / ENOENT -> Ok(()), real unlink failure -> Err(...)
+  match classify_unlink_result(true, Ok("{}"), "/tmp/a") {
+    Ok(_) => ()
+    Err(e) => panic("unlinked=true must be Ok(()), got: " + e)
+  }
+  match classify_unlink_result(false, Err(-2), "/tmp/missing") {
+    Ok(_) => ()
+    Err(e) => panic("ENOENT (-2) must be Ok(()), got: " + e)
+  }
+  match classify_unlink_result(false, Err(-3), "/tmp/eacces") {
+    Ok(_) => panic("EACCES (-3) must return Err")
+    Err(e) => if !e.contains("err=-3") { panic("unexpected err: " + e) }
+  }
+  match classify_unlink_result(false, Ok("{\"type\":\"dir\"}"), "/tmp/dir") {
+    Ok(_) => panic("existing entry after failed unlink must return Err")
+    Err(e) => if !e.contains("unlink failed") { panic("unexpected err: " + e) }
+  }
+
+  // 4. First-time home promotion in station_cloud::apply_join_workspace_response propagates remove_file Err
+  let p_files : Map[String, String] = Map::new()
+  let p_data = "/tmp/w17e4b-r5-promote-unlink"
+  p_files.set(station_cloud::state_path(p_data), "{\"origin\":\"https://api.still.fail\",\"workspace\":\"ws-old\",\"workspaceName\":\"Old\",\"name\":\"Box\",\"peers\":[],\"joined\":[]}")
+  p_files.set(station_cloud::lock_path(p_data), "{\"head\":\"old\"}")
+  let fail_rm_fs = station_cloud::CloudFs::{
+    read_text: fn(p : String) -> Result[Option[String], String] { Ok(p_files.get(p)) },
+    write_private_text: fn(p : String, t : String) -> Result[Unit, String] { p_files.set(p, t); Ok(()) },
+    mkdir_p: fn(_p : String) -> Result[Unit, String] { Ok(()) },
+    remove_file: fn(p : String) -> Result[Unit, String] { Err("EPERM: " + p) },
+    rename_file: fn(_a : String, _b : String) -> Result[Unit, String] { Ok(()) },
+    exists: fn(p : String) -> Bool { p_files.get(p).is_some() },
+  }
+  let p_seed = Bytes::new(32)
+  for i in 0..<32 {
+    p_seed[i] = (i + 31).to_byte()
+  }
+  let p_key = match station_cloud::StationKey::from_seed(p_seed) { Ok(k) => k, Err(e) => panic(e) }
+  let p_pin = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+  let p_prep = match station_cloud::prepare_join_workspace(p_data, fail_rm_fs, p_key, "tok_r5_1", "0.1.9999", 1700000000L, lock_hash=p_pin) {
+    Ok(p) => p
+    Err(e) => panic("prepare_join_workspace failed: " + e)
+  }
+  match station_cloud::apply_join_workspace_response(
+    p_data,
+    fail_rm_fs,
+    p_prep,
+    200,
+    "{\"workspace\":\"ws-new\",\"workspace_name\":\"New\",\"name\":\"Box\",\"home\":\"ws-new\"}",
+    1700000001L,
+    lock_hash=p_pin,
+  ) {
+    Ok(_) => panic("first-time home promotion must propagate remove_file Err")
+    Err(e) => if !e.contains("EPERM") { panic("expected EPERM from remove_file, got: " + e) }
+  }
+}

@@ -275,7 +275,7 @@ pub fn WholeApiRuntimePort::in_memory() -> WholeApiRuntimePort {
 pub fn WholeApiRuntimePort::production(
   whole_store : WholeStore,
   agents : WholeAgents,
-  home_ws_str : String,
+  get_home_ws : () -> String,
   shared_transfers : station_screens::TransfersManager,
 ) -> WholeApiRuntimePort {
   WholeApiRuntimePort::{
@@ -319,7 +319,7 @@ pub fn WholeApiRuntimePort::production(
         Ok(s) => s
         Err(e) => return Err(station_api::ApiError::new(503, e))
       }
-      match st.search_chat_threads(Some(ws), Some(home_ws_str), "", station_store::ChatListFilter::empty(), 100) {
+      match st.search_chat_threads(Some(ws), Some(get_home_ws()), "", station_store::ChatListFilter::empty(), 100) {
         Ok((threads, total)) => {
           let items : Array[base_codec::Json] = []
           for i in 0..<threads.length() {
@@ -337,7 +337,7 @@ pub fn WholeApiRuntimePort::production(
       }
       match st.db.all(
         "SELECT key, title, runtime, running, last_active_at FROM sessions WHERE COALESCE(ws, ?1) = ?2 ORDER BY last_active_at DESC LIMIT 100",
-        [base_codec::json_str(home_ws_str), base_codec::json_str(ws)],
+        [base_codec::json_str(get_home_ws()), base_codec::json_str(ws)],
       ) {
         Ok(rows) => {
           let items : Array[base_codec::Json] = []
@@ -413,7 +413,7 @@ pub fn WholeApiRuntimePort::production(
           [
             base_codec::json_str(to_name),
             base_codec::json_str(from_name),
-            base_codec::json_str(home_ws_str),
+            base_codec::json_str(get_home_ws()),
             base_codec::json_str(ws),
           ],
         ) {
@@ -705,7 +705,7 @@ pub fn WholeApiRuntimePort::production(
       }
     },
     vault_plain: VaultPlainStorePort::production(whole_store),
-    readops: ReadOpsPort::production(whole_store, agents, home_ws_str, shared_transfers),
+    readops: ReadOpsPort::production(whole_store, agents, get_home_ws, shared_transfers),
     vault_decisions: VaultDecisionsPort::production(whole_store),
   }
 }
@@ -721,10 +721,10 @@ pub fn build_empty_waiting_store_port() -> station_api::WaitingStorePort {
 /// Build a workspace-isolated SQLite-backed `station_api::WaitingStorePort` for `WaitingTracker` (`#9038`).
 /// Matches `station_store/src/store.pion:1034-1047` (joining `sessions` with the latest row in `turns`)
 /// scoped strictly to `COALESCE(s.ws, home_ws) = ws`.
-pub fn build_waiting_store_port(
+pub fn build_waiting_store_port_live(
   whole_store : WholeStore,
-  ws : String,
-  home_ws : String,
+  get_ws : () -> String,
+  get_home_ws : () -> String,
 ) -> station_api::WaitingStorePort {
   let parse_row = fn(r : Map[String, base_codec::Json]) -> Option[station_api::WaitingSessionInfo] {
     let key = match r.get("key") {
@@ -757,6 +757,8 @@ pub fn build_waiting_store_port(
         Err(_) => return []
       }
       let lim = if limit <= 0 { 50 } else { limit }
+      let ws = get_ws()
+      let home_ws = get_home_ws()
       match st.db.all(
         "SELECT s.key, s.title, t.need, t.ended_at" +
         " FROM sessions s" +
@@ -787,6 +789,8 @@ pub fn build_waiting_store_port(
         Ok(s) => s
         Err(_) => return None
       }
+      let ws = get_ws()
+      let home_ws = get_home_ws()
       match st.db.first(
         "SELECT s.key, s.title, t.need, t.ended_at" +
         " FROM sessions s" +
@@ -804,6 +808,14 @@ pub fn build_waiting_store_port(
       }
     }),
   }
+}
+
+pub fn build_waiting_store_port(
+  whole_store : WholeStore,
+  ws : String,
+  home_ws : String,
+) -> station_api::WaitingStorePort {
+  build_waiting_store_port_live(whole_store, fn() -> String { ws }, fn() -> String { home_ws })
 }
 
 // ---------------------------------------------------------------------------
@@ -1670,7 +1682,11 @@ pub fn dispatch_extra_call_op(
     None => ()
   }
   // 2b. Wave 17C-3A routes (CRDT records, Projects, Hub retry/compact, Drive mkdir/transfers, Links, Feedback, Resources)
-  match dispatch_wave17c3a_call_op(op, req, params, body, agents, seen_store, drive, events, hooks, port, now_ms) {
+  let cfg_path_opt = match cfg_opt {
+    Some(cf) => Some(cf.path)
+    None => None
+  }
+  match dispatch_wave17c3a_call_op(op, req, params, body, agents, seen_store, drive, events, hooks, port, now_ms, config_path_override=cfg_path_opt) {
     Some(r) => return Some(r)
     None => ()
   }
@@ -1778,30 +1794,26 @@ pub fn dispatch_extra_call_op(
     // Honest 501 until managed-mcp-config.ts / routes/mcp-servers.ts full schema & response contract is ported.
     return Some(Err(err_not_implemented(op)))
   }
-  if op == "tools.access.get" {
-    let raw = read_config_raw(cfg_opt)
-    let access = match base_codec::json_get(raw, "toolsAccess") {
-      Some(v) => v
-      None => base_codec::json_obj([])
-    }
-    return Some(Ok(base_codec::json_obj([("access", access)])))
-  }
-  if op == "tools.access.put" {
-    return Some(Err(err_not_implemented(op)))
-  }
   if op == "xshare.hosts.put" {
     return dispatch_live_xshare_hosts_put_op(op, req, body, agents, auth_policy, cfg_opt, hooks)
   }
   if op == "workspaces.list" {
+    let can_manage = req.viewer.manages_station()
     let arr : Array[base_codec::Json] = []
     for i in 0..<auth_policy.allowed_workspaces.length() {
       let ws = auth_policy.allowed_workspaces[i]
-      arr.push(base_codec::json_obj([
-        ("id", base_codec::json_str(ws)),
-        ("home", base_codec::json_bool(ws == auth_policy.home_workspace)),
-      ]))
+      if can_manage || ws == req.viewer.workspace {
+        arr.push(base_codec::json_obj([
+          ("id", base_codec::json_str(ws)),
+          ("workspace", base_codec::json_str(ws)),
+          ("home", base_codec::json_bool(ws == auth_policy.home_workspace)),
+        ]))
+      }
     }
-    return Some(Ok(base_codec::json_obj([("workspaces", base_codec::json_arr(arr))])))
+    return Some(Ok(base_codec::json_obj([
+      ("workspaces", base_codec::json_arr(arr)),
+      ("canJoin", base_codec::json_bool(can_manage)),
+    ])))
   }
   if op == "workspaces.join" {
     match hooks.on_workspace_join {
