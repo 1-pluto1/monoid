@@ -69,8 +69,8 @@ for part in $parts; do
     # on a small volume of its own beside the test station, alice's device, chats with files, a git worktree, a job and
     # a vault item moved and moved back, stations killed and started again mid-move (scripts/e2e-local.sh move-all), on
     # ports and directories of its own.
-    move) (cd apps/mbui && E2E_WORK=${RUNNER_TEMP:-/tmp}/side-move E2E_STATION=/tmp/side-move-$(id -u) E2E_PORT=28780 \
-      E2E_RELAY=28789 bash scripts/e2e-local.sh move-all) || status=1 ;;
+    move) (cd apps/mbui && E2E_WORK=${RUNNER_TEMP:-/tmp}/side-move E2E_STATION=/tmp/side-move-$(id -u) E2E_PORT=28820 \
+      E2E_RELAY=28829 bash scripts/e2e-local.sh move-all) || status=1 ;;
     # A self-hosted cloud on workerd (cloud/side): built, signing people in through an SMTP relay and an OpenID provider of
     # the test's own, over real sockets with a CA of its own.
     cloud) (cd cloud && pnpm side) || status=1 ;;
