@@ -110,3 +110,38 @@ test("the Directory rechecks a session revoked after the Worker's earlier check"
     await h.close();
   }
 });
+
+test("prune and single-session revoke skip Directory RPCs when no matching active session ends", async () => {
+  const h = await harness();
+  try {
+    await primary(h);
+    const old = await h.login("alice"), current = await h.login("alice");
+    const asCurrent = h.as(current);
+    const account = await h.object("ACCOUNTS", old.subject);
+    const directory = await h.object("DIRECTORY", "primary");
+    const meCalls = async () => ((await directory.adminLoad()).calls.families.me ?? []).reduce((a: number, b: number) => a + b, 0);
+
+    const base = await meCalls();
+    await account.sweepSessions();
+    assert.equal(await meCalls(), base, "sweepSessions skips revokeSessions when nothing expired");
+
+    assert.equal((await asCurrent("DELETE", `/v1/auth/sessions/${old.session_id}`)).status, 200);
+    await h.settled();
+    assert.equal(await meCalls(), base + 1, "removing an active session notifies Directory once");
+
+    const repeated = await asCurrent("DELETE", `/v1/auth/sessions/${old.session_id}`);
+    assert.equal(repeated.status, 200);
+    assert.deepEqual(await repeated.json(), { revoked: true });
+    await h.settled();
+    assert.equal(await meCalls(), base + 1, "removing an already revoked session skips Directory RPC");
+    assert.equal((await asCurrent("GET", "/v1/me")).status, 200, "active session stays valid");
+    const beforeExpire = await meCalls();
+
+    await account.expire(current.session_id, "idle");
+    await account.sweepSessions();
+    await h.settled();
+    assert.equal(await meCalls(), beforeExpire + 1, "expiring an active session notifies Directory once");
+  } finally {
+    await h.close();
+  }
+});
