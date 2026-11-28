@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { apply as applyDelta } from "../src/delta.ts";
-import { arrange, Browsing } from "../src/drive-browse.ts";
+import { arrange, Browsing, movesOf, resolveTyped } from "../src/drive-browse.ts";
 import { collate } from "../src/hosts/collate.ts";
 import type { CoreMessage } from "../src/protocol.ts";
 import { call, subscribe } from "./helpers.ts";
@@ -315,4 +315,72 @@ test("a snapshot given to a new browsing answers each act as the one it was take
     for (const view of ["columns", "tree", "list"]) assert.deepEqual(restored.view(at(view, "A")), live.view(at(view, "A")));
     assert.deepEqual(restored.tabsView("ws"), live.tabsView("ws"));
   }
+});
+
+test("movesOf and resolveTyped handle Windows drives, case-insensitive prefixes, and backslash home paths", () => {
+  // Cross-root move on the same Windows drive with anywhere=true succeeds via the common drive root.
+  assert.deepEqual(
+    movesOf(
+      [
+        { station: ST, root: "D:\\Work", abs: "D:\\Work\\a.txt", name: "a.txt" },
+        { station: ST, root: "C:\\Other", abs: "C:\\Other\\b.txt", name: "b.txt" },
+      ],
+      { station: ST, root: "d:\\Archive", path: "sub" },
+      true,
+    ),
+    [{ root: "d:\\", from: "Work/a.txt", to: "Archive/sub/a.txt" }],
+  );
+
+  // Case-insensitive under and self-move checks on Windows.
+  assert.deepEqual(
+    movesOf(
+      [
+        { station: ST, root: "D:\\Work", abs: "D:\\Work\\dir\\sub\\file.txt", name: "file.txt" },
+        { station: ST, root: "D:\\Work", abs: "D:\\Work\\dir", name: "dir" },
+        { station: ST, root: "D:\\Work", abs: "D:\\Work\\keep.txt", name: "keep.txt" },
+      ],
+      { station: ST, root: "d:\\work", path: "dir/sub" },
+      false,
+    ),
+    [{ root: "D:\\Work", from: "keep.txt", to: "dir/sub/keep.txt" }],
+  );
+  assert.deepEqual(
+    movesOf(
+      [{ station: ST, root: "D:\\Work", abs: "D:\\Work\\file.txt", name: "file.txt" }],
+      { station: ST, root: "d:\\work", path: "" },
+      false,
+    ),
+    [],
+  );
+
+  const stations = [
+    { station: ST, name: "WinPC", home: "C:\\Users\\alice" },
+    { station: "ws/c", name: "c", home: "/home/c" },
+  ];
+  const from = { station: ST, abs: "C:\\Users\\alice\\Work" };
+
+  // Bare drive letter resolves as the Windows drive root rather than station named "c".
+  assert.deepEqual(resolveTyped("C:", stations, from), { station: ST, abs: "C:\\", parent: "C:\\", partial: "" });
+  assert.deepEqual(resolveTyped("win:D:", stations, from), { station: ST, abs: "D:\\", parent: "D:\\", partial: "" });
+  // Station named "c" with non-drive remainder still matches the station.
+  assert.deepEqual(resolveTyped("c:~/docs", stations, from), { station: "ws/c", abs: "/home/c/docs", parent: "/home/c", partial: "docs" });
+  // Both ~\ and ~/ under a Windows home produce clean backslash paths without mixed separators.
+  assert.deepEqual(resolveTyped("~\\Projects\\app", stations, from), {
+    station: ST,
+    abs: "C:\\Users\\alice\\Projects\\app",
+    parent: "C:\\Users\\alice\\Projects",
+    partial: "app",
+  });
+  assert.deepEqual(resolveTyped("~/Projects/app", stations, from), {
+    station: ST,
+    abs: "C:\\Users\\alice\\Projects\\app",
+    parent: "C:\\Users\\alice\\Projects",
+    partial: "app",
+  });
+  assert.deepEqual(resolveTyped("sub/file", stations, from), {
+    station: ST,
+    abs: "C:\\Users\\alice\\Work\\sub\\file",
+    parent: "C:\\Users\\alice\\Work\\sub",
+    partial: "file",
+  });
 });

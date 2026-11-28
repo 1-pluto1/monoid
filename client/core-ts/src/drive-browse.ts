@@ -92,21 +92,34 @@ const sepOf = (path: string) => (path.includes("\\") && !path.includes("/") ? "\
 const childOf = (folder: string, name: string) => (folder.endsWith(sepOf(folder)) ? `${folder}${name}` : `${folder}${sepOf(folder)}${name}`);
 const absoluteOf = (root: string, path: string) => path.split("/").filter(Boolean).reduce((at, name) => childOf(at, name), root);
 
+const driveRootOf = (path: string): string | null => {
+  const m = /^([A-Za-z]:)[\\/]/.exec(path);
+  return m ? `${m[1]}\\` : null;
+};
+
 /// The renames a drag of a station's files into the folder `into` makes: none for one dragged from another station, one
 /// where it is already, or one into itself; each by a root both places are under (the one it was dragged from, or the
 /// folder's), else, for a member who browses every folder (`anywhere`), by the top of the disk.
 export function movesOf(items: readonly Moving[], into: Folder, anywhere: boolean): Move[] {
   const dest = absoluteOf(into.root, into.path);
   const sep = sepOf(dest);
-  const under = (path: string, top: string) => path === top || path.startsWith(top.endsWith(sep) ? top : top + sep);
+  const win = sep === "\\";
+  const norm = (path: string) => (win ? path.toLowerCase() : path);
+  const samePath = (a: string, b: string) => norm(a) === norm(b);
+  const under = (path: string, top: string) => {
+    const p = norm(path), t = norm(top);
+    return p === t || p.startsWith(t.endsWith(sep) ? t : t + sep);
+  };
+  const destDrive = win ? driveRootOf(dest) : null;
   const out: Move[] = [];
   for (const item of items) {
     if (item.station !== into.station) continue;
     const target = childOf(dest, item.name);
-    if (target === item.abs || under(dest, item.abs)) continue;
-    const root = [item.root, into.root].find((r) => under(item.abs, r) && under(target, r)) ?? (anywhere && sep === "/" ? "/" : null);
+    if (samePath(target, item.abs) || under(dest, item.abs)) continue;
+    const sameDrive = destDrive !== null && driveRootOf(item.abs)?.toLowerCase() === destDrive.toLowerCase() ? destDrive : null;
+    const root = [item.root, into.root].find((r) => under(item.abs, r) && under(target, r)) ?? (anywhere ? (win ? sameDrive : "/") : null);
     if (root === null) continue;
-    const rel = (abs: string) => (abs === root ? "" : abs.slice(root.length).replace(/^[/\\]+/, "").split(sep).join("/"));
+    const rel = (abs: string) => (samePath(abs, root) ? "" : abs.slice(root.length).replace(/^[/\\]+/, "").split(sep).join("/"));
     out.push({ root, from: rel(item.abs), to: rel(target) });
   }
   return out;
@@ -118,19 +131,38 @@ export function movesOf(items: readonly Moving[], into: Folder, anywhere: boolea
 export interface Named { station: string; name: string; home: string | null }
 export interface Typed { station: string; abs: string; parent: string; partial: string }
 
+const joinTyped = (folder: string, sub: string) => {
+  const sep = sepOf(folder);
+  const clean = sep === "\\" ? sub.replace(/\//g, "\\") : sub;
+  return childOf(folder, clean);
+};
+
 /// A folder typed by its path (⌘⇧G), worked out: `mba:~/Projects` names the station before the colon (its name, or the
 /// start of it), `~` its home, a path with no slash in front is under the folder shown (`from`; another station's: under
 /// its home); with the folder it is in (`parent`) and what is typed of its last part (`partial`, what Tab completes).
 export function resolveTyped(typed: string, stations: readonly Named[], from: { station: string; abs: string }): Typed | null {
+  const trimmedInput = typed.trim();
   const colon = typed.indexOf(":");
-  const named = colon > 0 && !/^[A-Za-z]:[\\/]/.test(typed) ? typed.slice(0, colon).trim().toLowerCase() : null;
+  const named = colon > 0 && !/^[A-Za-z]:(?:$|[\\/])/.test(trimmedInput) ? typed.slice(0, colon).trim().toLowerCase() : null;
   const s = named === null ? stations.find((v) => v.station === from.station) : stations.find((v) => v.name.toLowerCase() === named) ?? stations.find((v) => v.name.toLowerCase().startsWith(named));
   if (!s) return null;
   const rest = (named === null ? typed : typed.slice(colon + 1)).trim();
   const home = s.home;
-  const base = rest === "" || rest === "~" ? home : rest.startsWith("~/") ? (home ? childOf(home, rest.slice(2)) : null) : rest.startsWith("/") || /^[A-Za-z]:[\\/]/.test(rest) ? rest : s.station === from.station ? childOf(from.abs, rest) : home ? childOf(home, rest) : null;
+  const base = rest === "" || rest === "~"
+    ? home
+    : /^~[\\/]/.test(rest)
+      ? (home ? joinTyped(home, rest.slice(2)) : null)
+      : /^[A-Za-z]:$/.test(rest)
+        ? `${rest}\\`
+        : rest.startsWith("/") || /^[A-Za-z]:[\\/]/.test(rest)
+          ? rest
+          : s.station === from.station
+            ? joinTyped(from.abs, rest)
+            : home
+              ? joinTyped(home, rest)
+              : null;
   if (base === null) return null;
-  const ends = /[\\/]$/.test(rest) || rest === "" || rest === "~";
+  const ends = /[\\/]$/.test(rest) || /^[A-Za-z]:$/.test(rest) || rest === "" || rest === "~";
   // A drive's root keeps its separator: C: alone is that drive's current directory.
   const root = /^[A-Za-z]:[\\/]/.exec(base)?.[0] ?? "/";
   const trimmed = ends ? base.replace(/[\\/]+$/, "") : base;
